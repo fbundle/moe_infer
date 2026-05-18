@@ -32,8 +32,25 @@ $(BIN_DIR):
 	mkdir -p $(BIN_DIR)
 
 # ── Inference engine ──────────────────────────────────────────────────────
-$(BIN_DIR)/infer: $(SRC_DIR)/infer.m $(SRC_DIR)/shaders.metal $(SRC_DIR)/model_config.h $(SRC_DIR)/config.h | $(BIN_DIR)
-	$(CC) $(CFLAGS) $(FW) $(LDFLAGS) $(SRC_DIR)/infer.m -o $@
+INFER_SRCS = $(SRC_DIR)/main.m
+INFER_HDEP = $(SRC_DIR)/util.h \
+             $(SRC_DIR)/tensors.h \
+             $(SRC_DIR)/vocab.h \
+             $(SRC_DIR)/cpu_kernels.h \
+             $(SRC_DIR)/metal_setup.h \
+             $(SRC_DIR)/gpu_ops.h \
+             $(SRC_DIR)/attention.h \
+             $(SRC_DIR)/moe_forward.h \
+             $(SRC_DIR)/embeddings.h \
+             $(SRC_DIR)/expert_io.h \
+             $(SRC_DIR)/layer_forward.h \
+             $(SRC_DIR)/server.h \
+             $(SRC_DIR)/tokenizer.h \
+             $(SRC_DIR)/model_config.h \
+             $(SRC_DIR)/config.h
+
+$(BIN_DIR)/infer: $(INFER_SRCS) $(INFER_HDEP) $(SRC_DIR)/shaders.metal | $(BIN_DIR)
+	$(CC) $(CFLAGS) $(FW) $(LDFLAGS) $(INFER_SRCS) -o $@
 
 # ── Pre-compiled Metal library ────────────────────────────────────────────
 metallib: $(BIN_DIR)/shaders.metallib

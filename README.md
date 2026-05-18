@@ -73,11 +73,23 @@ python helpers/chat.py --port 8080
 
 ```
 src/
-  infer.m              # Inference engine (~7000 lines)
-  shaders.metal        # Metal compute kernels
-  model_config.h       # Model dimensions (generated)
-  config.h             # Experiment knobs (generated)
-  tokenizer.h          # C BPE tokenizer
+  main.m                # Entry point: CLI parsing, inference loop (~620 lines)
+  util.h                # System includes, timing, bf16, globals, cache telemetry
+  tensors.h             # Tensor manifest, JSON parsing, weight file mmap/loading
+  vocab.h               # Vocabulary loading, token decoding, prompt tokens, BPE tokenizer
+  cpu_kernels.h         # CPU dequant matvec, RMS norm, SwiGLU, softmax, top-K, conv1d
+  metal_setup.h         # Metal device/queue/pipeline setup, buffer allocation
+  gpu_ops.h             # GPU batched matvec, expert forward, RoPE, encode/dispatch
+  attention.h           # KV cache, linear attn state, full & linear attention (CPU+GPU)
+  moe_forward.h         # MoE routing + expert computation + shared expert
+  embeddings.h          # Embedding lookup, lm_head forward
+  expert_io.h           # Parallel pread I/O pool, LRU cache, malloc cache, prefetch
+  layer_forward.h       # Layer weight cache, deferred expert state, fused_layer_forward
+  server.h              # Frequency analysis, HTTP server, SSE streaming, chat mode
+  shaders.metal         # Metal compute kernels (dequant, norms, attention, combine)
+  model_config.h        # Model dimensions (generated)
+  config.h              # Experiment knobs (generated)
+  tokenizer.h           # C BPE tokenizer
 helpers/
   gen_model_config.py     # Generate model_config.h from HF config.json
   export_tokenizer.py     # Generate vocab.bin and tokenizer.bin from HF model
@@ -85,7 +97,7 @@ helpers/
   repack_experts_4bit.py  # MLX 4-bit experts → packed_experts/
   repack_experts_2bit.py  # 4-bit → 2-bit requantization
   gen_config.py           # Generate config.h with experiment values
-  chat.py                # Interactive chat client (connect to infer.m --serve)
+  chat.py                # Interactive chat client (connect to infer --serve)
 autotune.py            # Sweep experiment configs, find optimal 4-bit setup
 Makefile               # Build system
 data/                  # Weights, vocab, tokenizer (generated, gitignored)
