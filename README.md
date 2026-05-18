@@ -8,7 +8,7 @@ Currently running **Qwen3.5-35B-A3B** (35B params, 37GB 4-bit) at ~5.2 tok/s on 
 
 Start from the HuggingFace model and end with a running inference engine.
 
-### 1. Download the pre-quantized model
+### 1. Download
 
 ```bash
 # Install huggingface_hub CLI if needed
@@ -19,60 +19,43 @@ huggingface-cli download mlx-community/Qwen3.5-35B-A3B-4bit \
   --local-dir hub/models--mlx-community--Qwen3.5-35B-A3B-4bit
 ```
 
-### 2. Generate model config
+### 2. Generate model data
+
+Extract tokenizer, non-expert weights, and repacked experts from the HF model into `data/`.
 
 ```bash
-python helpers/gen_model_config.py \
-  --model hub/models--mlx-community--Qwen3.5-35B-A3B-4bit
-```
-
-This creates `src/model_config.h` with all dimension constants, expert layout offsets, and special tokens for your model.
-
-### 3. Export tokenizer
-
-```bash
+# Tokenizer — vocab.bin + tokenizer.bin
 python helpers/export_tokenizer.py \
   --model hub/models--mlx-community--Qwen3.5-35B-A3B-4bit
-```
 
-Writes `data/vocab.bin` and `data/tokenizer.bin`.
-
-### 4. Extract non-expert weights
-
-```bash
+# Non-expert weights — model_weights.bin (~1.38 GB) + manifest
 python helpers/extract_weights.py \
-  --model hub/models--mlx-community--Qwen3.5-35B-A3B-4bit \
-  --output data
-```
+  --model hub/models--mlx-community--Qwen3.5-35B-A3B-4bit
 
-Writes `data/model_weights.bin` (~1.38 GB) and `data/model_weights.json` manifest.
-
-### 5. Repack expert weights
-
-```bash
+# Expert weights — per-layer binaries (18.1 GB total, streamed from SSD)
 python helpers/repack_experts_4bit.py \
   --model hub/models--mlx-community--Qwen3.5-35B-A3B-4bit
 ```
 
-Extracts per-layer binary files into `data/packed_experts/layer_00.bin` through `layer_39.bin` (~453 MB each, 18.1 GB total). These are streamed from SSD on demand.
+### 3. Compile
 
-### 6. Generate experiment config
+Generate headers and build.
 
 ```bash
+# Model dimensions — src/model_config.h
+python helpers/gen_model_config.py \
+  --model hub/models--mlx-community--Qwen3.5-35B-A3B-4bit
+
+# Experiment knobs — src/config.h
 python helpers/gen_config.py --active_experts 8 --use_gpu_linear 1
-```
 
-Creates `src/config.h` with compile-time experiment knobs. Run `python autotune.py` later to sweep configs and find the best values.
-
-### 7. Build
-
-```bash
+# Build
 make
 ```
 
-Builds `bin/infer`.
+Run `python autotune.py` later to sweep configs and find the best values.
 
-### 8. Run
+## Running
 
 ```bash
 # One-shot inference

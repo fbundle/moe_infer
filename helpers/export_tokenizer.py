@@ -6,7 +6,7 @@ Reads vocab.json and tokenizer.json, writes binary files the C engine expects.
 
 vocab.bin (for decode_token in infer.m):
   uint32 num_entries, uint32 max_id
-  For each entry (sorted by id): uint16 byte_len, char[byte_len]
+  For each entry (sorted by id): uint32 token_id, uint16 byte_len, char[byte_len]
 
 tokenizer.bin (for bpe_load in tokenizer.h):
   Magic "BPET", uint32 version=1
@@ -25,8 +25,18 @@ import struct
 from pathlib import Path
 
 
-def write_vocab_bin(model_path, out_dir):
-    """Generate vocab.bin from vocab.json (token_str → token_id)."""
+def load_tokenizer_json(model_path):
+    """Load tokenizer.json, returning (vocab, merges, added_tokens)."""
+    tok_path = Path(model_path) / "tokenizer.json"
+    if not tok_path.exists():
+        return None, None, None
+    with open(tok_path, "r", encoding="utf-8") as f:
+        t = json.load(f)
+    return t["model"]["vocab"], t["model"]["merges"], t.get("added_tokens", [])
+
+
+def write_vocab_bin(model_path, out_dir, added_tokens):
+    """Generate vocab.bin from vocab.json + added_tokens (for high-ID special tokens)."""
     vocab_path = Path(model_path) / "vocab.json"
     if not vocab_path.exists():
         print(f"ERROR: {vocab_path} not found")
@@ -34,6 +44,13 @@ def write_vocab_bin(model_path, out_dir):
 
     with open(vocab_path, "r", encoding="utf-8") as f:
         vocab = json.load(f)
+
+    # Merge added tokens (IDs 248044+) not present in vocab.json
+    for tok in added_tokens:
+        tid = tok["id"]
+        content = tok["content"]
+        if tid not in vocab.values():
+            vocab[content] = tid
 
     sorted_vocab = sorted(vocab.items(), key=lambda x: x[1])
     max_id = max(v for _, v in sorted_vocab)
@@ -45,28 +62,16 @@ def write_vocab_bin(model_path, out_dir):
         f.write(struct.pack("<I", max_id))
         for token_str, token_id in sorted_vocab:
             b = token_str.encode("utf-8")
+            f.write(struct.pack("<I", token_id))
             f.write(struct.pack("<H", len(b)))
             f.write(b)
 
     size_mb = out_path.stat().st_size / 1e6
-    print(f"vocab.bin: {len(sorted_vocab)} tokens, {size_mb:.1f} MB")
+    print(f"vocab.bin: {len(sorted_vocab)} tokens (max_id={max_id}), {size_mb:.1f} MB")
 
 
-def write_tokenizer_bin(model_path, out_dir):
-    """Generate tokenizer.bin from tokenizer.json."""
-    tok_path = Path(model_path) / "tokenizer.json"
-    if not tok_path.exists():
-        print(f"ERROR: {tok_path} not found")
-        return
-
-    with open(tok_path, "r", encoding="utf-8") as f:
-        t = json.load(f)
-
-    model = t["model"]
-    vocab = model["vocab"]
-    merges = model["merges"]
-    added = t.get("added_tokens", [])
-
+def write_tokenizer_bin(out_dir, vocab, merges, added):
+    """Generate tokenizer.bin from pre-loaded data."""
     sorted_vocab = sorted(vocab.items(), key=lambda x: x[1])
 
     out_path = Path(out_dir) / "tokenizer.bin"
@@ -114,8 +119,13 @@ def main():
                         help="Output directory [default: data]")
     args = parser.parse_args()
 
-    write_vocab_bin(args.model, args.output)
-    write_tokenizer_bin(args.model, args.output)
+    vocab, merges, added = load_tokenizer_json(args.model)
+    if vocab is None:
+        print(f"ERROR: {args.model}/tokenizer.json not found")
+        return
+
+    write_vocab_bin(args.model, args.output, added)
+    write_tokenizer_bin(args.output, vocab, merges, added)
 
 
 if __name__ == "__main__":

@@ -116,16 +116,6 @@ def stream_chat(host: str, port: int, prompt: str, max_tokens: int,
 
             token = clean_text(token)
 
-            # Think-block handling
-            if "<think>" in token and not show_think:
-                in_think = True
-                continue
-            if "</think>" in token:
-                in_think = False
-                continue
-            if in_think:
-                continue
-
             if first_token:
                 first_token = False
                 t_first = time.monotonic() - t0

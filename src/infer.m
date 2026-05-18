@@ -574,18 +574,20 @@ static Vocabulary *load_vocab(const char *path) {
     fread(&max_id, 4, 1, f);
 
     Vocabulary *v = calloc(1, sizeof(Vocabulary));
-    v->num_tokens = num_entries;
-    v->tokens = calloc(num_entries, sizeof(char *));
-    v->lengths = calloc(num_entries, sizeof(int));
+    v->num_tokens = max_id + 1;
+    v->tokens = calloc(max_id + 1, sizeof(char *));
+    v->lengths = calloc(max_id + 1, sizeof(int));
 
     for (uint32_t i = 0; i < num_entries; i++) {
+        uint32_t token_id;
         uint16_t byte_len;
+        fread(&token_id, 4, 1, f);
         fread(&byte_len, 2, 1, f);
         if (byte_len > 0) {
-            v->tokens[i] = malloc(byte_len + 1);
-            fread(v->tokens[i], 1, byte_len, f);
-            v->tokens[i][byte_len] = '\0';
-            v->lengths[i] = byte_len;
+            v->tokens[token_id] = malloc(byte_len + 1);
+            fread(v->tokens[token_id], 1, byte_len, f);
+            v->tokens[token_id][byte_len] = '\0';
+            v->lengths[token_id] = byte_len;
         }
     }
 
