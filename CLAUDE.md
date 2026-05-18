@@ -69,37 +69,44 @@ On Apple Silicon, SSD DMA and GPU compute share the same memory controller and c
 ## Quick Start
 
 ```bash
-cd metal_infer
 make
 # 4-bit inference (needs packed_experts/ directory)
-./infer --prompt "Explain quantum computing" --tokens 100
+./bin/infer --prompt "Explain quantum computing" --tokens 100
 
 # 2-bit inference (faster but breaks tool calling)
-./infer --prompt "Explain quantum computing" --tokens 100 --2bit
+./bin/infer --prompt "Explain quantum computing" --tokens 100 --2bit
 
 # Interactive chat with tool calling
-./chat
+./bin/chat
 
 # Per-layer timing breakdown
-./infer --prompt "Hello" --tokens 20 --timing
+./bin/infer --prompt "Hello" --tokens 20 --timing
 ```
 
 ## Project Structure
 
 ```
-metal_infer/
+src/
   infer.m              # Complete inference engine (~7000 lines)
   shaders.metal        # Metal compute kernels (~1200 lines)
   chat.m               # Interactive chat TUI with tool calling
   tokenizer.h          # C BPE tokenizer (single-header, 449 lines)
   main.m               # MoE-only benchmark
-  Makefile             # Build system
+  model_config.h       # Compile-time model constants (generated)
+  linenoise.c/h        # Line editor for chat TUI
+helpers/
   extract_weights.py   # Creates model_weights.bin from safetensors
+  repack_experts_4bit.py  # MLX pre-quantized → per-layer binaries
   repack_experts_2bit.py  # 4-bit → 2-bit expert requantization
+  pack_experts.py      # BF16 → 4-bit expert quantization
+  gen_model_config.py  # Generate model_config.h from HF config.json
   train_predictor.py   # Expert routing prediction analysis
-  model_weights.bin    # Non-expert weights (5.5GB, mmap'd)
+  export_tokenizer.py  # Export tokenizer.json to C binary format
+data/
+  model_weights.bin    # Non-expert weights (mmap'd)
   model_weights.json   # Tensor manifest
   vocab.bin            # Vocabulary for token decoding
+  tokenizer.bin        # Pre-exported BPE tokenizer data
   tokenizer.bin        # Pre-exported BPE tokenizer data
 
 repack_experts.py      # 4-bit expert packing from safetensors

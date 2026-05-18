@@ -605,8 +605,8 @@ static int g_tokenizer_loaded = 0;
 static void init_tokenizer(void) {
     if (g_tokenizer_loaded) return;
     const char *paths[] = {
+        "data/tokenizer.bin",
         "tokenizer.bin",
-        "metal_infer/tokenizer.bin",
         NULL
     };
     for (int i = 0; paths[i]; i++) {
@@ -961,7 +961,7 @@ static MetalCtx *metal_setup(void) {
 
     // Compile shaders from source
     NSError *error = nil;
-    NSArray *paths = @[@"shaders.metal", @"metal_infer/shaders.metal"];
+    NSArray *paths = @[@"src/shaders.metal", @"shaders.metal"];
     NSString *src = nil;
     for (NSString *p in paths) {
         src = [NSString stringWithContentsOfFile:p encoding:NSUTF8StringEncoding error:&error];
@@ -6531,7 +6531,7 @@ int main(int argc, char **argv) {
         // Try to find files relative to the executable
         if (!weights_path) {
             snprintf(default_weights, sizeof(default_weights),
-                     "metal_infer/model_weights.bin");
+                     "data/model_weights.bin");
             if (access(default_weights, R_OK) != 0) {
                 snprintf(default_weights, sizeof(default_weights),
                          "model_weights.bin");
@@ -6540,7 +6540,7 @@ int main(int argc, char **argv) {
         }
         if (!manifest_path) {
             snprintf(default_manifest, sizeof(default_manifest),
-                     "metal_infer/model_weights.json");
+                     "data/model_weights.json");
             if (access(default_manifest, R_OK) != 0) {
                 snprintf(default_manifest, sizeof(default_manifest),
                          "model_weights.json");
@@ -6549,7 +6549,7 @@ int main(int argc, char **argv) {
         }
         if (!vocab_path) {
             snprintf(default_vocab, sizeof(default_vocab),
-                     "metal_infer/vocab.bin");
+                     "data/vocab.bin");
             if (access(default_vocab, R_OK) != 0) {
                 snprintf(default_vocab, sizeof(default_vocab),
                          "vocab.bin");

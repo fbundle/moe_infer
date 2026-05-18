@@ -200,7 +200,7 @@ static MetalContext *metal_init(void) {
     NSArray *metallib_paths = @[
         [execDir stringByAppendingPathComponent:@"shaders.metallib"],
         @"shaders.metallib",
-        @"metal_infer/shaders.metallib"
+        @"src/shaders.metallib"
     ];
     for (NSString *libPath in metallib_paths) {
         if ([[NSFileManager defaultManager] fileExistsAtPath:libPath]) {
@@ -218,7 +218,7 @@ static MetalContext *metal_init(void) {
         NSArray *source_paths = @[
             [execDir stringByAppendingPathComponent:@"shaders.metal"],
             @"shaders.metal",
-            @"metal_infer/shaders.metal"
+            @"src/shaders.metal"
         ];
         NSString *shaderSource = nil;
         NSString *foundPath = nil;

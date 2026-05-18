@@ -1,17 +1,16 @@
-# Build artifacts
-metal_infer/infer
-metal_infer/chat
-metal_infer/metal_infer
-metal_infer/bench_pread
+# Build output
+bin/
+
+# Generated data files (recreate with scripts — see CLAUDE.md)
+data/model_weights.bin
+data/model_weights.json
+data/vocab.bin
+data/tokenizer.bin
+
+# Compiled artifacts
 *.o
 *.air
 *.metallib
-
-# Generated model files (recreate with scripts — see CLAUDE.md Quick Start)
-metal_infer/model_weights.bin
-metal_infer/model_weights.json
-metal_infer/vocab.bin
-metal_infer/tokenizer.bin
 
 # Python
 __pycache__/
@@ -31,14 +30,8 @@ __pycache__/
 logs/
 *.log
 
-# Test binaries and experiment data
-metal_infer/test_lzfse
-metal_infer/repack_experts_lz4
-metal_infer/routing_data.bin
-
-
 # Downloaded model files
 hub/
 
-# other
-run_claude
+# Test binaries and experiment data
+routing_data.bin
