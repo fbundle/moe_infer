@@ -65,10 +65,11 @@ def main():
 
     weight_map = idx['weight_map']
 
-    # Filter: keep only language_model weights, skip vision_tower
-    # Also skip expert weights (switch_mlp.{gate_proj,up_proj,down_proj}.{weight,scales,biases})
-    # unless --include-experts is set
-    expert_pattern = re.compile(r'\.switch_mlp\.(gate_proj|up_proj|down_proj)\.(weight|scales|biases)$')
+    # Filter: keep only language_model weights, skip vision and expert tensors
+    # Raw BF16 models use .mlp.experts.{gate_up_proj,down_proj} (fused)
+    # Pre-quantized models use .switch_mlp.{gate_proj,up_proj,down_proj}.{weight,scales,biases}
+    expert_pattern = re.compile(r'\.(switch_mlp|mlp\.experts)\.(gate_proj|up_proj|down_proj|gate_up_proj)',)
+    mtp_expert_pattern = re.compile(r'mtp\.layers\.\d+\.mlp\.experts\.')
     vision_pattern = re.compile(r'^(vision_tower|model\.visual)')
 
     tensors_to_extract = {}  # name -> filename
@@ -79,7 +80,7 @@ def main():
         if vision_pattern.match(name):
             skipped_vision += 1
             continue
-        if not args.include_experts and expert_pattern.search(name):
+        if not args.include_experts and (expert_pattern.search(name) or mtp_expert_pattern.search(name)):
             skipped_expert += 1
             continue
         tensors_to_extract[name] = filename
@@ -102,10 +103,17 @@ def main():
         filepath = model_path / filename
         header_cache[filename] = parse_safetensors_header(str(filepath))
 
-    # Sanitize tensor names: remove "language_model." prefix for the C engine
+    # Sanitize tensor names for the C engine.
+    # MLX-quantized: "language_model.model.X" -> "model.X"
+    #                "language_model.lm_head.X" -> "lm_head.X"
+    # Raw Qwen3.5:   "model.language_model.X" -> "model.X"
     def sanitize_name(name):
+        if name.startswith("language_model.model."):
+            return "model." + name[len("language_model.model."):]
         if name.startswith("language_model."):
             return name[len("language_model."):]
+        if name.startswith("model.language_model."):
+            return "model." + name[len("model.language_model."):]
         return name
 
     # Plan the output layout
@@ -117,38 +125,75 @@ def main():
 
     # Write binary file
     bin_path = output_dir / 'model_weights.bin'
-    manifest = {
-        "model": str(model_path),
-        "num_tensors": len(all_tensors),
-        "tensors": {},
-        # Model config for the C engine
-        "config": {
-            "hidden_size": 4096,
-            "num_hidden_layers": 60,
-            "num_attention_heads": 32,
-            "num_key_value_heads": 2,
-            "head_dim": 256,
-            "vocab_size": 248320,
-            "rms_norm_eps": 1e-6,
-            "num_experts": 512,
-            "num_experts_per_tok": 10,
-            "moe_intermediate_size": 1024,
-            "shared_expert_intermediate_size": 1024,
-            "full_attention_interval": 4,
-            "linear_num_value_heads": 64,
-            "linear_num_key_heads": 16,
-            "linear_key_head_dim": 128,
-            "linear_value_head_dim": 128,
-            "linear_conv_kernel_dim": 4,
-            "partial_rotary_factor": 0.25,
-            "rope_theta": 10000000.0,
+    # Auto-detect model config from HuggingFace config.json
+    model_cfg_path = model_path / "config.json"
+    if model_cfg_path.exists():
+        with open(model_cfg_path) as f:
+            hf_config = json.load(f)
+        # Qwen3.5 MoE multimodal models nest text params under "text_config"
+        if "text_config" in hf_config:
+            hf_config = hf_config["text_config"]
+        num_layers = hf_config.get("num_hidden_layers", 60)
+        manifest = {
+            "model": str(model_path),
+            "num_tensors": len(all_tensors),
+            "tensors": {},
+            "config": {
+                "hidden_size": hf_config.get("hidden_size", 4096),
+                "num_hidden_layers": num_layers,
+                "num_attention_heads": hf_config.get("num_attention_heads", 32),
+                "num_key_value_heads": hf_config.get("num_key_value_heads", 2),
+                "head_dim": hf_config.get("head_dim", hf_config.get("hidden_size", 4096) // hf_config.get("num_attention_heads", 32)),
+                "vocab_size": hf_config.get("vocab_size", 248320),
+                "rms_norm_eps": hf_config.get("rms_norm_eps", 1e-6),
+                "num_experts": hf_config.get("num_experts", 512),
+                "num_experts_per_tok": hf_config.get("num_experts_per_tok", 10),
+                "moe_intermediate_size": hf_config.get("moe_intermediate_size", hf_config.get("intermediate_size", 1024)),
+                "shared_expert_intermediate_size": hf_config.get("shared_expert_intermediate_size", hf_config.get("intermediate_size", 1024)),
+                "full_attention_interval": hf_config.get("full_attention_interval", 4),
+                "linear_num_value_heads": hf_config.get("linear_num_value_heads", 64),
+                "linear_num_key_heads": hf_config.get("linear_num_key_heads", 16),
+                "linear_key_head_dim": hf_config.get("linear_key_head_dim", 128),
+                "linear_value_head_dim": hf_config.get("linear_value_head_dim", 128),
+                "linear_conv_kernel_dim": hf_config.get("linear_conv_kernel_dim", 4),
+                "partial_rotary_factor": hf_config.get("partial_rotary_factor", 0.25),
+                "rope_theta": hf_config.get("rope_theta", 10000000.0),
+            }
         }
-    }
+    else:
+        print(f"WARNING: {model_cfg_path} not found, using defaults")
+        num_layers = 60
+        manifest = {
+            "model": str(model_path),
+            "num_tensors": len(all_tensors),
+            "tensors": {},
+            "config": {
+                "hidden_size": 4096,
+                "num_hidden_layers": 60,
+                "num_attention_heads": 32,
+                "num_key_value_heads": 2,
+                "head_dim": 256,
+                "vocab_size": 248320,
+                "rms_norm_eps": 1e-6,
+                "num_experts": 512,
+                "num_experts_per_tok": 10,
+                "moe_intermediate_size": 1024,
+                "shared_expert_intermediate_size": 1024,
+                "full_attention_interval": 4,
+                "linear_num_value_heads": 64,
+                "linear_num_key_heads": 16,
+                "linear_key_head_dim": 128,
+                "linear_value_head_dim": 128,
+                "linear_conv_kernel_dim": 4,
+                "partial_rotary_factor": 0.25,
+                "rope_theta": 10000000.0,
+            }
+        }
 
     # Layer type map
     layer_types = []
-    for i in range(60):
-        if (i + 1) % 4 == 0:
+    for i in range(num_layers):
+        if (i + 1) % manifest["config"]["full_attention_interval"] == 0:
             layer_types.append("full_attention")
         else:
             layer_types.append("linear_attention")

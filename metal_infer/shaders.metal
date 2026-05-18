@@ -5,7 +5,7 @@
  *   1. dequant_matvec_4bit: Naive 4-bit affine dequant matvec (reference)
  *   2. dequant_matvec_4bit_fast: SIMD-optimized with simd_sum reduction
  *   3. dequant_matvec_4bit_v3: Fully optimized — tiled threadgroup, vector loads,
- *      coalesced access, shared input cache. Target: <0.1ms per matmul.
+ *      coalesced access, shared input cache.
  *   4. swiglu_fused / swiglu_fused_vec4: SwiGLU activation
  *   5. weighted_sum: combine expert outputs with routing weights
  *   6. rms_norm: RMS normalization
@@ -17,16 +17,19 @@
  *   - Groups of 64 elements share one (scale, bias) pair
  *
  * Matrix layout for expert projections:
- *   gate_proj/up_proj: [1024, 512] uint32 = [1024, 4096] logical (out=1024, in=4096)
- *   down_proj: [4096, 128] uint32 = [4096, 1024] logical (out=4096, in=1024)
+ *   gate_proj/up_proj: [moe_intermediate, hidden/8] uint32 (out=moe_intermediate, in=hidden)
+ *   down_proj: [hidden, moe_intermediate/8] uint32 (out=hidden, in=moe_intermediate)
  *
- *   Scales/biases: [out_dim, in_dim/group_size]
- *   gate/up scales: [1024, 64]   (4096/64 = 64 groups)
- *   down scales:    [4096, 16]   (1024/64 = 16 groups)
+ * All matrix dimensions are passed at runtime via constant buffers.
+ * MAX_INPUT_DIM = 4096: maximum supported hidden_dim for threadgroup shared memory.
  */
 
 #include <metal_stdlib>
 using namespace metal;
+
+// Maximum supported input dimension for threadgroup shared memory.
+// Models with larger hidden_dim would need dynamic threadgroup memory.
+#define MAX_INPUT_DIM 4096
 
 // ============================================================================
 // BFloat16 helpers
@@ -271,7 +274,7 @@ kernel void dequant_matvec_4bit_v3(
     // ---- Cache input vector in threadgroup shared memory ----
     // Max in_dim = 4096, so we need 4096 floats = 16KB shared memory
     // This is well within the 32KB threadgroup memory limit on M3
-    threadgroup float x_shared[4096];
+    threadgroup float x_shared[MAX_INPUT_DIM];
 
     // Cooperative load: 256 threads load 4096 floats (16 per thread)
     // ALL threads must participate in this load + barrier, even if their
@@ -369,7 +372,7 @@ kernel void dequant_matvec_4bit_v5(
     uint num_groups  = in_dim / group_size;
     uint packed_per_group = group_size / 8;
 
-    threadgroup float x_shared[4096];
+    threadgroup float x_shared[MAX_INPUT_DIM];
     for (uint i = lid; i < in_dim; i += 256) {
         x_shared[i] = x[i];
     }
@@ -443,7 +446,7 @@ kernel void dequant_matvec_2bit(
     uint packed_cols = in_dim / 16;  // 16 values per uint32 for 2-bit
     uint num_groups  = in_dim / group_size;
 
-    threadgroup float x_shared[4096];
+    threadgroup float x_shared[MAX_INPUT_DIM];
     for (uint i = lid; i < in_dim; i += 256) {
         x_shared[i] = x[i];
     }
@@ -524,7 +527,7 @@ kernel void dequant_matvec_4bit_v4(
     uint num_groups  = in_dim / group_size;
 
     // Cache input vector — ALL threads must participate before the barrier
-    threadgroup float x_shared[4096];
+    threadgroup float x_shared[MAX_INPUT_DIM];
     for (uint i = lid; i < in_dim; i += 256) {
         x_shared[i] = x[i];
     }
@@ -621,7 +624,7 @@ kernel void dequant_matvec_4bit_batched(
     uint num_groups  = in_dim / group_size;
 
     // Cache this expert's input vector
-    threadgroup float x_shared[4096];
+    threadgroup float x_shared[MAX_INPUT_DIM];
     device const float* x_k = x_inputs + expert_k * in_dim;
     for (uint i = lid; i < in_dim; i += 256) {
         x_shared[i] = x_k[i];
