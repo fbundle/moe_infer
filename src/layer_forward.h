@@ -176,6 +176,9 @@ typedef struct {
                                         // (next layer can skip deferred_wait+finalize+input_norm
                                         //  and submit CMD1 immediately -- buf_input is ready)
     id<MTLCommandBuffer> cmd_experts;   // the async command buffer (committed but not waited)
+#if USE_EVENT_PIPELINE
+    uint64_t expert_event_value;        // MTLSharedEvent value for non-blocking GPU completion check
+#endif
     float expert_weights[MAX_K];        // routing weights for weighted accumulation
     int valid[MAX_K];                   // which experts loaded successfully
     int actual_K;                       // number of experts
@@ -191,6 +194,13 @@ static DeferredExpertState g_deferred = { .active = 0 };
 // Split from finalize so timing can be measured independently.
 static void wait_deferred_experts_gpu(void) {
     if (!g_deferred.active) return;
+#if USE_EVENT_PIPELINE
+    // MTLSharedEvent non-blocking fast path (llama.cpp pattern)
+    id<MTLSharedEvent> ev = g_metal->pipeline_event;
+    if (ev && [ev signaledValue] >= g_deferred.expert_event_value) {
+        return;
+    }
+#endif
     [g_deferred.cmd_experts waitUntilCompleted];
 }
 
@@ -852,15 +862,17 @@ static void fused_layer_forward(
 
         // Update KV cache (CPU + GPU mirror)
         int cache_pos = kv->len;
-        memcpy(kv->k_cache + cache_pos * kv_dim, k_out, kv_dim * sizeof(float));
-        memcpy(kv->v_cache + cache_pos * kv_dim, v_out, kv_dim * sizeof(float));
+        for (int i = 0; i < kv_dim; i++) {
+            kv->k_cache[cache_pos * kv_dim + i] = f32_to_kv_elem(k_out[i]);
+            kv->v_cache[cache_pos * kv_dim + i] = f32_to_kv_elem(v_out[i]);
+        }
 
         int fa_idx = (layer_idx + 1) / FULL_ATTN_INTERVAL - 1;
         if (g_metal && g_metal->attn_scores_pipe && fa_idx >= 0 && fa_idx < NUM_FULL_ATTN_LAYERS) {
-            memcpy((float *)[g_metal->buf_kv_k[fa_idx] contents] + cache_pos * kv_dim,
-                   k_out, kv_dim * sizeof(float));
-            memcpy((float *)[g_metal->buf_kv_v[fa_idx] contents] + cache_pos * kv_dim,
-                   v_out, kv_dim * sizeof(float));
+            memcpy((kv_elem_t *)[g_metal->buf_kv_k[fa_idx] contents] + cache_pos * kv_dim,
+                   kv->k_cache + cache_pos * kv_dim, kv_dim * KV_ELEM_SIZE);
+            memcpy((kv_elem_t *)[g_metal->buf_kv_v[fa_idx] contents] + cache_pos * kv_dim,
+                   kv->v_cache + cache_pos * kv_dim, kv_dim * KV_ELEM_SIZE);
         }
         kv->len++;
 
@@ -888,16 +900,20 @@ static void fused_layer_forward(
                 float *qh = q + h * HEAD_DIM;
                 float *scores = malloc(kv->len * sizeof(float));
                 for (int p = 0; p < kv->len; p++) {
-                    float *kp = kv->k_cache + p * kv_dim + kv_h * HEAD_DIM;
+                    kv_elem_t *kp = kv->k_cache + p * kv_dim + kv_h * HEAD_DIM;
                     float dot = 0.0f;
-                    for (int d = 0; d < HEAD_DIM; d++) dot += qh[d] * kp[d];
+                    for (int d = 0; d < HEAD_DIM; d++) {
+                        dot += qh[d] * kv_elem_to_f32(kp[d]);
+                    }
                     scores[p] = dot * scale;
                 }
                 cpu_softmax(scores, kv->len);
                 float *oh = attn_out + h * HEAD_DIM;
                 for (int p = 0; p < kv->len; p++) {
-                    float *vp = kv->v_cache + p * kv_dim + kv_h * HEAD_DIM;
-                    for (int d = 0; d < HEAD_DIM; d++) oh[d] += scores[p] * vp[d];
+                    kv_elem_t *vp = kv->v_cache + p * kv_dim + kv_h * HEAD_DIM;
+                    for (int d = 0; d < HEAD_DIM; d++) {
+                        oh[d] += scores[p] * kv_elem_to_f32(vp[d]);
+                    }
                 }
                 free(scores);
             }
@@ -1765,6 +1781,11 @@ static void fused_layer_forward(
         }
 
         // DEFERRED commit — submit async, don't wait.
+#if USE_EVENT_PIPELINE
+        // Signal shared event (llama.cpp pattern) for non-blocking CPU/GPU sync.
+        g_metal->event_value++;
+        [cmd_experts encodeSignalEvent:g_metal->pipeline_event value:g_metal->event_value];
+#endif
         [cmd_experts commit];
         if (g_timing_enabled) {
             t1 = now_ms();
@@ -1777,6 +1798,9 @@ static void fused_layer_forward(
         g_deferred.active = 1;
         g_deferred.gpu_combined = gpu_combine;
         g_deferred.cmd_experts = cmd_experts;
+#if USE_EVENT_PIPELINE
+        g_deferred.expert_event_value = g_metal->event_value;    // for non-blocking wait
+#endif
         g_deferred.actual_K = actual_K;
         g_deferred.shared_gate_score = shared_gate_score;
         g_deferred.hidden = hidden;

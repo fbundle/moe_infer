@@ -43,6 +43,59 @@ static void cpu_dequant_matvec(
     }
 }
 
+#if USE_CPU_DEQUANT_FMA
+// Optimized variant: precompute scale*x and bias*x once per group
+// for the packed add path. Reduces inner-loop multiplies.
+static void cpu_dequant_matvec_fma(
+    const uint32_t *W, const uint16_t *scales, const uint16_t *biases,
+    const float *x, float *out,
+    int out_dim, int in_dim, int group_size
+) {
+    int num_groups = in_dim / group_size;
+    int packed_per_group = group_size / 8;
+    int packed_cols = in_dim / 8;
+
+    for (int row = 0; row < out_dim; row++) {
+        float acc = 0.0f;
+        const uint32_t *w_row = W + row * packed_cols;
+        const uint16_t *s_row = scales + row * num_groups;
+        const uint16_t *b_row = biases + row * num_groups;
+
+        for (int g = 0; g < num_groups; g++) {
+            float scale = bf16_to_f32(s_row[g]);
+            float bias = bf16_to_f32(b_row[g]);
+            int base_packed = g * packed_per_group;
+            int base_x = g * group_size;
+
+            for (int p = 0; p < packed_per_group; p++) {
+                uint32_t packed = w_row[base_packed + p];
+                int xb = base_x + p * 8;
+
+                // Precompute scale*x and bias*x, use FMA: nibble*(scale*x) + (bias*x)
+                float sx0 = scale * x[xb + 0], bx0 = bias * x[xb + 0];
+                float sx1 = scale * x[xb + 1], bx1 = bias * x[xb + 1];
+                float sx2 = scale * x[xb + 2], bx2 = bias * x[xb + 2];
+                float sx3 = scale * x[xb + 3], bx3 = bias * x[xb + 3];
+                float sx4 = scale * x[xb + 4], bx4 = bias * x[xb + 4];
+                float sx5 = scale * x[xb + 5], bx5 = bias * x[xb + 5];
+                float sx6 = scale * x[xb + 6], bx6 = bias * x[xb + 6];
+                float sx7 = scale * x[xb + 7], bx7 = bias * x[xb + 7];
+
+                acc += fmaf((float)((packed >>  0) & 0xF), sx0, bx0);
+                acc += fmaf((float)((packed >>  4) & 0xF), sx1, bx1);
+                acc += fmaf((float)((packed >>  8) & 0xF), sx2, bx2);
+                acc += fmaf((float)((packed >> 12) & 0xF), sx3, bx3);
+                acc += fmaf((float)((packed >> 16) & 0xF), sx4, bx4);
+                acc += fmaf((float)((packed >> 20) & 0xF), sx5, bx5);
+                acc += fmaf((float)((packed >> 24) & 0xF), sx6, bx6);
+                acc += fmaf((float)((packed >> 28) & 0xF), sx7, bx7);
+            }
+        }
+        out[row] = acc;
+    }
+}
+#endif // USE_CPU_DEQUANT_FMA
+
 // RMS normalization: out = x * w / rms(x)
 static void cpu_rms_norm(const float *x, const uint16_t *w_bf16, float *out, int dim, float eps) {
     float sum_sq = 0.0f;
@@ -88,17 +141,55 @@ static void cpu_softmax(float *x, int dim) {
     }
 }
 
-// Top-K: find K largest indices from scores[dim]
+// Top-K: find K largest indices from scores[dim].
+#if USE_HEAP_TOPK
+// Min-heap implementation: O(dim * log(K)) vs O(dim * K) for selection sort.
+// With K=8, ~2.5x fewer comparisons.
+// Pattern from llama.cpp: maintain a min-heap of the K smallest values found so far.
 static void cpu_topk(const float *scores, int dim, int K, int *indices, float *values) {
-    // Simple selection sort for small K
-    // Initialize with -inf
+    // Build initial heap with first K elements
+    int heap_size = 0;
+    for (int i = 0; i < dim; i++) {
+        if (heap_size < K) {
+            // Insert into heap (bubble up)
+            int pos = heap_size;
+            while (pos > 0 && values[(pos - 1) / 2] > scores[i]) {
+                values[pos] = values[(pos - 1) / 2];
+                indices[pos] = indices[(pos - 1) / 2];
+                pos = (pos - 1) / 2;
+            }
+            values[pos] = scores[i];
+            indices[pos] = i;
+            heap_size++;
+        } else if (scores[i] > values[0]) {
+            // Replace heap root with new value, then bubble down
+            values[0] = scores[i];
+            indices[0] = i;
+            int pos = 0;
+            while (1) {
+                int left = 2 * pos + 1, right = 2 * pos + 2, smallest = pos;
+                if (left < K && values[left] < values[smallest]) smallest = left;
+                if (right < K && values[right] < values[smallest]) smallest = right;
+                if (smallest == pos) break;
+                float tmp_v = values[pos];
+                int tmp_i = indices[pos];
+                values[pos] = values[smallest];
+                indices[pos] = indices[smallest];
+                values[smallest] = tmp_v;
+                indices[smallest] = tmp_i;
+                pos = smallest;
+            }
+        }
+    }
+}
+#else
+// Simple selection sort: O(dim * K). Used when heap implementation is disabled.
+static void cpu_topk(const float *scores, int dim, int K, int *indices, float *values) {
     for (int k = 0; k < K; k++) {
         values[k] = -1e30f;
         indices[k] = 0;
     }
-
     for (int i = 0; i < dim; i++) {
-        // Check if this score beats the smallest in our top-K
         int min_k = 0;
         for (int k = 1; k < K; k++) {
             if (values[k] < values[min_k]) min_k = k;
@@ -109,6 +200,7 @@ static void cpu_topk(const float *scores, int dim, int K, int *indices, float *v
         }
     }
 }
+#endif // USE_HEAP_TOPK
 
 // Normalize top-K weights to sum to 1
 static void cpu_normalize_weights(float *weights, int K) {

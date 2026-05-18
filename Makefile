@@ -20,7 +20,7 @@ endif
 # ── Debug build ───────────────────────────────────────────────────────────
 DEBUG ?= 0
 ifeq ($(DEBUG),1)
-	CFLAGS := -g -O0 -Wall -Wextra -fobjc-arc -Isrc -DDEBUG
+	CFLAGS := -g -O3 -Wall -Wextra -fobjc-arc -Isrc -DDEBUG
 endif
 
 # ── Targets ───────────────────────────────────────────────────────────────
@@ -47,7 +47,9 @@ INFER_HDEP = $(SRC_DIR)/util.h \
              $(SRC_DIR)/server.h \
              $(SRC_DIR)/tokenizer.h \
              $(SRC_DIR)/model_config.h \
-             $(SRC_DIR)/config.h
+             $(SRC_DIR)/config.h \
+             $(SRC_DIR)/optimization.h \
+             $(SRC_DIR)/flag.h
 
 $(BIN_DIR)/infer: $(INFER_SRCS) $(INFER_HDEP) $(SRC_DIR)/shaders.metal | $(BIN_DIR)
 	$(CC) $(CFLAGS) $(FW) $(LDFLAGS) $(INFER_SRCS) -o $@

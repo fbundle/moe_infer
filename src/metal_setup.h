@@ -20,6 +20,9 @@ typedef struct {
     id<MTLComputePipelineState> rms_norm_sum;
     id<MTLComputePipelineState> rms_norm_apply;
     id<MTLComputePipelineState> rms_norm_apply_bf16;
+#if USE_FUSED_RMS_NORM
+    id<MTLComputePipelineState> rms_norm_fused;     // single-kernel fused RMS norm (llama.cpp pattern)
+#endif
     id<MTLComputePipelineState> residual_add;
     id<MTLComputePipelineState> swiglu;
     // GPU attention pipelines
@@ -77,8 +80,10 @@ typedef struct {
     id<MTLBuffer> buf_combine_params; // [10 floats] expert weights[8] + shared_gate_score + padding
     id<MTLBuffer> buf_cmd3_sum_sq;    // [1 float] for RMS norm reduction in CMD3
     // Shared event for CPU-GPU synchronization (async pipeline)
+#if USE_EVENT_PIPELINE
     id<MTLSharedEvent> pipeline_event;   // CPU signals when buf_input is ready
     uint64_t event_value;                // monotonically increasing event counter
+#endif
     // GPU delta-net (gated_delta_net_step) and conv1d pipelines
     id<MTLComputePipelineState> delta_net_step;  // gated_delta_net_step kernel
     id<MTLComputePipelineState> conv1d_step;     // conv1d_step kernel
@@ -132,6 +137,12 @@ static MetalCtx *metal_setup(void) {
     MTLCompileOptions *opts = [[MTLCompileOptions alloc] init];
     opts.mathMode = MTLMathModeFast;
     opts.languageVersion = MTLLanguageVersion3_1;
+#if USE_KV_CACHE_BF16 || USE_FUSED_RMS_NORM
+    opts.preprocessorMacros = @{
+        @"USE_KV_CACHE_BF16": @(USE_KV_CACHE_BF16),
+        @"USE_FUSED_RMS_NORM": @(USE_FUSED_RMS_NORM),
+    };
+#endif
     double t0 = now_ms();
     ctx->library = [ctx->device newLibraryWithSource:src options:opts error:&error];
     if (!ctx->library) {
@@ -158,6 +169,9 @@ static MetalCtx *metal_setup(void) {
     ctx->rms_norm_sum  = makePipe(@"rms_norm_sum_sq");
     ctx->rms_norm_apply = makePipe(@"rms_norm_apply");
     ctx->rms_norm_apply_bf16 = makePipe(@"rms_norm_apply_bf16");
+#if USE_FUSED_RMS_NORM
+    ctx->rms_norm_fused  = makePipe(@"rms_norm_fused");
+#endif
     ctx->residual_add  = makePipe(@"residual_add");
     ctx->swiglu        = makePipe(@"swiglu_fused");
     ctx->attn_scores_pipe  = makePipe(@"attn_scores_batched");
@@ -280,7 +294,11 @@ static MetalCtx *metal_setup(void) {
     // GPU attention buffers
     {
         size_t kv_dim = NUM_KV_HEADS * HEAD_DIM;
+#if USE_KV_CACHE_BF16
+        size_t kv_cache_size = GPU_KV_SEQ * kv_dim * sizeof(uint16_t);
+#else
         size_t kv_cache_size = GPU_KV_SEQ * kv_dim * sizeof(float);
+#endif
         for (int i = 0; i < NUM_FULL_ATTN_LAYERS; i++) {
             ctx->buf_kv_k[i] = [ctx->device newBufferWithLength:kv_cache_size
                                                         options:MTLResourceStorageModeShared];
@@ -328,8 +346,10 @@ static MetalCtx *metal_setup(void) {
     }
 
     // Create shared event for CPU-GPU async pipeline
+#if USE_EVENT_PIPELINE
     ctx->pipeline_event = [ctx->device newSharedEvent];
     ctx->event_value = 0;
+#endif
 
     printf("[metal] Inference pipelines ready (multi-expert[%d] + shared buffers allocated)\n", MAX_K);
     return ctx;
@@ -445,7 +465,11 @@ static void fast_dequant_matvec(
         gpu_dequant_matvec(g_metal, W, scales, biases, x, out,
                            (uint32_t)out_dim, (uint32_t)in_dim, (uint32_t)group_size);
     } else {
+#if USE_CPU_DEQUANT_FMA
+        cpu_dequant_matvec_fma(W, scales, biases, x, out, out_dim, in_dim, group_size);
+#else
         cpu_dequant_matvec(W, scales, biases, x, out, out_dim, in_dim, group_size);
+#endif
     }
 }
 

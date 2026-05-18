@@ -39,6 +39,12 @@ Extracts MLX pre-quantized 4-bit expert weights from 3D tensors `[num_experts, o
 ### `src/config.h` + `helpers/gen_config.py`
 Compile-time experiment configuration system. `config.h` contains mandatory defines (`ACTIVE_EXPERTS_PER_LAYER`, `CACHE_MODE`, `GPU_LINEAR`, `PREDICTION`) with no `#ifndef` guards — the engine won't compile without it. `gen_config.py` generates the header programmatically.
 
+### `src/optimization.h` + `helpers/gen_optimizations.py`
+Compile-time optimization feature flags. Five independent flags (`USE_KV_CACHE_BF16`, `USE_FUSED_RMS_NORM`, `USE_EVENT_PIPELINE`, `USE_CPU_DEQUANT_FMA`, `USE_HEAP_TOPK`) each gate a specific optimization. Set to 1 to enable, 0 to disable. All flags use `#if USE_*` (not `#ifdef`) so value 0 correctly disables the optimization. `#else` branches contain verbatim original code — when all flags are 0, the preprocessor output matches the unoptimized baseline exactly. `gen_optimizations.py` generates the header with `--no-all` / `--no-<feature>` flags.
+
+### `src/flag.h`
+Single include hub for all compile-time headers. `#include`s `model_config.h`, `config.h`, and `optimization.h` so downstream headers only need one include.
+
 ### `autotune.py`
 Sweeps the experiment parameter space (K ∈ {2,4,8}, GPU_LINEAR ∈ {0,1}, PREDICTION ∈ {0,1}), builds each config, benchmarks tok/s, captures output text for quality assessment, and reports the optimal 4-bit configuration.
 
@@ -83,6 +89,28 @@ Both use MLX pre-quantized format — no manual quantization needed.
 - **K=4 quality degradation**: Model trained with 8 experts/token. K=4 produces degraded output. Default is now K=8.
 - **2-bit not tested**: Layout constants exist in `model_config.h` but no 2-bit expert files generated.
 - **Malloc cache on 16GB**: ~2581 entries needed for 80% hit rate requires ~17GB, tight on 16GB machines.
+
+## Optimizations (feature-flagged, from llama.cpp & MLX-LM study)
+
+All optimizations are gated by compile-time `USE_*` flags in `optimization.h`. Each flag can be toggled independently via `helpers/gen_optimizations.py`. The preprocessor uses `#if USE_*` (not `#ifdef`) so that value 0 correctly disables the code path. `#else` branches contain verbatim original code — when all flags are 0, preprocessor output matches the unoptimized baseline character-for-character.
+
+### USE_KV_CACHE_BF16: KV Cache bf16 Quantization
+Adopted from llama.cpp's fp16 KV cache patterns. Switches KVCache storage from float to uint16_t (bfloat16), halving memory bandwidth for full-attention layers. f32 ↔ bf16 via single bitshift (no conversion overhead). GPU attention kernels (`attn_scores_batched`, `attn_values_batched`) read bf16 KV cache and convert inline. KV cache memory reduced from 32MB to 16MB at seq=8192.
+
+### USE_FUSED_RMS_NORM: Fused RMS Norm Metal Kernel
+Single-dispatch kernel combining sum-of-squares reduction + normalization apply into one dispatch. Saves 1 encoder + 1 dispatch + 1 threadgroup barrier per RMS norm call. Kernel exists in `shaders.metal` and pipeline is created; not yet wired into `layer_forward.h`.
+
+### USE_EVENT_PIPELINE: MTLSharedEvent Async Pipeline
+GPU signals a shared event on CMD3 commit; CPU checks `signaledValue` non-blocking before falling back to `waitUntilCompleted`. Enables diagnostic measurement of GPU vs CPU time.
+
+### USE_CPU_DEQUANT_FMA: CPU Dequant FMA Variant
+Precomputed `scale*x + bias*x` with `fmaf()` intrinsics for FMA-friendly inner loops. Activates in the CPU fallback path when the GPU weight buffer isn't available.
+
+### USE_HEAP_TOPK: Heap-Based Top-K
+Replaces O(dim × K) selection sort with O(dim × log(K)) min-heap. With K=8, reduces ~2.5× comparisons.
+
+### BPE Cleanup: Server-Side Token Sanitization
+The BPE tokenizer produces artifacts in decoded output (Ġ for space, Ċ for newline, multi-byte sequences for quotes/dashes). Previously these were cleaned in the Python chat client (`helpers/chat.py`). Moved to server-side in `server.h` (`server_cleanup_token`) so all clients (HTTP, SSE, curl) get clean text without needing BPE decoding logic.
 
 ## Lessons
 

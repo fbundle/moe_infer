@@ -247,6 +247,50 @@ static void http_write_str(int fd, const char *s) {
     http_write(fd, s, (int)strlen(s));
 }
 
+// BPE token cleanup: the tokenizer produces artifacts (Ġ for space, Ċ for newline,
+// various multi-byte sequences for punctuation). Clean them server-side so all
+// clients get readable text without needing BPE decoding logic.
+static const char *server_cleanup_token(const char *raw) {
+    static char buf[512];
+    char *w = buf;
+    const char *end = buf + sizeof(buf) - 1;
+    const unsigned char *r = (const unsigned char *)raw;
+
+    while (*r && w < end) {
+        // Ġ (U+0120, 0xC4 0xA0) → space
+        if (r[0] == 0xC4 && r[1] == 0xA0) {
+            *w++ = ' '; r += 2; continue;
+        }
+        // Ċ (U+010A, 0xC4 0x8A) → newline
+        if (r[0] == 0xC4 && r[1] == 0x8A) {
+            *w++ = '\n'; r += 2; continue;
+        }
+        // ĉ (U+0109, 0xC4 0x89) → skip (stray continuation byte)
+        if (r[0] == 0xC4 && r[1] == 0x89) {
+            r += 2; continue;
+        }
+        // âĢĶ (U+00E2 U+0122 U+0136) → emdash —
+        if (r[0] == 0xC3 && r[1] == 0xA2 && r[2] == 0xC4 && r[3] == 0xA2 && r[4] == 0xC4 && r[5] == 0xB6) {
+            *w++ = 0xE2; *w++ = 0x80; *w++ = 0x94; r += 6; continue;
+        }
+        // âĢĵ (U+00E2 U+0122 U+0135) → endash –
+        if (r[0] == 0xC3 && r[1] == 0xA2 && r[2] == 0xC4 && r[3] == 0xA2 && r[4] == 0xC4 && r[5] == 0xB5) {
+            *w++ = 0xE2; *w++ = 0x80; *w++ = 0x93; r += 6; continue;
+        }
+        // âĢľ (U+00E2 U+0122 U+013E) → ''
+        if (r[0] == 0xC3 && r[1] == 0xA2 && r[2] == 0xC4 && r[3] == 0xA2 && r[4] == 0xC4 && r[5] == 0xBE) {
+            *w++ = '\''; *w++ = '\''; r += 6; continue;
+        }
+        // âĢĻ (U+00E2 U+0122 U+013B) → "
+        if (r[0] == 0xC3 && r[1] == 0xA2 && r[2] == 0xC4 && r[3] == 0xA2 && r[4] == 0xC4 && r[5] == 0xBB) {
+            *w++ = '"'; r += 6; continue;
+        }
+        *w++ = *r++;
+    }
+    *w = '\0';
+    return buf;
+}
+
 // Send an SSE chunk with a token delta
 // Returns 0 on success, -1 if client disconnected
 static int sse_send_delta(int fd, const char *request_id, const char *token_text) {
@@ -860,7 +904,8 @@ static void serve_loop(
                     }
                 }
 
-                const char *tok_str = decode_token(vocab, next_token);
+                const char *raw_str = decode_token(vocab, next_token);
+                const char *tok_str = server_cleanup_token(raw_str);
                 // Accumulate non-thinking response for session persistence
                 if (!in_think && tok_str && gen_resp_len + (int)strlen(tok_str) < 256*1024 - 1) {
                     int tlen = (int)strlen(tok_str);

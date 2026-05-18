@@ -3,18 +3,43 @@
 
 // ============================================================================
 // KV Cache for full attention layers
+//
+// With USE_KV_CACHE_BF16: stored as bfloat16 (uint16_t) to halve memory bandwidth.
+// llama.cpp-inspired: fp16/bf16 KV caches reduce cache line traffic by 2x
+// with negligible precision loss. f32<->bf16 conversion is a single bitshift.
 // ============================================================================
 
+#if USE_KV_CACHE_BF16
+typedef uint16_t kv_elem_t;
+#define KV_ELEM_SIZE sizeof(uint16_t)
+static inline float kv_elem_to_f32(uint16_t v) {
+    uint32_t bits = (uint32_t)v << 16;
+    float f;
+    memcpy(&f, &bits, sizeof(float));
+    return f;
+}
+static inline uint16_t f32_to_kv_elem(float v) {
+    uint32_t bits;
+    memcpy(&bits, &v, sizeof(uint32_t));
+    return (uint16_t)(bits >> 16);
+}
+#else
+typedef float kv_elem_t;
+#define KV_ELEM_SIZE sizeof(float)
+static inline float kv_elem_to_f32(float v) { return v; }
+static inline float f32_to_kv_elem(float v) { return v; }
+#endif
+
 typedef struct {
-    float *k_cache;  // [max_seq, num_kv_heads * head_dim]
-    float *v_cache;  // [max_seq, num_kv_heads * head_dim]
-    int len;         // current number of cached entries
+    kv_elem_t *k_cache;  // [max_seq, num_kv_heads * head_dim]
+    kv_elem_t *v_cache;  // [max_seq, num_kv_heads * head_dim]
+    int len;              // current number of cached entries
 } KVCache;
 
 static KVCache *kv_cache_new(void) {
     KVCache *c = calloc(1, sizeof(KVCache));
-    c->k_cache = calloc(MAX_SEQ_LEN * NUM_KV_HEADS * HEAD_DIM, sizeof(float));
-    c->v_cache = calloc(MAX_SEQ_LEN * NUM_KV_HEADS * HEAD_DIM, sizeof(float));
+    c->k_cache = calloc(MAX_SEQ_LEN * NUM_KV_HEADS * HEAD_DIM, KV_ELEM_SIZE);
+    c->v_cache = calloc(MAX_SEQ_LEN * NUM_KV_HEADS * HEAD_DIM, KV_ELEM_SIZE);
     c->len = 0;
     return c;
 }
@@ -202,8 +227,15 @@ static void full_attention_forward(
 
     // ---- Update KV cache ----
     int cache_pos = kv->len;
+#if USE_KV_CACHE_BF16
+    for (int i = 0; i < kv_dim; i++) {
+        kv->k_cache[cache_pos * kv_dim + i] = f32_to_kv_elem(k[i]);
+        kv->v_cache[cache_pos * kv_dim + i] = f32_to_kv_elem(v[i]);
+    }
+#else
     memcpy(kv->k_cache + cache_pos * kv_dim, k, kv_dim * sizeof(float));
     memcpy(kv->v_cache + cache_pos * kv_dim, v, kv_dim * sizeof(float));
+#endif
     kv->len++;
 
     // ---- Scaled dot-product attention ----
@@ -221,10 +253,10 @@ static void full_attention_forward(
         // Compute attention scores for all cached positions
         float *scores = malloc(kv->len * sizeof(float));
         for (int p = 0; p < kv->len; p++) {
-            float *kp = kv->k_cache + p * kv_dim + kv_h * HEAD_DIM;
+            kv_elem_t *kp = kv->k_cache + p * kv_dim + kv_h * HEAD_DIM;
             float dot = 0.0f;
             for (int d = 0; d < HEAD_DIM; d++) {
-                dot += qh[d] * kp[d];
+                dot += qh[d] * kv_elem_to_f32(kp[d]);
             }
             scores[p] = dot * scale;
         }
@@ -235,9 +267,9 @@ static void full_attention_forward(
         // Weighted sum of values
         float *oh = attn_out + h * HEAD_DIM;
         for (int p = 0; p < kv->len; p++) {
-            float *vp = kv->v_cache + p * kv_dim + kv_h * HEAD_DIM;
+            kv_elem_t *vp = kv->v_cache + p * kv_dim + kv_h * HEAD_DIM;
             for (int d = 0; d < HEAD_DIM; d++) {
-                oh[d] += scores[p] * vp[d];
+                oh[d] += scores[p] * kv_elem_to_f32(vp[d]);
             }
         }
         free(scores);

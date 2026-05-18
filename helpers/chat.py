@@ -18,25 +18,6 @@ import urllib.error
 
 SESSIONS_DIR = os.path.expanduser("~/.flash-moe/sessions")
 
-# BPE artifacts — the tokenizer leaves these in decoded output
-BPE_CLEANUP = [
-    ("Ġ", " "),    # GPT-2 / Qwen space token
-    ("Ċ", "\n"),   # newline artifact
-    ("âĢĶ", "—"),  # emdash
-    ("âĢĵ", "–"),  # endash
-    ("âĢľ", "''"),
-    ("âĢĻ", "\""),
-    ("ĉ", ""),     # stray continuation byte
-]
-
-
-def clean_text(text: str) -> str:
-    """Clean BPE artifacts from decoded text."""
-    for a, b in BPE_CLEANUP:
-        text = text.replace(a, b)
-    return text
-
-
 def load_sessions():
     """List saved sessions."""
     if not os.path.isdir(SESSIONS_DIR):
@@ -113,8 +94,6 @@ def stream_chat(host: str, port: int, prompt: str, max_tokens: int,
                 if choices[0].get("finish_reason"):
                     break
                 continue
-
-            token = clean_text(token)
 
             if first_token:
                 first_token = False
