@@ -119,7 +119,7 @@ static LayerTimingAccum g_timing = {0};
 static int g_timing_enabled = 0;
 
 // Temporal prediction pipeline counters (declared early for timing_print access)
-static int g_pred_enabled = PREDICTION;
+static int g_pred_enabled = USE_EXPERT_PREDICTION;
 static int g_pred_generating = 0;   // only set to 1 after prefill (predictions only help during generation)
 static uint64_t g_pred_hits = 0;
 static uint64_t g_pred_misses = 0;
@@ -475,7 +475,6 @@ typedef struct {
 } WeightFile;
 
 static WeightFile *open_weights(const char *bin_path, const char *json_path) {
-    // mmap the binary file
     int fd = open(bin_path, O_RDONLY);
     if (fd < 0) {
         fprintf(stderr, "ERROR: Cannot open %s: %s\n", bin_path, strerror(errno));
@@ -486,19 +485,48 @@ static WeightFile *open_weights(const char *bin_path, const char *json_path) {
     fstat(fd, &st);
     size_t size = st.st_size;
 
+#if MALLOC_WEIGHTS
+    // Page-aligned allocation for zero-copy Metal buffer wrapping.
+    // Non-expert weights are always in use — read them all upfront.
+    size_t page_size = 16384;
+    size_t aligned_size = (size + page_size - 1) & ~(page_size - 1);
+    void *data = NULL;
+    if (posix_memalign(&data, page_size, aligned_size) != 0) {
+        fprintf(stderr, "ERROR: posix_memalign failed for %.2f GB\n", size / 1e9);
+        close(fd);
+        return NULL;
+    }
+    size_t total = 0;
+    while (total < size) {
+        ssize_t n = read(fd, (char *)data + total, size - total);
+        if (n <= 0) {
+            fprintf(stderr, "ERROR: read failed at %zu / %zu: %s\n", total, size, strerror(errno));
+            free(data);
+            close(fd);
+            return NULL;
+        }
+        total += (size_t)n;
+    }
+    close(fd);
+    printf("[weights] loaded %.2f GB from %s\n", total / 1e9, bin_path);
+#else
     void *data = mmap(NULL, size, PROT_READ, MAP_PRIVATE, fd, 0);
     close(fd);
     if (data == MAP_FAILED) {
         fprintf(stderr, "ERROR: mmap failed: %s\n", strerror(errno));
         return NULL;
     }
-
-    // Advise sequential access
     madvise(data, size, MADV_SEQUENTIAL);
+    printf("[weights] mmap'd %.2f GB from %s\n", size / 1e9, bin_path);
+#endif
 
     TensorManifest *manifest = load_manifest(json_path);
     if (!manifest) {
+#if MALLOC_WEIGHTS
+        free(data);
+#else
         munmap(data, size);
+#endif
         return NULL;
     }
 
@@ -506,8 +534,6 @@ static WeightFile *open_weights(const char *bin_path, const char *json_path) {
     wf->data = data;
     wf->size = size;
     wf->manifest = manifest;
-
-    printf("[weights] mmap'd %.2f GB from %s\n", size / 1e9, bin_path);
     return wf;
 }
 
@@ -2330,7 +2356,7 @@ static void cpu_rms_norm_gated(const float *x, const float *z, const uint16_t *w
 }
 
 static int linear_attn_bypass = 0;  // set to 1 to skip linear attention (identity)
-static int gpu_linear_attn_enabled = GPU_LINEAR;  // fused GPU delta-net path (compile-time)
+static int gpu_linear_attn_enabled = USE_GPU_LINEAR;  // fused GPU delta-net path (compile-time)
 
 __attribute__((unused))
 static void linear_attention_forward(
@@ -6428,10 +6454,7 @@ static void serve_loop(
 
 static void print_usage(const char *prog) {
     printf("Usage: %s [options]\n", prog);
-    printf("  --model PATH         Model path\n");
-    printf("  --weights PATH       model_weights.bin path\n");
-    printf("  --manifest PATH      model_weights.json path\n");
-    printf("  --vocab PATH         vocab.bin path\n");
+    printf("  --model PATH         Data directory (weights, vocab, experts) [default: data]\n");
     printf("  --prompt-tokens PATH prompt_tokens.bin path\n");
     printf("  --prompt TEXT         Prompt text (requires encode_prompt.py)\n");
     printf("  --tokens N           Max tokens to generate (default: 20)\n");
@@ -6444,29 +6467,23 @@ static void print_usage(const char *prog) {
     printf("  --serve PORT         Run HTTP server (OpenAI-compatible API)\n");
     printf("  --collect-routing F  Log routing data to binary file F (for predictor training)\n");
     printf("  --help               This message\n");
-    printf("\nExperiment knobs (K, cache mode, linear backend, prediction) are compile-time\n");
-    printf("via src/config.h.  Run autotune.py to sweep and find the best configuration.\n");
+    printf("\nExperiment knobs are compile-time via src/config.h.\n");
+    printf("Run autotune.py to sweep and find the best configuration.\n");
 }
 
 int main(int argc, char **argv) {
     @autoreleasepool {
-        const char *model_path = MODEL_PATH_DEFAULT;
-        const char *weights_path = NULL;
-        const char *manifest_path = NULL;
-        const char *vocab_path = NULL;
+        const char *model_path = "data";
         const char *prompt_tokens_path = NULL;
         const char *prompt_text = NULL;
         int max_tokens = 20;
-        int K = ACTIVE_EXPERTS_PER_LAYER;
-        int cache_entries = 0;  // Metal LRU deprecated (paper: -38%), CACHE_MODE handles malloc
-        int malloc_cache_entries = (CACHE_MODE == 1) ? CACHE_ENTRIES : 0;
+        int K = NUM_ACTIVE_EXPERTS;
+        int cache_entries = 0;  // Metal LRU deprecated (paper: -38%), EXPERT_CACHE_MODE handles malloc
+        int malloc_cache_entries = (EXPERT_CACHE_MODE == 1) ? EXPERT_CACHE_ENTRIES : 0;
         int serve_port = 0;  // 0 = disabled, >0 = HTTP serve mode
 
         static struct option long_options[] = {
             {"model",         required_argument, 0, 'm'},
-            {"weights",       required_argument, 0, 'w'},
-            {"manifest",      required_argument, 0, 'j'},
-            {"vocab",         required_argument, 0, 'v'},
             {"prompt-tokens", required_argument, 0, 'p'},
             {"prompt",        required_argument, 0, 'P'},
             {"tokens",        required_argument, 0, 't'},
@@ -6483,12 +6500,9 @@ int main(int argc, char **argv) {
         };
 
         int c;
-        while ((c = getopt_long(argc, argv, "m:w:j:v:p:P:t:2SR:B:TFEZh", long_options, NULL)) != -1) {
+        while ((c = getopt_long(argc, argv, "m:p:P:t:2SR:B:TFEZh", long_options, NULL)) != -1) {
             switch (c) {
                 case 'm': model_path = optarg; break;
-                case 'w': weights_path = optarg; break;
-                case 'j': manifest_path = optarg; break;
-                case 'v': vocab_path = optarg; break;
                 case 'p': prompt_tokens_path = optarg; break;
                 case 'P': prompt_text = optarg; break;
                 case 't': max_tokens = atoi(optarg); break;
@@ -6511,37 +6525,11 @@ int main(int argc, char **argv) {
             }
         }
 
-        // Build default paths
-        char default_weights[1024], default_manifest[1024], default_vocab[1024];
-
-        // Try to find files relative to the executable
-        if (!weights_path) {
-            snprintf(default_weights, sizeof(default_weights),
-                     "data/model_weights.bin");
-            if (access(default_weights, R_OK) != 0) {
-                snprintf(default_weights, sizeof(default_weights),
-                         "model_weights.bin");
-            }
-            weights_path = default_weights;
-        }
-        if (!manifest_path) {
-            snprintf(default_manifest, sizeof(default_manifest),
-                     "data/model_weights.json");
-            if (access(default_manifest, R_OK) != 0) {
-                snprintf(default_manifest, sizeof(default_manifest),
-                         "model_weights.json");
-            }
-            manifest_path = default_manifest;
-        }
-        if (!vocab_path) {
-            snprintf(default_vocab, sizeof(default_vocab),
-                     "data/vocab.bin");
-            if (access(default_vocab, R_OK) != 0) {
-                snprintf(default_vocab, sizeof(default_vocab),
-                         "vocab.bin");
-            }
-            vocab_path = default_vocab;
-        }
+        // All data files live under model_path
+        char weights_path[1024], manifest_path[1024], vocab_path[1024];
+        snprintf(weights_path, sizeof(weights_path), "%s/model_weights.bin", model_path);
+        snprintf(manifest_path, sizeof(manifest_path), "%s/model_weights.json", model_path);
+        snprintf(vocab_path, sizeof(vocab_path), "%s/vocab.bin", model_path);
 
         // ---- Model config from compile-time model_config.h ----
         print_model_config();
@@ -6575,8 +6563,8 @@ int main(int argc, char **argv) {
         printf("Quant:    %s experts (%zu bytes each)\n", g_use_2bit ? "2-bit" : "4-bit", active_expert_size());
         printf("Linear:   %s\n", gpu_linear_attn_enabled ? "fused GPU delta-net" : "CPU/hybrid fallback");
         printf("Tokens:   %d\n", max_tokens);
-        printf("Cache:    %s\n", CACHE_MODE == 0 ? "OS page cache" : "malloc cache");
-        printf("Prediction: %s\n", PREDICTION ? "enabled" : "disabled");
+        printf("Cache:    %s\n", EXPERT_CACHE_MODE == 0 ? "OS page cache" : "malloc cache");
+        printf("Prediction: %s\n", USE_EXPERT_PREDICTION ? "enabled" : "disabled");
 
         double t0 = now_ms();
 

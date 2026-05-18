@@ -5,9 +5,7 @@ Sweeps the compile-time experiment parameter space, builds each config,
 benchmarks it, and reports the optimal configuration.
 
 Usage:
-  python autotune.py                  # full sweep
-  python autotune.py --quick          # fast sweep (fewer K values)
-  python autotune.py --k 4 --k 8      # test specific K values only
+  python autotune.py
 """
 import argparse
 import json
@@ -23,21 +21,22 @@ GEN_SCRIPT = os.path.join(REPO_ROOT, "helpers", "gen_config.py")
 BIN_DIR = os.path.join(REPO_ROOT, "bin")
 INFER_BIN = os.path.join(BIN_DIR, "infer")
 
-# Benchmark prompt — short enough to finish fast, long enough to exercise the pipeline
 BENCH_PROMPT = "Explain quantum computing in one sentence."
 BENCH_TOKENS = 100
 
 
-def generate_config(k: int, cache_mode: int, cache_entries: int,
-                    gpu_linear: int, prediction: int) -> bool:
+def generate_config(active_experts: int, expert_cache_mode: int,
+                    expert_cache_entries: int, use_gpu_linear: int,
+                    use_expert_prediction: int, malloc_weights: int) -> bool:
     """Generate src/config.h. Returns True if changed."""
     cmd = [
         sys.executable, GEN_SCRIPT,
-        "--k", str(k),
-        "--cache_mode", str(cache_mode),
-        "--cache_entries", str(cache_entries),
-        "--gpu_linear", str(gpu_linear),
-        "--prediction", str(prediction),
+        "--active_experts", str(active_experts),
+        "--expert_cache_mode", str(expert_cache_mode),
+        "--expert_cache_entries", str(expert_cache_entries),
+        "--use_gpu_linear", str(use_gpu_linear),
+        "--use_expert_prediction", str(use_expert_prediction),
+        "--malloc_weights", str(malloc_weights),
     ]
     result = subprocess.run(cmd, capture_output=True, text=True, cwd=REPO_ROOT)
     if "unchanged" in result.stdout:
@@ -49,7 +48,7 @@ def generate_config(k: int, cache_mode: int, cache_entries: int,
 def build() -> bool:
     """Build the inference binary. Returns True on success."""
     result = subprocess.run(
-        ["make", "infer"],
+        ["make"],
         capture_output=True, text=True, cwd=REPO_ROOT
     )
     if result.returncode != 0:
@@ -58,7 +57,7 @@ def build() -> bool:
     return True
 
 
-def benchmark() -> tuple[Optional[float], str]:
+def benchmark(retry: bool = True) -> tuple[Optional[float], str]:
     """Run inference benchmark. Returns (tok/s or None, generated text)."""
     cmd = [
         INFER_BIN,
@@ -72,74 +71,73 @@ def benchmark() -> tuple[Optional[float], str]:
     combined = result.stdout + result.stderr
 
     if result.returncode != 0:
-        print(f"BENCHMARK FAILED (exit {result.returncode}):\n{result.stderr[-500:]}")
-        return None, combined
+        if retry:
+            print("(retry)", end=" ", flush=True)
+            return benchmark(retry=False)
+        print(f"FAILED (exit {result.returncode}):\n{result.stderr[-300:]}")
+        return None, ""
 
-    # Parse output for tok/s.  infer.m prints lines like:
-    #   [stats] 100 tokens in 18.32s (5.46 tok/s)
+    # Parse tok/s from:  Generation:     X.X s (Y.YY tok/s)
     toks = None
     for line in combined.splitlines():
         m = re.search(r'([\d.]+)\s*tok/s', line)
         if m:
             toks = float(m.group(1))
+            break
 
     if toks is None:
-        toks = BENCH_TOKENS / elapsed
-        print(f"  (no tok/s in output, using wall time: {toks:.2f} tok/s)")
+        toks = BENCH_TOKENS / max(elapsed, 0.1)
 
-    # Extract the generated text (lines between [prompt] and [stats])
-    lines = combined.splitlines()
+    # Extract generated text after [prompt], stop at timing lines
     text_lines = []
-    in_output = False
-    for line in lines:
-        if '[prompt]' in line or '[stats]' in line:
-            in_output = not in_output
+    capture = False
+    for line in combined.splitlines():
+        stripped = line.strip()
+        if '[prompt]' in stripped:
+            capture = True
             continue
-        if in_output and line.strip() and not line.startswith('['):
-            text_lines.append(line.strip())
-    generated_text = ' '.join(text_lines).strip()
+        if capture:
+            if any(tag in stripped for tag in
+                   ('[ttft]', '[timing]', '---', 'Generation:', 'TTFT:', 'Tokens:')):
+                break
+            if stripped.startswith('[') or stripped.startswith('Config:'):
+                continue
+            cleaned = stripped.replace('Ġ', ' ').replace('Ċ', '\n')
+            if cleaned.strip():
+                text_lines.append(cleaned)
 
+    generated_text = ' '.join(text_lines).strip()
     return toks, generated_text
 
 
-def config_key(k: int, cm: int, gl: int, pred: int) -> str:
-    return f"K={k}_CM={cm}_GL={gl}_P={pred}"
+def config_key(k: int, cm: int, gl: int, pred: int, umw: int) -> str:
+    return f"K={k}_GL={gl}_P={pred}_UMW={umw}"
 
 
 def main():
     parser = argparse.ArgumentParser(description="Autotune Flash-MoE 4-bit configs")
-    parser.add_argument("--quick", action="store_true",
-                        help="Fast sweep: skip K=2 (low quality) and prediction")
-    parser.add_argument("--k", type=int, nargs="+",
-                        default=[2, 4, 8],
-                        help="K values to test (default: 2 4 8)")
-    parser.add_argument("--gpu_linear", type=int, nargs="+",
-                        default=[0, 1],
+    parser.add_argument("--active_experts", type=int, nargs="+", default=[8],
+                        help="Active experts values (default: 8)")
+    parser.add_argument("--use_gpu_linear", type=int, nargs="+", default=[0, 1],
                         help="GPU linear values (default: 0 1)")
-    parser.add_argument("--prediction", type=int, nargs="+",
-                        default=[0, 1],
-                        help="Prediction values (default: 0 1)")
+    parser.add_argument("--use_expert_prediction", type=int, nargs="+", default=[0, 1],
+                        help="Expert prediction values (default: 0 1)")
+    parser.add_argument("--malloc_weights", type=int, nargs="+", default=[0, 1],
+                        help="Malloc weights values (default: 0 1)")
     parser.add_argument("--json", action="store_true",
                         help="Output results as JSON")
     args = parser.parse_args()
 
-    ks = args.k
-    if args.quick:
-        ks = [k for k in ks if k != 2]
-        # Skip prediction sweep in quick mode
-        predictions = [0]
-    else:
-        predictions = args.prediction
+    ks = args.active_experts
+    predictions = args.use_expert_prediction
+    use_malloc_opts = args.malloc_weights
+    cache_modes = [0]  # Only OS page cache (paper winner)
 
-    # CACHE_MODE: only test OS page cache (paper winner: +38% over custom caches).
-    # Malloc cache with enough entries to matter (~2581) needs ~17GB — tight on 16GB.
-    cache_modes = [0]
-
-    # Shared expert baseline info
-    total_configs = len(ks) * len(cache_modes) * len(args.gpu_linear) * len(predictions)
+    total_configs = (len(ks) * len(cache_modes) * len(args.use_gpu_linear) *
+                     len(predictions) * len(use_malloc_opts))
     print(f"=== Flash-MoE 4-bit Autotune ===")
-    print(f"Sweep: K∈{ks}, CACHE_MODE∈{cache_modes}, GPU_LINEAR∈{args.gpu_linear}, "
-          f"PREDICTION∈{predictions}")
+    print(f"Sweep: ACTIVE_EXPERTS∈{ks}, GPU_LINEAR∈{args.use_gpu_linear}, "
+          f"PREDICTION∈{predictions}, MALLOC_WEIGHTS∈{use_malloc_opts}")
     print(f"Total configs: {total_configs}")
     print(f"Prompt: \"{BENCH_PROMPT}\" ({BENCH_TOKENS} tokens)\n")
 
@@ -149,39 +147,43 @@ def main():
 
     for k in ks:
         for cm in cache_modes:
-            for gl in args.gpu_linear:
+            for gl in args.use_gpu_linear:
                 for pred in predictions:
-                    key = config_key(k, cm, gl, pred)
-                    cache_entries = 0  # OS page cache doesn't use malloc entries
+                    for umw in use_malloc_opts:
+                        key = config_key(k, cm, gl, pred, umw)
+                        ce = 0
 
-                    print(f"[{len(results) + 1}/{total_configs}] {key} ", end="", flush=True)
+                        print(f"[{len(results) + 1}/{total_configs}] {key} ",
+                              end="", flush=True)
 
-                    changed = generate_config(k, cm, cache_entries, gl, pred)
-                    if changed or not os.path.exists(INFER_BIN):
-                        print(" building...", end=" ", flush=True)
-                        if not build():
-                            print("SKIP (build failed)")
+                        changed = generate_config(k, cm, ce, gl, pred, umw)
+                        if changed or not os.path.exists(INFER_BIN):
+                            print(" building...", end=" ", flush=True)
+                            if not build():
+                                print("SKIP (build failed)")
+                                continue
+                        else:
+                            print("(unchanged, skip rebuild)", end=" ", flush=True)
+
+                        print(" running...", end=" ", flush=True)
+                        toks, text = benchmark()
+                        if toks is None:
+                            print("SKIP (benchmark failed)")
                             continue
-                    else:
-                        print(" (unchanged, skip rebuild)", end=" ", flush=True)
 
-                    print(" running...", end=" ", flush=True)
-                    toks, text = benchmark()
-                    if toks is None:
-                        print("SKIP (benchmark failed)")
-                        continue
+                        print(f"{toks:.2f} tok/s")
+                        if text:
+                            print(f"  \033[2;37m{text[:200]}\033[0m")
+                        results.append({
+                            "active_experts": k, "expert_cache_mode": cm,
+                            "use_gpu_linear": gl, "use_expert_prediction": pred,
+                            "malloc_weights": umw,
+                            "tok_s": round(toks, 2), "text": text,
+                        })
 
-                    print(f"{toks:.2f} tok/s")
-                    if text:
-                        # Show generated text dimmed so quality can be assessed
-                        print(f"  \033[2;37m{text[:200]}\033[0m")
-                    results.append({"k": k, "cache_mode": cm, "cache_entries": cache_entries,
-                                    "gpu_linear": gl, "prediction": pred, "tok_s": round(toks, 2),
-                                    "text": text})
-
-                    if toks > best_toks:
-                        best_toks = toks
-                        best_config = results[-1]
+                        if toks > best_toks:
+                            best_toks = toks
+                            best_config = results[-1]
 
     # Summary
     print(f"\n=== Results ({len(results)}/{total_configs} successful) ===\n")
@@ -190,23 +192,28 @@ def main():
         print(json.dumps(results, indent=2))
         return
 
-    # Sort by tok/s descending
     results.sort(key=lambda r: r["tok_s"], reverse=True)
-    print(f"{'Rank':<5} {'K':<4} {'Cache':<7} {'GPU_Lin':<8} {'Pred':<5} {'tok/s':<8}")
-    print("-" * 45)
+    header = f"{'Rank':<5} {'K':<4} {'GPU_Lin':<8} {'Pred':<5} {'MallocW':<8} {'tok/s':<8}"
+    print(header)
+    print("-" * len(header))
     for i, r in enumerate(results):
         marker = " <-- BEST" if i == 0 else ""
-        print(f"{i+1:<5} {r['k']:<4} {r['cache_mode']:<7} {r['gpu_linear']:<8} "
-              f"{r['prediction']:<5} {r['tok_s']:<8.2f}{marker}")
+        print(f"{i+1:<5} {r['active_experts']:<4} {r['use_gpu_linear']:<8} "
+              f"{r['use_expert_prediction']:<5} {r['malloc_weights']:<8} "
+              f"{r['tok_s']:<8.2f}{marker}")
 
     if best_config:
-        print(f"\nBest: K={best_config['k']}, CACHE_MODE={best_config['cache_mode']}, "
-              f"GPU_LINEAR={best_config['gpu_linear']}, PREDICTION={best_config['prediction']} "
+        bc = best_config
+        print(f"\nBest: ACTIVE_EXPERTS={bc['active_experts']}, "
+              f"USE_GPU_LINEAR={bc['use_gpu_linear']}, "
+              f"USE_EXPERT_PREDICTION={bc['use_expert_prediction']}, "
+              f"MALLOC_WEIGHTS={bc['malloc_weights']} "
               f"→ {best_toks:.2f} tok/s")
-        print(f"\nApply: python helpers/gen_config.py --k {best_config['k']} "
-              f"--cache_mode {best_config['cache_mode']} "
-              f"--gpu_linear {best_config['gpu_linear']} "
-              f"--prediction {best_config['prediction']} && make")
+        print(f"\nApply: python helpers/gen_config.py "
+              f"--active_experts {bc['active_experts']} "
+              f"--use_gpu_linear {bc['use_gpu_linear']} "
+              f"--use_expert_prediction {bc['use_expert_prediction']} "
+              f"--malloc_weights {bc['malloc_weights']} && make")
 
 
 if __name__ == "__main__":

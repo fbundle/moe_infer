@@ -26,7 +26,7 @@ endif
 # ── Targets ───────────────────────────────────────────────────────────────
 .PHONY: all clean metallib help
 
-all: $(BIN_DIR)/infer $(BIN_DIR)/chat
+all: $(BIN_DIR)/infer
 
 $(BIN_DIR):
 	mkdir -p $(BIN_DIR)
@@ -34,14 +34,6 @@ $(BIN_DIR):
 # ── Inference engine ──────────────────────────────────────────────────────
 $(BIN_DIR)/infer: $(SRC_DIR)/infer.m $(SRC_DIR)/shaders.metal $(SRC_DIR)/model_config.h $(SRC_DIR)/config.h | $(BIN_DIR)
 	$(CC) $(CFLAGS) $(FW) $(LDFLAGS) $(SRC_DIR)/infer.m -o $@
-
-# ── MoE benchmark ─────────────────────────────────────────────────────────
-$(BIN_DIR)/bench: $(SRC_DIR)/main.m $(SRC_DIR)/shaders.metal $(SRC_DIR)/model_config.h | $(BIN_DIR)
-	$(CC) $(CFLAGS) $(FW) $(LDFLAGS) $(SRC_DIR)/main.m -o $@
-
-# ── Chat TUI ──────────────────────────────────────────────────────────────
-$(BIN_DIR)/chat: $(SRC_DIR)/chat.m $(SRC_DIR)/linenoise.c $(SRC_DIR)/linenoise.h | $(BIN_DIR)
-	$(CC) -O2 -Wall -fobjc-arc -framework Foundation $(SRC_DIR)/chat.m $(SRC_DIR)/linenoise.c -o $@
 
 # ── Pre-compiled Metal library ────────────────────────────────────────────
 metallib: $(BIN_DIR)/shaders.metallib
@@ -59,9 +51,7 @@ help:
 	@echo "Flash-MoE Makefile"
 	@echo ""
 	@echo "Build targets:"
-	@echo "  make              Build infer + chat"
-	@echo "  make bench        Build MoE benchmark (bin/bench)"
-	@echo "  make chat         Build chat TUI (bin/chat)"
+	@echo "  make              Build infer"
 	@echo "  make metallib     Pre-compile Metal shader library"
 	@echo "  make clean        Remove bin/"
 	@echo ""

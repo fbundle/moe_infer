@@ -107,10 +107,4 @@
 #define THINK_START_TOKEN   248068
 #define THINK_END_TOKEN     248069
 
-// ============================================================================
-// Default model path
-// ============================================================================
-
-#define MODEL_PATH_DEFAULT "hub/models--mlx-community--Qwen3.5-35B-A3B-4bit"
-
 #endif // MODEL_CONFIG_H

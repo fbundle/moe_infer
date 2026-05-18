@@ -34,7 +34,7 @@ This creates `src/model_config.h` with all dimension constants, expert layout of
 python helpers/extract_weights.py
 ```
 
-Writes `data/model_weights.bin` (~1.38 GB) and `data/model_weights.json` manifest. These are mmap'd at runtime.
+Writes `data/model_weights.bin` (~1.38 GB) and `data/model_weights.json` manifest. These are read into memory at startup (always in use, no benefit from lazy loading).
 
 ### 4. Repack expert weights
 
@@ -47,10 +47,10 @@ Extracts per-layer binary files into `packed_experts/layer_00.bin` through `laye
 ### 5. Generate experiment config
 
 ```bash
-python helpers/gen_config.py --k 8 --cache-mode 0 --gpu-linear 1 --prediction 0
+python helpers/gen_config.py --active_experts 8 --use_gpu_linear 1
 ```
 
-Creates `src/config.h` with compile-time experiment knobs. Run `make autotune` later to find the best values.
+Creates `src/config.h` with compile-time experiment knobs. Run `python autotune.py` later to find the best values.
 
 ### 6. Build
 
@@ -58,7 +58,7 @@ Creates `src/config.h` with compile-time experiment knobs. Run `make autotune` l
 make
 ```
 
-Builds `bin/infer` (inference engine) and `bin/chat` (interactive TUI).
+Builds `bin/infer` (inference engine).
 
 ### 7. Run
 
@@ -67,7 +67,7 @@ Builds `bin/infer` (inference engine) and `bin/chat` (interactive TUI).
 ./bin/infer --prompt "Explain quantum computing" --tokens 100
 
 # Interactive chat
-./bin/chat --k 8
+python helpers/chat.py
 
 # Per-layer timing breakdown
 ./bin/infer --prompt "Hello" --tokens 20 --timing
@@ -77,20 +77,18 @@ Builds `bin/infer` (inference engine) and `bin/chat` (interactive TUI).
 
 ```
 src/
-  infer.m              # Inference engine
+  infer.m              # Inference engine (~7000 lines)
   shaders.metal        # Metal compute kernels
-  chat.m               # Interactive chat TUI
-  main.m               # MoE benchmark
   model_config.h       # Model dimensions (generated)
   config.h             # Experiment knobs (generated)
   tokenizer.h          # C BPE tokenizer
-  linenoise.c/h        # Line editor
 helpers/
   gen_model_config.py     # Generate model_config.h from HF config.json
   extract_weights.py      # Non-expert weights → data/model_weights.bin
   repack_experts_4bit.py  # MLX 4-bit experts → packed_experts/
   repack_experts_2bit.py  # 4-bit → 2-bit requantization
   gen_config.py           # Generate config.h with experiment values
+  chat.py                # Interactive chat client (connect to infer.m --serve)
 autotune.py            # Sweep experiment configs, find optimal 4-bit setup
 Makefile               # Build system
 data/                  # Weights, vocab, tokenizer (generated, gitignored)
@@ -105,19 +103,20 @@ All experiment knobs are **compile-time** — no runtime overhead from condition
 
 | Define | Values | Description |
 |--------|--------|-------------|
-| `ACTIVE_EXPERTS_PER_LAYER` | 2, 4, 8 | Active experts per layer |
-| `CACHE_MODE` | 0, 1 | 0 = OS page cache, 1 = malloc cache |
-| `CACHE_ENTRIES` | 0..N | Malloc cache entries (mode 1 only) |
-| `GPU_LINEAR` | 0, 1 | 1 = fused GPU delta-net, 0 = CPU BLAS |
-| `PREDICTION` | 0, 1 | Temporal expert prediction (paper: -18%) |
+| `NUM_ACTIVE_EXPERTS` | 2, 4, 8 | Active experts per layer |
+| `EXPERT_CACHE_MODE` | 0, 1 | 0 = OS page cache, 1 = malloc cache |
+| `EXPERT_CACHE_ENTRIES` | 0..N | Malloc cache entries (mode 1 only) |
+| `USE_GPU_LINEAR` | 0, 1 | 1 = fused GPU delta-net, 0 = CPU BLAS |
+| `USE_EXPERT_PREDICTION` | 0, 1 | Temporal expert prediction |
+| `MALLOC_WEIGHTS` | 0, 1 | 1 = malloc+read weights, 0 = mmap |
 
 ```bash
 # Manual: set config, rebuild, run
-python helpers/gen_config.py --k 4
+python helpers/gen_config.py --active_experts 4
 make && ./bin/infer --prompt "Hello" --tokens 20
 
-# Automatic: sweep all configs, find the best
-make autotune
+# Autotune: sweep configs, find the best 4-bit setup
+python autotune.py
 ```
 
 ## Architecture

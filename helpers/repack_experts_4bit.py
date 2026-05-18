@@ -52,7 +52,7 @@ def main():
     )
     parser.add_argument(
         "--output", type=str, default=None,
-        help="Output directory (default: <model>/packed_experts)",
+        help="Output directory (default: data/packed_experts)",
     )
     parser.add_argument(
         "--layers", type=str, default=None,
@@ -108,7 +108,7 @@ def main():
     else:
         layers = list(range(num_layers))
 
-    output_dir = Path(args.output) if args.output else model_path / "packed_experts"
+    output_dir = Path(args.output) if args.output else Path("data/packed_experts")
     output_dir.mkdir(parents=True, exist_ok=True)
 
     # Load weight map
