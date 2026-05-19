@@ -7,7 +7,7 @@
 // KV Cache bf16 quantization: halve memory bandwidth for full-attention layers.
 // Switches KVCache storage from float to uint16_t (bfloat16).
 // Affects: attention.h, layer_forward.h, shaders.metal, metal_setup.h
-#define USE_KV_CACHE_BF16 0
+#define USE_KV_CACHE_BF16 1
 
 // Fused RMS Norm Metal kernel: single-dispatch reduce+apply.
 // Combines rms_norm_sum + rms_norm_apply into one kernel.
@@ -27,12 +27,12 @@
 // Heap-based top-K: O(dim * log(K)) min-heap instead of O(dim * K) selection sort.
 // With K=8, reduces comparisons by ~2.5x.
 // Affects: cpu_kernels.h (cpu_topk)
-#define USE_HEAP_TOPK 0
+#define USE_HEAP_TOPK 1
 
 // Fused gate+up+SwiGLU kernel: computes gate_proj and up_proj in one pass,
 // applies SwiGLU inline, writes activated output directly. Saves 2 dispatches
 // and 2 intermediate buffers per expert.
 // Affects: shaders.metal (kernel), gpu_ops.h (encoding), metal_setup.h (pipeline)
-#define USE_FUSED_GATE_UP_SWIGLU 1
+#define USE_FUSED_GATE_UP_SWIGLU 0
 
 #endif // OPTIMIZATION_H

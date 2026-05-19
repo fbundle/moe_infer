@@ -2,7 +2,7 @@
 
 Pure C/Metal inference engine for Mixture-of-Experts models on Apple Silicon. Streams expert weights from SSD on demand — no Python, no frameworks, just C, Objective-C, and hand-tuned Metal shaders.
 
-Currently running **Qwen3.5-35B-A3B** (35B params, 37GB 4-bit) at ~5.2 tok/s on Apple M4 with 16GB RAM.
+Supports both `mlx-community/Qwen3.5-35B-A3B-4bit` and `mlx-community/Qwen3.6-35B-A3B-4bit` — identical architecture, same binary, just point `--model` at the right data directory.
 
 ## Building from Scratch
 
@@ -11,40 +11,45 @@ Start from the HuggingFace model and end with a running inference engine.
 ### 1. Download
 
 ```bash
-# Install huggingface_hub CLI if needed
+# Install hf CLI if needed
 pip install huggingface_hub
 
 # Download the MLX 4-bit model (~19GB)
-huggingface-cli download mlx-community/Qwen3.5-35B-A3B-4bit \
+hf download mlx-community/Qwen3.5-35B-A3B-4bit \
   --local-dir hub/models--mlx-community--Qwen3.5-35B-A3B-4bit
+
+# Or Qwen3.6
+hf download mlx-community/Qwen3.6-35B-A3B-4bit \
+  --local-dir hub/models--mlx-community--Qwen3.6-35B-A3B-4bit
 ```
 
 ### 2. Generate model data
 
-Extract tokenizer, non-expert weights, and repacked experts from the HF model into `data/`.
+Extract tokenizer, non-expert weights, and repacked experts from the HF model into a data directory
 
 ```bash
+# Set your model and data directory
+MODEL=hub/models--mlx-community--Qwen3.5-35B-A3B-4bit
+OUTPUT=output/models--mlx-community--Qwen3.5-35B-A3B-4bit
+
 # Tokenizer — vocab.bin + tokenizer.bin
-python helpers/export_tokenizer.py \
-  --model hub/models--mlx-community--Qwen3.5-35B-A3B-4bit
+python helpers/export_tokenizer.py --model $MODEL --output $OUTPUT
 
 # Non-expert weights — model_weights.bin (~1.38 GB) + manifest
-python helpers/extract_weights.py \
-  --model hub/models--mlx-community--Qwen3.5-35B-A3B-4bit
+python helpers/extract_weights.py --model $MODEL --output $OUTPUT
 
 # Expert weights — per-layer binaries (18.1 GB total, streamed from SSD)
-python helpers/repack_experts_4bit.py \
-  --model hub/models--mlx-community--Qwen3.5-35B-A3B-4bit
+python helpers/repack_experts_4bit.py --model $MODEL --output $OUTPUT/packed_experts
 ```
+
 
 ### 3. Compile
 
 Generate headers and build.
 
 ```bash
-# Model dimensions — src/model_config.h
-python helpers/gen_model_config.py \
-  --model hub/models--mlx-community--Qwen3.5-35B-A3B-4bit
+# Model dimensions — src/model_config.h (same for Qwen3.5 and Qwen3.6)
+python helpers/gen_model_config.py --model $MODEL
 
 # Experiment knobs — src/config.h
 python helpers/gen_config.py --active_experts 8 --use_gpu_linear 1
@@ -64,15 +69,15 @@ Run `python autotune.py` later to sweep configs and find the best values.
 ## Running
 
 ```bash
-# One-shot inference
-./bin/infer --model data --prompt "Explain quantum computing" --tokens 100
+# One-shot inference (use --model to pick which model)
+./bin/infer --model $OUTPUT --prompt "Explain quantum computing" --tokens 100
 
 # HTTP server + chat client
-./bin/infer --model data --serve 8080 &
+./bin/infer --model $OUTPUT --serve 8080 &
 python helpers/chat.py --port 8080
 
 # Per-layer timing breakdown
-./bin/infer --model data --prompt "Hello" --tokens 20 --timing
+./bin/infer --model $OUTPUT --prompt "Hello" --tokens 20 --timing
 ```
 
 ## Project Structure
