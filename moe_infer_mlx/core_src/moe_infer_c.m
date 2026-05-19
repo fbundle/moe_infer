@@ -268,19 +268,17 @@ int flashmoe_forward(FlashMoE_Context *m,
     return 0;
 }
 
-// ---- flashmoe_generate ----
+// ---- flashmoe_generate_step ----
 
-int flashmoe_generate(FlashMoE_Context *m,
-                      FlashMoE_Cache *cache,
-                      int first_token_id,
-                      int *output_ids, int max_completion_length,
-                      int eos_token_id, float temperature,
-                      int top_k, float top_p, float min_p)
+int flashmoe_generate_step(FlashMoE_Context *m,
+                           FlashMoE_Cache *cache,
+                           int *next_id, float *logits_out,
+                           int eos_token_id, float temperature,
+                           int top_k, float top_p, float min_p)
 {
-    return generate(m, cache, first_token_id,
-                    output_ids, max_completion_length,
-                    eos_token_id, temperature,
-                    top_k, top_p, min_p);
+    return generate_step(m, cache, next_id, logits_out,
+                         eos_token_id, temperature,
+                         top_k, top_p, min_p);
 }
 
 // ---- Accessors ----

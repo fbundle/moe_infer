@@ -24,12 +24,11 @@ def generate_c(model, cache, prompt_ids, max_tokens, eos_token_id, temperature):
         logits, cache = model.forward([prompt_ids[-1]], cache)
 
     first_id = int(logits[-1].argmax())
-    token_ids, cache = model.generate(
+    yield from model.generate(
         first_id, cache, eos_token_id,
         max_tokens=max_tokens,
         temperature=temperature,
     )
-    yield from token_ids
 
 
 def main():
@@ -68,11 +67,14 @@ def main():
 
             cache = fm.Cache(model)
             t0 = time.monotonic()
+            ttft = 0.0
             response_ids = []
 
             for token_id in generate_c(model, cache, prompt_ids,
                                        args.max_tokens, tok.eos_token_id,
                                        args.temperature):
+                if not response_ids:
+                    ttft = time.monotonic() - t0
                 response_ids.append(token_id)
                 print(tok.decode([token_id]), end="", flush=True)
 
@@ -84,7 +86,7 @@ def main():
             messages.append({"role": "assistant", "content": response_text})
 
             print(f"\n[{n_tok} tokens, {tok_s:.1f} tok/s, "
-                  f"TTFT {t0:.2f}s]\n")
+                  f"TTFT {ttft:.2f}s]\n")
 
 
 if __name__ == "__main__":

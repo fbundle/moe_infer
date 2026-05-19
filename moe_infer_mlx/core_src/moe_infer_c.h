@@ -48,16 +48,14 @@ int flashmoe_forward(FlashMoE_Context *model,
 
 // ---- Generation (sampling) ----
 
-// Autoregressive generation from first_token_id.
-// Samples with temperature/top_k/top_p/min_p; writes tokens into output_ids.
-// Returns number of tokens generated (stops at eos_token_id or max_completion_length).
-// output_ids must be pre-allocated with max_completion_length ints.
-int flashmoe_generate(FlashMoE_Context *model,
-                      FlashMoE_Cache *cache,
-                      int first_token_id,
-                      int *output_ids, int max_completion_length,
-                      int eos_token_id, float temperature,
-                      int top_k, float top_p, float min_p);
+// Single step: feed *next_id to model, sample, write result back into *next_id.
+// logits_out must be pre-allocated with vocab_size floats (reused as scratch).
+// Returns 0 on success, -1 on error.
+int flashmoe_generate_step(FlashMoE_Context *model,
+                           FlashMoE_Cache *cache,
+                           int *next_id, float *logits_out,
+                           int eos_token_id, float temperature,
+                           int top_k, float top_p, float min_p);
 
 // ---- Accessors ----
 
