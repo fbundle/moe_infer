@@ -1,8 +1,8 @@
-# Port Report: Flash-MoE → Qwen3.5-35B-A3B
+# Port Report: Flash-MoE → Qwen3.5/Qwen3.6-35B-A3B
 
 ## Summary
 
-Ported the Flash-MoE Metal inference engine from Qwen3.5-397B-A17B (397B params, 209GB) to Qwen/Qwen3.5-35B-A3B (35B params, 37GB 4-bit). The engine is now model-agnostic via compile-time `#define` constants in `model_config.h`. Used the pre-quantized `mlx-community/Qwen3.5-35B-A3B-4bit` model from HuggingFace.
+Ported the Flash-MoE Metal inference engine from Qwen3.5-397B-A17B (397B params, 209GB) to Qwen/Qwen3.5-35B-A3B (35B params, 37GB 4-bit). The engine is now model-agnostic via compile-time `#define` constants in `model_config.h`. Used the pre-quantized `mlx-community/Qwen3.5-35B-A3B-4bit` and `mlx-community/Qwen3.6-35B-A3B-4bit` models from HuggingFace. Both share identical architecture — same `model_config.h`, same binary.
 
 **Result**: ~5.2 tok/s (K=8) on Apple M4 with 16GB RAM.
 
@@ -83,6 +83,17 @@ Added `tqdm` progress bars with per-layer timing.
 2. **Expert weights**: `repack_experts_4bit.py` → `packed_experts/layer_00.bin` through `layer_39.bin` (453 MB each)
 
 Both use MLX pre-quantized format — no manual quantization needed.
+
+## Qwen3.6: INT8 Routing Gate Quantization
+
+Qwen3.6 introduces per-tensor quantization overrides in `config.json`. While most tensors are 4-bit, the routing gate (`mlp.gate`) and shared expert gate (`shared_expert_gate`) tensors use **INT8** quantization with group_size=64:
+
+| Tensor | Qwen3.5 (4-bit) | Qwen3.6 (8-bit) |
+|--------|----------------|-----------------|
+| `mlp.gate.weight` | 262,144 bytes | 524,288 bytes |
+| `mlp.shared_expert_gate.weight` | 1,024 bytes | 2,048 bytes |
+
+Reading INT8 bytes as 4-bit nibbles produces garbage routing scores → wrong experts selected → repeating-token collapse. `extract_weights.py` now detects 8-bit tensors from `quantization_config`, dequantizes to float32, and re-quantizes to 4-bit during extraction. The C engine sees only 4-bit data — zero code changes needed. 80 tensors converted (40 layers × gate + shared_expert_gate).
 
 ## Known Issues
 
