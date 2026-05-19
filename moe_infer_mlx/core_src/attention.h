@@ -38,8 +38,8 @@ typedef struct {
 
 static KVCache *kv_cache_new(void) {
     KVCache *c = calloc(1, sizeof(KVCache));
-    c->k_cache = calloc(MAX_SEQ_LEN * NUM_KV_HEADS * HEAD_DIM, KV_ELEM_SIZE);
-    c->v_cache = calloc(MAX_SEQ_LEN * NUM_KV_HEADS * HEAD_DIM, KV_ELEM_SIZE);
+    c->k_cache = calloc(MAX_SEQ_LEN * g_cfg.num_kv_heads * HEAD_DIM, KV_ELEM_SIZE);
+    c->v_cache = calloc(MAX_SEQ_LEN * g_cfg.num_kv_heads * HEAD_DIM, KV_ELEM_SIZE);
     c->len = 0;
     return c;
 }
@@ -63,8 +63,8 @@ typedef struct {
 
 static LinearAttnState *linear_attn_state_new(void) {
     LinearAttnState *s = calloc(1, sizeof(LinearAttnState));
-    s->conv_state = calloc((CONV_KERNEL_SIZE - 1) * LINEAR_CONV_DIM, sizeof(float));
-    s->ssm_state = calloc(LINEAR_NUM_V_HEADS * LINEAR_VALUE_DIM * LINEAR_KEY_DIM, sizeof(float));
+    s->conv_state = calloc((CONV_KERNEL_SIZE - 1) * g_cfg.linear_conv_dim, sizeof(float));
+    s->ssm_state = calloc(g_cfg.linear_num_v_heads * LINEAR_VALUE_DIM * LINEAR_KEY_DIM, sizeof(float));
     return s;
 }
 
@@ -92,7 +92,7 @@ __attribute__((unused))
 static void full_attention_forward(
     WeightFile *wf,
     int layer_idx,
-    float *hidden,       // [HIDDEN_DIM] in/out
+    float *hidden,       // [g_cfg.hidden_dim] in/out
     KVCache *kv,
     int pos              // position in sequence
 ) {
@@ -100,32 +100,32 @@ static void full_attention_forward(
     int do_debug = 0;  // set to (fa_debug_count <= N) to enable debug
 
     char name[256];
-    float *normed = malloc(HIDDEN_DIM * sizeof(float));
-    float *residual = malloc(HIDDEN_DIM * sizeof(float));
-    cpu_vec_copy(residual, hidden, HIDDEN_DIM);
+    float *normed = malloc(g_cfg.hidden_dim * sizeof(float));
+    float *residual = malloc(g_cfg.hidden_dim * sizeof(float));
+    cpu_vec_copy(residual, hidden, g_cfg.hidden_dim);
 
     if (do_debug) {
         fprintf(stderr, "[FA-DBG] layer=%d pos=%d hidden_rms=%.6f first5=[%.6f,%.6f,%.6f,%.6f,%.6f]\n",
-                layer_idx, pos, vec_rms(hidden, HIDDEN_DIM),
+                layer_idx, pos, vec_rms(hidden, g_cfg.hidden_dim),
                 hidden[0], hidden[1], hidden[2], hidden[3], hidden[4]);
     }
 
     // ---- Input LayerNorm ----
     snprintf(name, sizeof(name), "model.layers.%d.input_layernorm.weight", layer_idx);
     uint16_t *norm_w = get_tensor_ptr(wf, name);
-    cpu_rms_norm(hidden, norm_w, normed, HIDDEN_DIM, RMS_NORM_EPS);
+    cpu_rms_norm(hidden, norm_w, normed, g_cfg.hidden_dim, RMS_NORM_EPS);
 
     if (do_debug) {
         fprintf(stderr, "[FA-DBG] normed_rms=%.6f first5=[%.6f,%.6f,%.6f,%.6f,%.6f]\n",
-                vec_rms(normed, HIDDEN_DIM), normed[0], normed[1], normed[2], normed[3], normed[4]);
+                vec_rms(normed, g_cfg.hidden_dim), normed[0], normed[1], normed[2], normed[3], normed[4]);
     }
 
     // ---- QKV Projection ----
     // CRITICAL: Q projection outputs num_heads * head_dim * 2 = 16384
     // The second half is a sigmoid gate applied after attention
-    int q_proj_dim = NUM_ATTN_HEADS * HEAD_DIM * 2;  // 32 * 256 * 2 = 16384
-    int q_dim = NUM_ATTN_HEADS * HEAD_DIM;            // 32 * 256 = 8192
-    int kv_dim = NUM_KV_HEADS * HEAD_DIM;             // 2 * 256 = 512
+    int q_proj_dim = g_cfg.num_attn_heads * HEAD_DIM * 2;  // 32 * 256 * 2 = 16384
+    int q_dim = g_cfg.num_attn_heads * HEAD_DIM;            // 32 * 256 = 8192
+    int kv_dim = g_cfg.num_kv_heads * HEAD_DIM;             // 2 * 256 = 512
 
     float *q_proj_out = calloc(q_proj_dim, sizeof(float));
     float *k = calloc(kv_dim, sizeof(float));
@@ -156,11 +156,11 @@ static void full_attention_forward(
     // Batch Q/K/V into one command buffer (3 dispatches, 1 commit)
     if (qw && qs && qb && kw && ks && kb && vw && vs && vb) {
         BatchMatvecSpec qkv_specs[3] = {
-            { qw, qs, qb, q_proj_out, (uint32_t)q_proj_dim, HIDDEN_DIM, GROUP_SIZE, 0 },
-            { kw, ks, kb, k,          (uint32_t)kv_dim,     HIDDEN_DIM, GROUP_SIZE, 1 },
-            { vw, vs, vb, v,          (uint32_t)kv_dim,     HIDDEN_DIM, GROUP_SIZE, 2 },
+            { qw, qs, qb, q_proj_out, (uint32_t)q_proj_dim, g_cfg.hidden_dim, GROUP_SIZE, 0 },
+            { kw, ks, kb, k,          (uint32_t)kv_dim,     g_cfg.hidden_dim, GROUP_SIZE, 1 },
+            { vw, vs, vb, v,          (uint32_t)kv_dim,     g_cfg.hidden_dim, GROUP_SIZE, 2 },
         };
-        fast_batch_matvec(normed, HIDDEN_DIM, qkv_specs, 3);
+        fast_batch_matvec(normed, g_cfg.hidden_dim, qkv_specs, 3);
     }
 
     if (do_debug) {
@@ -171,7 +171,7 @@ static void full_attention_forward(
     // Split q_proj_out into queries and gate
     float *q = calloc(q_dim, sizeof(float));
     float *q_gate = calloc(q_dim, sizeof(float));
-    for (int h = 0; h < NUM_ATTN_HEADS; h++) {
+    for (int h = 0; h < g_cfg.num_attn_heads; h++) {
         float *src = q_proj_out + h * (2 * HEAD_DIM);
         memcpy(q + h * HEAD_DIM, src, HEAD_DIM * sizeof(float));
         memcpy(q_gate + h * HEAD_DIM, src + HEAD_DIM, HEAD_DIM * sizeof(float));
@@ -198,7 +198,7 @@ static void full_attention_forward(
 
     // Apply per-head Q norm
     if (qnorm_w) {
-        for (int h = 0; h < NUM_ATTN_HEADS; h++) {
+        for (int h = 0; h < g_cfg.num_attn_heads; h++) {
             float *qh = q + h * HEAD_DIM;
             float sum_sq = 0.0f;
             for (int i = 0; i < HEAD_DIM; i++) sum_sq += qh[i] * qh[i];
@@ -210,7 +210,7 @@ static void full_attention_forward(
     }
     // Apply per-head K norm
     if (knorm_w) {
-        for (int h = 0; h < NUM_KV_HEADS; h++) {
+        for (int h = 0; h < g_cfg.num_kv_heads; h++) {
             float *kh = k + h * HEAD_DIM;
             float sum_sq = 0.0f;
             for (int i = 0; i < HEAD_DIM; i++) sum_sq += kh[i] * kh[i];
@@ -223,7 +223,7 @@ static void full_attention_forward(
 
 
     // ---- RoPE ----
-    apply_rotary_emb(q, k, pos, NUM_ATTN_HEADS, NUM_KV_HEADS, HEAD_DIM, ROTARY_DIM);
+    apply_rotary_emb(q, k, pos, g_cfg.num_attn_heads, g_cfg.num_kv_heads, HEAD_DIM, g_cfg.rotary_dim);
 
     // ---- Update KV cache ----
     int cache_pos = kv->len;
@@ -239,14 +239,14 @@ static void full_attention_forward(
     kv->len++;
 
     // ---- Scaled dot-product attention ----
-    // GQA: NUM_ATTN_HEADS=32 heads, NUM_KV_HEADS=2 kv heads
+    // GQA: g_cfg.num_attn_heads=32 heads, g_cfg.num_kv_heads=2 kv heads
     // Each group of 16 query heads shares 1 kv head
-    int heads_per_kv = NUM_ATTN_HEADS / NUM_KV_HEADS;
+    int heads_per_kv = g_cfg.num_attn_heads / g_cfg.num_kv_heads;
     float scale = 1.0f / sqrtf((float)HEAD_DIM);
 
     float *attn_out = calloc(q_dim, sizeof(float));
 
-    for (int h = 0; h < NUM_ATTN_HEADS; h++) {
+    for (int h = 0; h < g_cfg.num_attn_heads; h++) {
         int kv_h = h / heads_per_kv;
         float *qh = q + h * HEAD_DIM;
 
@@ -285,14 +285,14 @@ static void full_attention_forward(
     }
 
     // ---- Output projection ----
-    float *attn_projected = calloc(HIDDEN_DIM, sizeof(float));
+    float *attn_projected = calloc(g_cfg.hidden_dim, sizeof(float));
     snprintf(name, sizeof(name), "model.layers.%d.self_attn.o_proj.weight", layer_idx);
     uint32_t *ow = get_tensor_ptr(wf, name);
     snprintf(name, sizeof(name), "model.layers.%d.self_attn.o_proj.scales", layer_idx);
     uint16_t *os_ptr = get_tensor_ptr(wf, name);
     snprintf(name, sizeof(name), "model.layers.%d.self_attn.o_proj.biases", layer_idx);
     uint16_t *ob = get_tensor_ptr(wf, name);
-    if (ow && os_ptr && ob) fast_dequant_matvec(ow, os_ptr, ob, attn_out, attn_projected, HIDDEN_DIM, q_dim, GROUP_SIZE);
+    if (ow && os_ptr && ob) fast_dequant_matvec(ow, os_ptr, ob, attn_out, attn_projected, g_cfg.hidden_dim, q_dim, GROUP_SIZE);
 
     if (do_debug) {
         fprintf(stderr, "[FA-DBG] attn_out_rms=%.6f o_proj first5=[%.6f,%.6f,%.6f,%.6f,%.6f]\n",
@@ -301,13 +301,13 @@ static void full_attention_forward(
     }
 
     // ---- Residual connection ----
-    for (int i = 0; i < HIDDEN_DIM; i++) {
+    for (int i = 0; i < g_cfg.hidden_dim; i++) {
         hidden[i] = residual[i] + attn_projected[i];
     }
 
     if (do_debug) {
         fprintf(stderr, "[FA-DBG] AFTER layer=%d hidden_rms=%.6f first5=[%.6f,%.6f,%.6f,%.6f,%.6f]\n",
-                layer_idx, vec_rms(hidden, HIDDEN_DIM),
+                layer_idx, vec_rms(hidden, g_cfg.hidden_dim),
                 hidden[0], hidden[1], hidden[2], hidden[3], hidden[4]);
     }
 
@@ -353,7 +353,7 @@ __attribute__((unused))
 static void linear_attention_forward(
     WeightFile *wf,
     int layer_idx,
-    float *hidden,           // [HIDDEN_DIM] in/out
+    float *hidden,           // [g_cfg.hidden_dim] in/out
     LinearAttnState *state
 ) {
     // If bypass is enabled, just pass through (identity)
@@ -368,27 +368,27 @@ static void linear_attention_forward(
 
     if (la_debug) {
         fprintf(stderr, "[LA-DBG] layer=%d hidden_rms=%.6f first5=[%.6f,%.6f,%.6f,%.6f,%.6f]\n",
-                layer_idx, vec_rms(hidden, HIDDEN_DIM),
+                layer_idx, vec_rms(hidden, g_cfg.hidden_dim),
                 hidden[0], hidden[1], hidden[2], hidden[3], hidden[4]);
     }
 
     char name[256];
-    float *normed = malloc(HIDDEN_DIM * sizeof(float));
-    float *residual = malloc(HIDDEN_DIM * sizeof(float));
-    cpu_vec_copy(residual, hidden, HIDDEN_DIM);
+    float *normed = malloc(g_cfg.hidden_dim * sizeof(float));
+    float *residual = malloc(g_cfg.hidden_dim * sizeof(float));
+    cpu_vec_copy(residual, hidden, g_cfg.hidden_dim);
 
     // ---- Input LayerNorm ----
     snprintf(name, sizeof(name), "model.layers.%d.input_layernorm.weight", layer_idx);
     uint16_t *norm_w = get_tensor_ptr(wf, name);
-    cpu_rms_norm(hidden, norm_w, normed, HIDDEN_DIM, RMS_NORM_EPS);
+    cpu_rms_norm(hidden, norm_w, normed, g_cfg.hidden_dim, RMS_NORM_EPS);
 
     // ---- Batch QKV + Z + B + A projections (4 matmuls, 1 command buffer) ----
-    int qkv_dim = LINEAR_CONV_DIM;  // 12288
+    int qkv_dim = g_cfg.linear_conv_dim;  // 12288
     float *qkv = calloc(qkv_dim, sizeof(float));
-    int z_dim = LINEAR_TOTAL_VALUE;  // 8192
+    int z_dim = g_cfg.linear_total_value;  // 8192
     float *z = calloc(z_dim, sizeof(float));
-    float *beta = calloc(LINEAR_NUM_V_HEADS, sizeof(float));
-    float *alpha = calloc(LINEAR_NUM_V_HEADS, sizeof(float));
+    float *beta = calloc(g_cfg.linear_num_v_heads, sizeof(float));
+    float *alpha = calloc(g_cfg.linear_num_v_heads, sizeof(float));
 
     snprintf(name, sizeof(name), "model.layers.%d.linear_attn.in_proj_qkv.weight", layer_idx);
     uint32_t *qkv_w = get_tensor_ptr(wf, name);
@@ -421,12 +421,12 @@ static void linear_attention_forward(
     if (qkv_w && qkv_s && qkv_b && z_w && z_s && z_b &&
         b_w && b_s && b_b && a_w && a_s && a_b) {
         BatchMatvecSpec la_specs[4] = {
-            { qkv_w, qkv_s, qkv_b, qkv,   (uint32_t)qkv_dim,         HIDDEN_DIM, GROUP_SIZE, 0 },
-            { z_w,   z_s,   z_b,   z,      (uint32_t)z_dim,           HIDDEN_DIM, GROUP_SIZE, 1 },
-            { b_w,   b_s,   b_b,   beta,   (uint32_t)LINEAR_NUM_V_HEADS, HIDDEN_DIM, GROUP_SIZE, 2 },
-            { a_w,   a_s,   a_b,   alpha,  (uint32_t)LINEAR_NUM_V_HEADS, HIDDEN_DIM, GROUP_SIZE, 3 },
+            { qkv_w, qkv_s, qkv_b, qkv,   (uint32_t)qkv_dim,         g_cfg.hidden_dim, GROUP_SIZE, 0 },
+            { z_w,   z_s,   z_b,   z,      (uint32_t)z_dim,           g_cfg.hidden_dim, GROUP_SIZE, 1 },
+            { b_w,   b_s,   b_b,   beta,   (uint32_t)g_cfg.linear_num_v_heads, g_cfg.hidden_dim, GROUP_SIZE, 2 },
+            { a_w,   a_s,   a_b,   alpha,  (uint32_t)g_cfg.linear_num_v_heads, g_cfg.hidden_dim, GROUP_SIZE, 3 },
         };
-        fast_batch_matvec(normed, HIDDEN_DIM, la_specs, 4);
+        fast_batch_matvec(normed, g_cfg.hidden_dim, la_specs, 4);
     }
 
     // ---- Conv1d step ----
@@ -450,9 +450,9 @@ static void linear_attention_forward(
     // q: [num_k_heads * head_k_dim] = [2048]
     // k: [num_k_heads * head_k_dim] = [2048]
     // v: [num_v_heads * head_v_dim] = [8192]
-    float *lin_q = conv_out;  // first LINEAR_TOTAL_KEY elements
-    float *lin_k = conv_out + LINEAR_TOTAL_KEY;  // next LINEAR_TOTAL_KEY
-    float *lin_v = conv_out + 2 * LINEAR_TOTAL_KEY;  // rest = LINEAR_TOTAL_VALUE
+    float *lin_q = conv_out;  // first g_cfg.linear_total_key elements
+    float *lin_k = conv_out + g_cfg.linear_total_key;  // next g_cfg.linear_total_key
+    float *lin_v = conv_out + 2 * g_cfg.linear_total_key;  // rest = g_cfg.linear_total_value
 
     // ---- RMS normalize q and k (bare, no weights) ----
     // q: scale = key_dim^(-0.5), normalize per head then scale by key_dim^(-1.0)
@@ -462,13 +462,13 @@ static void linear_attention_forward(
     //   k = inv_scale * rms_norm(k) = (1/sqrt(128)) * rms_norm(k)
     float inv_scale = 1.0f / sqrtf((float)LINEAR_KEY_DIM);
 
-    for (int h = 0; h < LINEAR_NUM_K_HEADS; h++) {
+    for (int h = 0; h < g_cfg.linear_num_k_heads; h++) {
         float *qh = lin_q + h * LINEAR_KEY_DIM;
         cpu_rms_norm_bare(qh, qh, LINEAR_KEY_DIM, 1e-6f);
         float q_scale = inv_scale * inv_scale;  // inv_scale^2 = 1/head_k_dim
         for (int d = 0; d < LINEAR_KEY_DIM; d++) qh[d] *= q_scale;
     }
-    for (int h = 0; h < LINEAR_NUM_K_HEADS; h++) {
+    for (int h = 0; h < g_cfg.linear_num_k_heads; h++) {
         float *kh = lin_k + h * LINEAR_KEY_DIM;
         cpu_rms_norm_bare(kh, kh, LINEAR_KEY_DIM, 1e-6f);
         for (int d = 0; d < LINEAR_KEY_DIM; d++) kh[d] *= inv_scale;
@@ -491,14 +491,14 @@ static void linear_attention_forward(
     snprintf(name, sizeof(name), "model.layers.%d.linear_attn.dt_bias", layer_idx);
     uint16_t *dt_bias_bf16 = get_tensor_ptr(wf, name);
 
-    float *out_values = calloc(LINEAR_TOTAL_VALUE, sizeof(float));  // [num_v_heads * head_v_dim]
+    float *out_values = calloc(g_cfg.linear_total_value, sizeof(float));  // [num_v_heads * head_v_dim]
 
-    int k_heads_per_v = LINEAR_NUM_V_HEADS / LINEAR_NUM_K_HEADS;  // 64/16 = 4
+    int k_heads_per_v = g_cfg.linear_num_v_heads / g_cfg.linear_num_k_heads;  // 64/16 = 4
 
     // Precompute per-head decay (g) and beta
-    float g_decay[LINEAR_NUM_V_HEADS];
-    float beta_gate[LINEAR_NUM_V_HEADS];
-    for (int vh = 0; vh < LINEAR_NUM_V_HEADS; vh++) {
+    float g_decay[g_cfg.linear_num_v_heads];
+    float beta_gate[g_cfg.linear_num_v_heads];
+    for (int vh = 0; vh < g_cfg.linear_num_v_heads; vh++) {
         // g = exp(-exp(A_log) * softplus(a + dt_bias))
         float a_val = alpha[vh];
         float dt_b = dt_bias_bf16 ? bf16_to_f32(dt_bias_bf16[vh]) : 0.0f;
@@ -510,7 +510,7 @@ static void linear_attention_forward(
         beta_gate[vh] = cpu_sigmoid(beta[vh]);
     }
 
-    for (int vh = 0; vh < LINEAR_NUM_V_HEADS; vh++) {
+    for (int vh = 0; vh < g_cfg.linear_num_v_heads; vh++) {
         int kh = vh / k_heads_per_v;  // which k head this v head maps to
 
         float g = g_decay[vh];
@@ -558,8 +558,8 @@ static void linear_attention_forward(
     snprintf(name, sizeof(name), "model.layers.%d.linear_attn.norm.weight", layer_idx);
     uint16_t *gated_norm_w = get_tensor_ptr(wf, name);
 
-    float *gated_out = calloc(LINEAR_TOTAL_VALUE, sizeof(float));
-    for (int vh = 0; vh < LINEAR_NUM_V_HEADS; vh++) {
+    float *gated_out = calloc(g_cfg.linear_total_value, sizeof(float));
+    for (int vh = 0; vh < g_cfg.linear_num_v_heads; vh++) {
         float *oh = out_values + vh * LINEAR_VALUE_DIM;
         float *zh = z + vh * LINEAR_VALUE_DIM;
         float *gh = gated_out + vh * LINEAR_VALUE_DIM;
@@ -571,7 +571,7 @@ static void linear_attention_forward(
     }
 
     // ---- Output projection: [value_dim=8192] -> [hidden_dim=4096] ----
-    float *attn_out = calloc(HIDDEN_DIM, sizeof(float));
+    float *attn_out = calloc(g_cfg.hidden_dim, sizeof(float));
     snprintf(name, sizeof(name), "model.layers.%d.linear_attn.out_proj.weight", layer_idx);
     uint32_t *out_w = get_tensor_ptr(wf, name);
     snprintf(name, sizeof(name), "model.layers.%d.linear_attn.out_proj.scales", layer_idx);
@@ -579,20 +579,20 @@ static void linear_attention_forward(
     snprintf(name, sizeof(name), "model.layers.%d.linear_attn.out_proj.biases", layer_idx);
     uint16_t *out_b = get_tensor_ptr(wf, name);
     if (out_w && out_s && out_b) {
-        fast_dequant_matvec(out_w, out_s, out_b, gated_out, attn_out, HIDDEN_DIM,
-                            LINEAR_TOTAL_VALUE, GROUP_SIZE);
+        fast_dequant_matvec(out_w, out_s, out_b, gated_out, attn_out, g_cfg.hidden_dim,
+                            g_cfg.linear_total_value, GROUP_SIZE);
     }
 
     // ---- Residual ----
-    for (int i = 0; i < HIDDEN_DIM; i++) {
+    for (int i = 0; i < g_cfg.hidden_dim; i++) {
         hidden[i] = residual[i] + attn_out[i];
     }
 
     if (la_debug) {
         fprintf(stderr, "[LA-DBG] AFTER layer=%d out_proj_rms=%.6f gated_rms=%.6f hidden_rms=%.6f\n",
-                layer_idx, vec_rms(attn_out, HIDDEN_DIM),
-                vec_rms(gated_out, LINEAR_TOTAL_VALUE),
-                vec_rms(hidden, HIDDEN_DIM));
+                layer_idx, vec_rms(attn_out, g_cfg.hidden_dim),
+                vec_rms(gated_out, g_cfg.linear_total_value),
+                vec_rms(hidden, g_cfg.hidden_dim));
     }
 
     free(normed);

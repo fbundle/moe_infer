@@ -274,7 +274,7 @@ int parallel_pread_experts_into(
 typedef struct {
     int layer_idx;
     int expert_idx;
-    id<MTLBuffer> buffer;    // Metal buffer holding EXPERT_SIZE bytes
+    id<MTLBuffer> buffer;    // Metal buffer holding g_cfg.expert_size_4bit bytes
     uint64_t last_used;      // monotonic counter for LRU ordering
 } ExpertCacheEntry;
 
@@ -283,7 +283,7 @@ typedef struct {
     int max_entries;
     int num_entries;
     int used_entries;
-    int entry_idx[NUM_LAYERS][NUM_EXPERTS];
+    int *entry_idx;  // [g_cfg.num_layers * g_cfg.num_experts] — dynamically allocated
     uint64_t access_counter; // monotonic, incremented on every access
     id<MTLDevice> device;    // for allocating new Metal buffers
     // Stats
@@ -306,13 +306,12 @@ static uint64_t g_spec_route_preloads = 0;    // async preloads initiated (cache
 //   - Loads into scratch buffers (no cache pollution)
 //   - Uses CMD1_wait idle time (no additional CPU cost)
 //   - Only sync-preads misses (not all K experts)
-static int g_pred_experts[NUM_LAYERS][MAX_K];
-static int g_pred_count[60];                       // how many experts stored per layer
 static int g_pred_valid = 0;                       // 1 after first token completes (predictions available)
 // g_pred_enabled, g_pred_hits, g_pred_misses, g_pred_layers declared near timing (line ~163)
 
 ExpertLRUCache *expert_cache_new(id<MTLDevice> device, int max_entries) {
     ExpertLRUCache *cache = calloc(1, sizeof(ExpertLRUCache));
+    cache->entry_idx = calloc((size_t)g_cfg.num_layers * g_cfg.num_experts, sizeof(int));
     cache->entries = calloc(max_entries, sizeof(ExpertCacheEntry));
     cache->max_entries = max_entries;
     cache->num_entries = 0;
@@ -321,9 +320,9 @@ ExpertLRUCache *expert_cache_new(id<MTLDevice> device, int max_entries) {
     cache->device = device;
     cache->hits = 0;
     cache->misses = 0;
-    for (int l = 0; l < NUM_LAYERS; l++) {
-        for (int e = 0; e < NUM_EXPERTS; e++) {
-            cache->entry_idx[l][e] = -1;
+    for (int l = 0; l < g_cfg.num_layers; l++) {
+        for (int e = 0; e < g_cfg.num_experts; e++) {
+            cache->entry_idx[(l) * g_cfg.num_experts + (e)] = -1;
         }
     }
     // Pre-allocate ALL Metal buffers at startup (avoids allocation overhead at runtime)
@@ -362,7 +361,7 @@ static void expert_cache_free(ExpertLRUCache *cache) {
 // Lookup: returns the cached Metal buffer if found, otherwise NULL.
 // On hit, updates the LRU timestamp.
 static id<MTLBuffer> expert_cache_lookup(ExpertLRUCache *cache, int layer_idx, int expert_idx) {
-    int idx = cache->entry_idx[layer_idx][expert_idx];
+    int idx = cache->entry_idx[(layer_idx) * g_cfg.num_experts + (expert_idx)];
     if (idx >= 0) {
         cache->entries[idx].last_used = ++cache->access_counter;
         cache->hits++;
@@ -379,7 +378,7 @@ static id<MTLBuffer> expert_cache_lookup(ExpertLRUCache *cache, int layer_idx, i
 static id<MTLBuffer> expert_cache_insert(ExpertLRUCache *cache, int layer_idx, int expert_idx) {
     id<MTLBuffer> buf = nil;
 
-    int existing = cache->entry_idx[layer_idx][expert_idx];
+    int existing = cache->entry_idx[(layer_idx) * g_cfg.num_experts + (expert_idx)];
     if (existing >= 0) {
         cache->entries[existing].last_used = ++cache->access_counter;
         return cache->entries[existing].buffer;
@@ -396,7 +395,7 @@ static id<MTLBuffer> expert_cache_insert(ExpertLRUCache *cache, int layer_idx, i
         cache->entries[target].layer_idx = layer_idx;
         cache->entries[target].expert_idx = expert_idx;
         cache->entries[target].last_used = ++cache->access_counter;
-        cache->entry_idx[layer_idx][expert_idx] = target;
+        cache->entry_idx[(layer_idx) * g_cfg.num_experts + (expert_idx)] = target;
         return buf;
     }
 
@@ -415,13 +414,13 @@ static id<MTLBuffer> expert_cache_insert(ExpertLRUCache *cache, int layer_idx, i
     int old_expert = cache->entries[lru_idx].expert_idx;
     cache_telemetry_evict(old_layer, old_expert);
     if (old_layer >= 0 && old_expert >= 0) {
-        cache->entry_idx[old_layer][old_expert] = -1;
+        cache->entry_idx[(old_layer) * g_cfg.num_experts + (old_expert)] = -1;
     }
     buf = cache->entries[lru_idx].buffer;
     cache->entries[lru_idx].layer_idx = layer_idx;
     cache->entries[lru_idx].expert_idx = expert_idx;
     cache->entries[lru_idx].last_used = ++cache->access_counter;
-    cache->entry_idx[layer_idx][expert_idx] = lru_idx;
+    cache->entry_idx[(layer_idx) * g_cfg.num_experts + (expert_idx)] = lru_idx;
     return buf;
 }
 
@@ -433,7 +432,7 @@ static id<MTLBuffer> expert_cache_insert(ExpertLRUCache *cache, int layer_idx, i
 // ============================================================================
 
 typedef struct {
-    void **data;           // [max_entries] page-aligned malloc'd EXPERT_SIZE buffers
+    void **data;           // [max_entries] page-aligned malloc'd g_cfg.expert_size_4bit buffers
     id<MTLBuffer> __strong *metal_bufs;  // [max_entries] zero-copy Metal buffer wrappers
     int *layer_idx;        // [max_entries] layer index for each entry
     int *expert_idx;       // [max_entries] expert index for each entry
@@ -441,7 +440,7 @@ typedef struct {
     int max_entries;
     int num_entries;
     int used_entries;
-    int entry_idx[NUM_LAYERS][NUM_EXPERTS];
+    int *entry_idx;  // [g_cfg.num_layers * g_cfg.num_experts] — dynamically allocated
     uint64_t access_counter;
     uint64_t hits;
     uint64_t misses;
@@ -451,6 +450,7 @@ static MallocExpertCache *g_malloc_cache = NULL;
 
 MallocExpertCache *malloc_cache_init(int max_entries, id<MTLDevice> device) {
     MallocExpertCache *cache = calloc(1, sizeof(MallocExpertCache));
+    cache->entry_idx = calloc((size_t)g_cfg.num_layers * g_cfg.num_experts, sizeof(int));
     cache->data = calloc(max_entries, sizeof(void *));
     cache->metal_bufs = (__strong id<MTLBuffer> *)calloc(max_entries, sizeof(id<MTLBuffer>));
     cache->layer_idx = calloc(max_entries, sizeof(int));
@@ -462,9 +462,9 @@ MallocExpertCache *malloc_cache_init(int max_entries, id<MTLDevice> device) {
     cache->access_counter = 0;
     cache->hits = 0;
     cache->misses = 0;
-    for (int l = 0; l < NUM_LAYERS; l++) {
-        for (int e = 0; e < NUM_EXPERTS; e++) {
-            cache->entry_idx[l][e] = -1;
+    for (int l = 0; l < g_cfg.num_layers; l++) {
+        for (int e = 0; e < g_cfg.num_experts; e++) {
+            cache->entry_idx[(l) * g_cfg.num_experts + (e)] = -1;
         }
     }
 
@@ -508,7 +508,7 @@ MallocExpertCache *malloc_cache_init(int max_entries, id<MTLDevice> device) {
 
 // Lookup: returns Metal buffer wrapping cached data, or nil. Zero-copy dispatch.
 static id<MTLBuffer> malloc_cache_lookup(MallocExpertCache *cache, int layer, int expert) {
-    int idx = cache->entry_idx[layer][expert];
+    int idx = cache->entry_idx[(layer) * g_cfg.num_experts + (expert)];
     if (idx >= 0) {
         cache->last_used[idx] = ++cache->access_counter;
         cache->hits++;
@@ -523,7 +523,7 @@ static id<MTLBuffer> malloc_cache_lookup(MallocExpertCache *cache, int layer, in
 // Insert: evict LRU if needed, return entry index for pread target.
 // Returns the Metal buffer for this entry (caller should pread into cache->data[idx]).
 static id<MTLBuffer> malloc_cache_insert(MallocExpertCache *cache, int layer, int expert, int *out_idx) {
-    int existing = cache->entry_idx[layer][expert];
+    int existing = cache->entry_idx[(layer) * g_cfg.num_experts + (expert)];
     if (existing >= 0) {
         cache->last_used[existing] = ++cache->access_counter;
         if (out_idx) *out_idx = existing;
@@ -548,14 +548,14 @@ static id<MTLBuffer> malloc_cache_insert(MallocExpertCache *cache, int layer, in
         }
         cache_telemetry_evict(cache->layer_idx[target], cache->expert_idx[target]);
         if (cache->layer_idx[target] >= 0 && cache->expert_idx[target] >= 0) {
-            cache->entry_idx[cache->layer_idx[target]][cache->expert_idx[target]] = -1;
+            cache->entry_idx[(cache->layer_idx[target]) * g_cfg.num_experts + (cache->expert_idx[target])] = -1;
         }
     }
 
     cache->layer_idx[target] = layer;
     cache->expert_idx[target] = expert;
     cache->last_used[target] = ++cache->access_counter;
-    cache->entry_idx[layer][expert] = target;
+    cache->entry_idx[(layer) * g_cfg.num_experts + (expert)] = target;
     if (out_idx) *out_idx = target;
     return cache->metal_bufs[target];
 }

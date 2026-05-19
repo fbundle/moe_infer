@@ -174,20 +174,20 @@ void gpu_encode_expert_forward_slot(
     NSUInteger up_w_off, up_s_off, up_b_off;
     NSUInteger down_w_off, down_s_off, down_b_off;
     if (g_use_2bit) {
-        gate_w_off = GATE_W_OFF_2; gate_s_off = GATE_S_OFF_2; gate_b_off = GATE_B_OFF_2;
-        up_w_off   = UP_W_OFF_2;   up_s_off   = UP_S_OFF_2;   up_b_off   = UP_B_OFF_2;
-        down_w_off = DOWN_W_OFF_2; down_s_off = DOWN_S_OFF_2; down_b_off = DOWN_B_OFF_2;
+        gate_w_off = g_cfg.layout_2bit.gate_w_off; gate_s_off = g_cfg.layout_2bit.gate_s_off; gate_b_off = g_cfg.layout_2bit.gate_b_off;
+        up_w_off   = g_cfg.layout_2bit.up_w_off;   up_s_off   = g_cfg.layout_2bit.up_s_off;   up_b_off   = g_cfg.layout_2bit.up_b_off;
+        down_w_off = g_cfg.layout_2bit.down_w_off; down_s_off = g_cfg.layout_2bit.down_s_off; down_b_off = g_cfg.layout_2bit.down_b_off;
     } else {
-        gate_w_off = GATE_W_OFF; gate_s_off = GATE_S_OFF; gate_b_off = GATE_B_OFF;
-        up_w_off   = UP_W_OFF;   up_s_off   = UP_S_OFF;   up_b_off   = UP_B_OFF;
-        down_w_off = DOWN_W_OFF; down_s_off = DOWN_S_OFF; down_b_off = DOWN_B_OFF;
+        gate_w_off = g_cfg.layout_4bit.gate_w_off; gate_s_off = g_cfg.layout_4bit.gate_s_off; gate_b_off = g_cfg.layout_4bit.gate_b_off;
+        up_w_off   = g_cfg.layout_4bit.up_w_off;   up_s_off   = g_cfg.layout_4bit.up_s_off;   up_b_off   = g_cfg.layout_4bit.up_b_off;
+        down_w_off = g_cfg.layout_4bit.down_w_off; down_s_off = g_cfg.layout_4bit.down_s_off; down_b_off = g_cfg.layout_4bit.down_b_off;
     }
     id<MTLComputePipelineState> expert_pipe = g_use_2bit ? ctx->matvec_2bit : ctx->matvec_v3;
 
-    uint32_t gate_up_out = MOE_INTERMEDIATE;
-    uint32_t gate_up_in  = HIDDEN_DIM;
-    uint32_t down_out    = HIDDEN_DIM;
-    uint32_t down_in     = MOE_INTERMEDIATE;
+    uint32_t gate_up_out = g_cfg.moe_intermediate;
+    uint32_t gate_up_in  = g_cfg.hidden_dim;
+    uint32_t down_out    = g_cfg.hidden_dim;
+    uint32_t down_in     = g_cfg.moe_intermediate;
     uint32_t gs          = GROUP_SIZE;
 
     // gate_proj: data[k] -> gate[k]
@@ -270,20 +270,20 @@ void gpu_encode_expert_forward_slot_buf(
     NSUInteger up_w_off, up_s_off, up_b_off;
     NSUInteger down_w_off, down_s_off, down_b_off;
     if (g_use_2bit) {
-        gate_w_off = GATE_W_OFF_2; gate_s_off = GATE_S_OFF_2; gate_b_off = GATE_B_OFF_2;
-        up_w_off   = UP_W_OFF_2;   up_s_off   = UP_S_OFF_2;   up_b_off   = UP_B_OFF_2;
-        down_w_off = DOWN_W_OFF_2; down_s_off = DOWN_S_OFF_2; down_b_off = DOWN_B_OFF_2;
+        gate_w_off = g_cfg.layout_2bit.gate_w_off; gate_s_off = g_cfg.layout_2bit.gate_s_off; gate_b_off = g_cfg.layout_2bit.gate_b_off;
+        up_w_off   = g_cfg.layout_2bit.up_w_off;   up_s_off   = g_cfg.layout_2bit.up_s_off;   up_b_off   = g_cfg.layout_2bit.up_b_off;
+        down_w_off = g_cfg.layout_2bit.down_w_off; down_s_off = g_cfg.layout_2bit.down_s_off; down_b_off = g_cfg.layout_2bit.down_b_off;
     } else {
-        gate_w_off = GATE_W_OFF; gate_s_off = GATE_S_OFF; gate_b_off = GATE_B_OFF;
-        up_w_off   = UP_W_OFF;   up_s_off   = UP_S_OFF;   up_b_off   = UP_B_OFF;
-        down_w_off = DOWN_W_OFF; down_s_off = DOWN_S_OFF; down_b_off = DOWN_B_OFF;
+        gate_w_off = g_cfg.layout_4bit.gate_w_off; gate_s_off = g_cfg.layout_4bit.gate_s_off; gate_b_off = g_cfg.layout_4bit.gate_b_off;
+        up_w_off   = g_cfg.layout_4bit.up_w_off;   up_s_off   = g_cfg.layout_4bit.up_s_off;   up_b_off   = g_cfg.layout_4bit.up_b_off;
+        down_w_off = g_cfg.layout_4bit.down_w_off; down_s_off = g_cfg.layout_4bit.down_s_off; down_b_off = g_cfg.layout_4bit.down_b_off;
     }
     id<MTLComputePipelineState> expert_pipe = g_use_2bit ? ctx->matvec_2bit : ctx->matvec_v3;
 
-    uint32_t gate_up_out = MOE_INTERMEDIATE;
-    uint32_t gate_up_in  = HIDDEN_DIM;
-    uint32_t down_out    = HIDDEN_DIM;
-    uint32_t down_in     = MOE_INTERMEDIATE;
+    uint32_t gate_up_out = g_cfg.moe_intermediate;
+    uint32_t gate_up_in  = g_cfg.hidden_dim;
+    uint32_t down_out    = g_cfg.hidden_dim;
+    uint32_t down_in     = g_cfg.moe_intermediate;
     uint32_t gs          = GROUP_SIZE;
 
     // gate_proj
@@ -370,20 +370,20 @@ static void gpu_encode_experts_batched(
     NSUInteger up_w_off, up_s_off, up_b_off;
     NSUInteger down_w_off, down_s_off, down_b_off;
     if (g_use_2bit) {
-        gate_w_off = GATE_W_OFF_2; gate_s_off = GATE_S_OFF_2; gate_b_off = GATE_B_OFF_2;
-        up_w_off   = UP_W_OFF_2;   up_s_off   = UP_S_OFF_2;   up_b_off   = UP_B_OFF_2;
-        down_w_off = DOWN_W_OFF_2; down_s_off = DOWN_S_OFF_2; down_b_off = DOWN_B_OFF_2;
+        gate_w_off = g_cfg.layout_2bit.gate_w_off; gate_s_off = g_cfg.layout_2bit.gate_s_off; gate_b_off = g_cfg.layout_2bit.gate_b_off;
+        up_w_off   = g_cfg.layout_2bit.up_w_off;   up_s_off   = g_cfg.layout_2bit.up_s_off;   up_b_off   = g_cfg.layout_2bit.up_b_off;
+        down_w_off = g_cfg.layout_2bit.down_w_off; down_s_off = g_cfg.layout_2bit.down_s_off; down_b_off = g_cfg.layout_2bit.down_b_off;
     } else {
-        gate_w_off = GATE_W_OFF; gate_s_off = GATE_S_OFF; gate_b_off = GATE_B_OFF;
-        up_w_off   = UP_W_OFF;   up_s_off   = UP_S_OFF;   up_b_off   = UP_B_OFF;
-        down_w_off = DOWN_W_OFF; down_s_off = DOWN_S_OFF; down_b_off = DOWN_B_OFF;
+        gate_w_off = g_cfg.layout_4bit.gate_w_off; gate_s_off = g_cfg.layout_4bit.gate_s_off; gate_b_off = g_cfg.layout_4bit.gate_b_off;
+        up_w_off   = g_cfg.layout_4bit.up_w_off;   up_s_off   = g_cfg.layout_4bit.up_s_off;   up_b_off   = g_cfg.layout_4bit.up_b_off;
+        down_w_off = g_cfg.layout_4bit.down_w_off; down_s_off = g_cfg.layout_4bit.down_s_off; down_b_off = g_cfg.layout_4bit.down_b_off;
     }
     id<MTLComputePipelineState> expert_pipe = g_use_2bit ? ctx->matvec_2bit : ctx->matvec_v3;
 
-    uint32_t gate_up_out = MOE_INTERMEDIATE;
-    uint32_t gate_up_in  = HIDDEN_DIM;
-    uint32_t down_out    = HIDDEN_DIM;
-    uint32_t down_in     = MOE_INTERMEDIATE;
+    uint32_t gate_up_out = g_cfg.moe_intermediate;
+    uint32_t gate_up_in  = g_cfg.hidden_dim;
+    uint32_t down_out    = g_cfg.hidden_dim;
+    uint32_t down_in     = g_cfg.moe_intermediate;
     uint32_t gs          = GROUP_SIZE;
     // 2-bit: packed_cols = in_dim/16, threadgroups = out_dim/8
     // 4-bit: packed_cols = in_dim/8,  threadgroups = out_dim/8
@@ -509,20 +509,20 @@ static void gpu_encode_expert_forward(
     MetalCtx *ctx,
     id<MTLCommandBuffer> cmdbuf
 ) {
-    NSUInteger gate_w_off = GATE_W_OFF;
-    NSUInteger gate_s_off = GATE_S_OFF;
-    NSUInteger gate_b_off = GATE_B_OFF;
-    NSUInteger up_w_off   = UP_W_OFF;
-    NSUInteger up_s_off   = UP_S_OFF;
-    NSUInteger up_b_off   = UP_B_OFF;
-    NSUInteger down_w_off = DOWN_W_OFF;
-    NSUInteger down_s_off = DOWN_S_OFF;
-    NSUInteger down_b_off = DOWN_B_OFF;
+    NSUInteger gate_w_off = g_cfg.layout_4bit.gate_w_off;
+    NSUInteger gate_s_off = g_cfg.layout_4bit.gate_s_off;
+    NSUInteger gate_b_off = g_cfg.layout_4bit.gate_b_off;
+    NSUInteger up_w_off   = g_cfg.layout_4bit.up_w_off;
+    NSUInteger up_s_off   = g_cfg.layout_4bit.up_s_off;
+    NSUInteger up_b_off   = g_cfg.layout_4bit.up_b_off;
+    NSUInteger down_w_off = g_cfg.layout_4bit.down_w_off;
+    NSUInteger down_s_off = g_cfg.layout_4bit.down_s_off;
+    NSUInteger down_b_off = g_cfg.layout_4bit.down_b_off;
 
-    uint32_t gate_up_out = MOE_INTERMEDIATE;
-    uint32_t gate_up_in  = HIDDEN_DIM;
-    uint32_t down_out    = HIDDEN_DIM;
-    uint32_t down_in     = MOE_INTERMEDIATE;
+    uint32_t gate_up_out = g_cfg.moe_intermediate;
+    uint32_t gate_up_in  = g_cfg.hidden_dim;
+    uint32_t down_out    = g_cfg.hidden_dim;
+    uint32_t down_in     = g_cfg.moe_intermediate;
     uint32_t gs          = GROUP_SIZE;
 
     // gate_proj
@@ -619,9 +619,9 @@ static void fast_batch_matvec(
 __attribute__((unused))
 static void gpu_expert_forward(
     MetalCtx *ctx,
-    const void *expert_data,     // EXPERT_SIZE bytes (may be buf_expert_data contents)
-    const float *h_post,         // [HIDDEN_DIM] input
-    float *expert_out,           // [HIDDEN_DIM] output
+    const void *expert_data,     // g_cfg.expert_size_4bit bytes (may be buf_expert_data contents)
+    const float *h_post,         // [g_cfg.hidden_dim] input
+    float *expert_out,           // [g_cfg.hidden_dim] output
     int expert_data_already_in_buffer
 ) {
     // Expert layout offsets — select based on quantization mode
@@ -629,13 +629,13 @@ static void gpu_expert_forward(
     NSUInteger up_w_off, up_s_off, up_b_off;
     NSUInteger down_w_off, down_s_off, down_b_off;
     if (g_use_2bit) {
-        gate_w_off = GATE_W_OFF_2; gate_s_off = GATE_S_OFF_2; gate_b_off = GATE_B_OFF_2;
-        up_w_off   = UP_W_OFF_2;   up_s_off   = UP_S_OFF_2;   up_b_off   = UP_B_OFF_2;
-        down_w_off = DOWN_W_OFF_2; down_s_off = DOWN_S_OFF_2; down_b_off = DOWN_B_OFF_2;
+        gate_w_off = g_cfg.layout_2bit.gate_w_off; gate_s_off = g_cfg.layout_2bit.gate_s_off; gate_b_off = g_cfg.layout_2bit.gate_b_off;
+        up_w_off   = g_cfg.layout_2bit.up_w_off;   up_s_off   = g_cfg.layout_2bit.up_s_off;   up_b_off   = g_cfg.layout_2bit.up_b_off;
+        down_w_off = g_cfg.layout_2bit.down_w_off; down_s_off = g_cfg.layout_2bit.down_s_off; down_b_off = g_cfg.layout_2bit.down_b_off;
     } else {
-        gate_w_off = GATE_W_OFF; gate_s_off = GATE_S_OFF; gate_b_off = GATE_B_OFF;
-        up_w_off   = UP_W_OFF;   up_s_off   = UP_S_OFF;   up_b_off   = UP_B_OFF;
-        down_w_off = DOWN_W_OFF; down_s_off = DOWN_S_OFF; down_b_off = DOWN_B_OFF;
+        gate_w_off = g_cfg.layout_4bit.gate_w_off; gate_s_off = g_cfg.layout_4bit.gate_s_off; gate_b_off = g_cfg.layout_4bit.gate_b_off;
+        up_w_off   = g_cfg.layout_4bit.up_w_off;   up_s_off   = g_cfg.layout_4bit.up_s_off;   up_b_off   = g_cfg.layout_4bit.up_b_off;
+        down_w_off = g_cfg.layout_4bit.down_w_off; down_s_off = g_cfg.layout_4bit.down_s_off; down_b_off = g_cfg.layout_4bit.down_b_off;
     }
     id<MTLComputePipelineState> expert_pipe = g_use_2bit ? ctx->matvec_2bit : ctx->matvec_v3;
 
@@ -643,12 +643,12 @@ static void gpu_expert_forward(
     if (!expert_data_already_in_buffer) {
         memcpy([ctx->buf_expert_data contents], expert_data, active_expert_size());
     }
-    memcpy([ctx->buf_expert_input contents], h_post, HIDDEN_DIM * sizeof(float));
+    memcpy([ctx->buf_expert_input contents], h_post, g_cfg.hidden_dim * sizeof(float));
 
-    uint32_t gate_up_out = MOE_INTERMEDIATE;  // 1024
-    uint32_t gate_up_in  = HIDDEN_DIM;        // 4096
-    uint32_t down_out    = HIDDEN_DIM;        // 4096
-    uint32_t down_in     = MOE_INTERMEDIATE;  // 1024
+    uint32_t gate_up_out = g_cfg.moe_intermediate;  // 1024
+    uint32_t gate_up_in  = g_cfg.hidden_dim;        // 4096
+    uint32_t down_out    = g_cfg.hidden_dim;        // 4096
+    uint32_t down_in     = g_cfg.moe_intermediate;  // 1024
     uint32_t gs          = GROUP_SIZE;        // 64
 
     // Build one command buffer with all 4 dispatches:
@@ -731,7 +731,7 @@ static void gpu_expert_forward(
     [cmdbuf waitUntilCompleted];
 
     // Copy result back to CPU
-    memcpy(expert_out, [ctx->buf_expert_out contents], HIDDEN_DIM * sizeof(float));
+    memcpy(expert_out, [ctx->buf_expert_out contents], g_cfg.hidden_dim * sizeof(float));
 }
 
 // ============================================================================

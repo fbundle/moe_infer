@@ -3,7 +3,7 @@
  */
 
 #include "util.h"
-#include "tensors.h"
+#include "model_weights.h"
 #include "cpu_kernels.h"
 #include "metal_setup.h"
 #include "gpu_ops.h"
@@ -13,11 +13,14 @@
 #include "layer_forward.h"
 #include "moe_infer_c.h"
 
+// ---- Global runtime config ----
+ModelConfig g_cfg = {0};
+
 // ---- Cache ----
 
 typedef struct FlashMoE_Cache {
-    KVCache **kv_caches;          // [NUM_LAYERS] — non-NULL for full-attn layers
-    void    **layer_states;       // [NUM_LAYERS] — LinearAttnState* for linear layers
+    KVCache **kv_caches;          // [g_cfg.num_layers] — non-NULL for full-attn layers
+    void    **layer_states;       // [g_cfg.num_layers] — LinearAttnState* for linear layers
     int       pos;                // sequence position for RoPE
 } FlashMoE_Cache;
 
@@ -25,9 +28,9 @@ typedef struct FlashMoE_Cache {
 
 static WeightFile *g_wf = NULL;
 
-static int   g_layer_fds[NUM_LAYERS];
-static void *g_layer_mmaps[NUM_LAYERS];
-static size_t g_layer_mmap_sizes[NUM_LAYERS];
+static int   *g_layer_fds = NULL;
+static void **g_layer_mmaps = NULL;
+static size_t *g_layer_mmap_sizes = NULL;
 
 static float    *g_hidden = NULL;
 static float    *g_logits = NULL;
@@ -41,10 +44,10 @@ static int g_initialized = 0;
 FlashMoE_Cache *flashmoe_cache_new(void) {
     FlashMoE_Cache *c = calloc(1, sizeof(FlashMoE_Cache));
     if (!c) return NULL;
-    c->kv_caches    = calloc(NUM_LAYERS, sizeof(KVCache *));
-    c->layer_states = calloc(NUM_LAYERS, sizeof(void *));
+    c->kv_caches    = calloc(g_cfg.num_layers, sizeof(KVCache *));
+    c->layer_states = calloc(g_cfg.num_layers, sizeof(void *));
     c->pos = 0;
-    for (int i = 0; i < NUM_LAYERS; i++) {
+    for (int i = 0; i < g_cfg.num_layers; i++) {
         int is_full = ((i + 1) % FULL_ATTN_INTERVAL == 0);
         if (is_full) {
             c->kv_caches[i] = kv_cache_new();
@@ -64,7 +67,7 @@ FlashMoE_Cache *flashmoe_cache_clone(FlashMoE_Cache *src) {
 
 void flashmoe_cache_free(FlashMoE_Cache *c) {
     if (!c) return;
-    for (int i = 0; i < NUM_LAYERS; i++) {
+    for (int i = 0; i < g_cfg.num_layers; i++) {
         if (c->kv_caches[i])    kv_cache_free(c->kv_caches[i]);
         if (c->layer_states[i]) linear_attn_state_free(c->layer_states[i]);
     }
@@ -75,16 +78,16 @@ void flashmoe_cache_free(FlashMoE_Cache *c) {
 
 void flashmoe_cache_reset(FlashMoE_Cache *c) {
     if (!c) return;
-    for (int i = 0; i < NUM_LAYERS; i++) {
+    for (int i = 0; i < g_cfg.num_layers; i++) {
         if (c->kv_caches[i]) {
             c->kv_caches[i]->len = 0;
         }
         if (c->layer_states[i]) {
             LinearAttnState *s = (LinearAttnState *)c->layer_states[i];
             memset(s->conv_state, 0,
-                   (CONV_KERNEL_SIZE - 1) * LINEAR_CONV_DIM * sizeof(float));
+                   (CONV_KERNEL_SIZE - 1) * g_cfg.linear_conv_dim * sizeof(float));
             memset(s->ssm_state, 0,
-                   LINEAR_NUM_V_HEADS * LINEAR_VALUE_DIM * LINEAR_KEY_DIM * sizeof(float));
+                   g_cfg.linear_num_v_heads * LINEAR_VALUE_DIM * LINEAR_KEY_DIM * sizeof(float));
         }
     }
     c->pos = 0;
@@ -102,7 +105,8 @@ int flashmoe_init(const char *model_path) {
     snprintf(weights_path,  sizeof(weights_path),  "%s/model_weights.bin",   model_path);
     snprintf(manifest_path, sizeof(manifest_path), "%s/model_weights.json",  model_path);
 
-    print_model_config();
+    if (model_config_load(model_path) != 0) return -1;
+    util_arrays_alloc();
 
     // Metal
     g_metal = metal_setup();
@@ -143,12 +147,12 @@ int flashmoe_init(const char *model_path) {
     }
 
     // Open expert files
-    memset(g_layer_fds, 0, sizeof(g_layer_fds));
-    memset(g_layer_mmaps, 0, sizeof(g_layer_mmaps));
-    memset(g_layer_mmap_sizes, 0, sizeof(g_layer_mmap_sizes));
-    memset(g_expert_seen, 0, sizeof(g_expert_seen));
+    g_layer_fds = calloc(g_cfg.num_layers, sizeof(int));
+    g_layer_mmaps = calloc(g_cfg.num_layers, sizeof(void *));
+    g_layer_mmap_sizes = calloc(g_cfg.num_layers, sizeof(size_t));
+    for (int i = 0; i < g_cfg.num_layers; i++) g_layer_fds[i] = -1;
 
-    for (int i = 0; i < NUM_LAYERS; i++) {
+    for (int i = 0; i < g_cfg.num_layers; i++) {
         g_layer_fds_cold[i] = -1;
         char path[1024];
         snprintf(path, sizeof(path), "%s/%s/layer_%02d.bin", model_path,
@@ -174,16 +178,16 @@ int flashmoe_init(const char *model_path) {
         char lz4_probe[1024];
         snprintf(lz4_probe, sizeof(lz4_probe), "%s/packed_experts_lz4/layer_00.bin", model_path);
         if (!g_use_2bit && access(lz4_probe, R_OK) == 0) {
-            for (int i = 0; i < NUM_LAYERS; i++) {
+            for (int i = 0; i < g_cfg.num_layers; i++) {
                 char lz4_path[1024];
                 snprintf(lz4_path, sizeof(lz4_path),
                          "%s/packed_experts_lz4/layer_%02d.bin", model_path, i);
                 int lz4_fd = open(lz4_path, O_RDONLY);
                 if (lz4_fd >= 0) {
-                    g_lz4_index[i] = malloc(NUM_EXPERTS * sizeof(LZ4IndexEntry));
+                    g_lz4_index[i] = malloc(g_cfg.num_experts * sizeof(LZ4IndexEntry));
                     ssize_t nr = pread(lz4_fd, g_lz4_index[i],
-                                       NUM_EXPERTS * sizeof(LZ4IndexEntry), 0);
-                    if (nr == NUM_EXPERTS * (ssize_t)sizeof(LZ4IndexEntry)) {
+                                       g_cfg.num_experts * sizeof(LZ4IndexEntry), 0);
+                    if (nr == g_cfg.num_experts * (ssize_t)sizeof(LZ4IndexEntry)) {
                         close(g_layer_fds[i]);
                         g_layer_fds[i] = lz4_fd;
                         fcntl(lz4_fd, F_RDAHEAD, 1);
@@ -197,14 +201,14 @@ int flashmoe_init(const char *model_path) {
             if (g_lz4_index[0] != NULL || g_lz4_index[1] != NULL) {  // at least some layers
                 g_use_lz4 = 1;
                 for (int k = 0; k < MAX_K; k++) {
-                    g_lz4_comp_bufs[k] = malloc(EXPERT_SIZE + 4096);
+                    g_lz4_comp_bufs[k] = malloc(g_cfg.expert_size_4bit + 4096);
                 }
             }
         }
     }
 
     // Warm page cache
-    for (int i = 0; i < NUM_LAYERS; i++) {
+    for (int i = 0; i < g_cfg.num_layers; i++) {
         if (g_layer_fds[i] >= 0) {
             char dummy[4096];
             pread(g_layer_fds[i], dummy, sizeof(dummy), 0);
@@ -212,10 +216,13 @@ int flashmoe_init(const char *model_path) {
     }
 
     // Working buffers
-    g_hidden = calloc(HIDDEN_DIM, sizeof(float));
-    g_logits = calloc(VOCAB_SIZE, sizeof(float));
+    g_hidden = calloc(g_cfg.hidden_dim, sizeof(float));
+    g_logits = calloc(g_cfg.vocab_size, sizeof(float));
     g_final_norm_w = get_tensor_ptr(g_wf, "model.norm.weight");
     g_K = NUM_ACTIVE_EXPERTS;
+
+    // Allocate scratch buffers (g_cfg.hidden_dim / g_cfg.num_experts dependent)
+    init_layer_scratch();
 
     // Build layer weight cache
     if (!layer_cache_built) build_layer_cache(g_wf);
@@ -238,7 +245,7 @@ int flashmoe_forward(const int *input_ids, int n_tokens,
     for (int tok = 0; tok < n_tokens; tok++) {
         embed_lookup(g_wf, input_ids[tok], g_hidden);
 
-        for (int layer = 0; layer < NUM_LAYERS; layer++) {
+        for (int layer = 0; layer < g_cfg.num_layers; layer++) {
             int is_full = ((layer + 1) % FULL_ATTN_INTERVAL == 0);
             fused_layer_forward(g_wf, layer, g_hidden,
                                 is_full ? cache->kv_caches[layer] : NULL,
@@ -252,13 +259,13 @@ int flashmoe_forward(const int *input_ids, int n_tokens,
         pos++;
 
         if (g_final_norm_w) {
-            float *normed = malloc(HIDDEN_DIM * sizeof(float));
-            cpu_rms_norm(g_hidden, g_final_norm_w, normed, HIDDEN_DIM, RMS_NORM_EPS);
-            memcpy(g_hidden, normed, HIDDEN_DIM * sizeof(float));
+            float *normed = malloc(g_cfg.hidden_dim * sizeof(float));
+            cpu_rms_norm(g_hidden, g_final_norm_w, normed, g_cfg.hidden_dim, RMS_NORM_EPS);
+            memcpy(g_hidden, normed, g_cfg.hidden_dim * sizeof(float));
             free(normed);
         }
 
-        lm_head_forward(g_wf, g_hidden, logits_out + (size_t)tok * VOCAB_SIZE);
+        lm_head_forward(g_wf, g_hidden, logits_out + (size_t)tok * g_cfg.vocab_size);
     }
 
     cache->pos = pos;
@@ -271,9 +278,9 @@ int flashmoe_cache_position(FlashMoE_Cache *c) {
     return c ? c->pos : 0;
 }
 
-int flashmoe_vocab_size(void)  { return VOCAB_SIZE; }
-int flashmoe_hidden_dim(void)  { return HIDDEN_DIM; }
-int flashmoe_num_layers(void)  { return NUM_LAYERS; }
+int flashmoe_vocab_size(void)  { return g_cfg.vocab_size; }
+int flashmoe_hidden_dim(void)  { return g_cfg.hidden_dim; }
+int flashmoe_num_layers(void)  { return g_cfg.num_layers; }
 
 // ---- flashmoe_free ----
 
@@ -289,13 +296,15 @@ void flashmoe_free(void) {
         expert_cache_free(g_expert_cache);
         g_expert_cache = NULL;
     }
-    for (int i = 0; i < NUM_LAYERS; i++) {
+    // Close layer FDs, unmap mmaps, free LZ4 indices BEFORE util_arrays_free
+    // because util_arrays_free() frees g_layer_fds_cold and g_lz4_index.
+    for (int i = 0; i < g_cfg.num_layers; i++) {
         if (g_layer_mmaps[i] != MAP_FAILED) {
             munmap(g_layer_mmaps[i], g_layer_mmap_sizes[i]);
         }
         if (g_layer_fds[i] >= 0) close(g_layer_fds[i]);
-        if (g_layer_fds_cold[i] >= 0) close(g_layer_fds_cold[i]);
-        if (g_lz4_index[i]) {
+        if (g_layer_fds_cold && g_layer_fds_cold[i] >= 0) close(g_layer_fds_cold[i]);
+        if (g_lz4_index && g_lz4_index[i]) {
             free(g_lz4_index[i]);
             g_lz4_index[i] = NULL;
         }
@@ -304,12 +313,47 @@ void flashmoe_free(void) {
         free(g_lz4_comp_bufs[k]);
         g_lz4_comp_bufs[k] = NULL;
     }
+    free(g_layer_fds);
+    free(g_layer_mmaps);
+    free(g_layer_mmap_sizes);
+    g_layer_fds = NULL;
+    g_layer_mmaps = NULL;
+    g_layer_mmap_sizes = NULL;
+    util_arrays_free();
     free(g_hidden);
     free(g_logits);
-    // WeightFile is not freed (it's mmap'd)
     g_hidden = NULL;
     g_logits = NULL;
     g_wf = NULL;
+    // Free Metal arrays (allocated dynamically after VLA→pointer conversion).
+    // Each buffer has +1 retain from newBufferWithLength: plus +1 from CFRetain
+    // (see metal_setup.h) — CFRelease before freeing the array.
+    if (g_metal) {
+        if (g_metal->buf_kv_k) {
+            for (int i = 0; i < g_cfg.num_full_attn_layers; i++)
+                if (g_metal->buf_kv_k[i]) CFRelease((__bridge CFTypeRef)g_metal->buf_kv_k[i]);
+            free(g_metal->buf_kv_k);
+        }
+        if (g_metal->buf_kv_v) {
+            for (int i = 0; i < g_cfg.num_full_attn_layers; i++)
+                if (g_metal->buf_kv_v[i]) CFRelease((__bridge CFTypeRef)g_metal->buf_kv_v[i]);
+            free(g_metal->buf_kv_v);
+        }
+        if (g_metal->buf_delta_state) {
+            for (int i = 0; i < g_cfg.num_linear_layers; i++)
+                if (g_metal->buf_delta_state[i]) CFRelease((__bridge CFTypeRef)g_metal->buf_delta_state[i]);
+            free(g_metal->buf_delta_state);
+        }
+        if (g_metal->buf_conv_state) {
+            for (int i = 0; i < g_cfg.num_linear_layers; i++)
+                if (g_metal->buf_conv_state[i]) CFRelease((__bridge CFTypeRef)g_metal->buf_conv_state[i]);
+            free(g_metal->buf_conv_state);
+        }
+        free(g_metal);
+    }
     g_metal = NULL;
+    free(layer_cache);
+    layer_cache = NULL;
+    layer_cache_built = 0;
     g_initialized = 0;
 }

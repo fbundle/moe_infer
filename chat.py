@@ -47,8 +47,8 @@ def main():
     messages = []
 
     with model:
-        print(f"Ready. {fm._core.num_layers()} layers, "
-              f"{fm._core.hidden_dim()} dim.\n")
+        print(f"Ready. {fm.core.num_layers()} layers, "
+              f"{fm.core.hidden_dim()} dim.\n")
 
         while True:
             try:

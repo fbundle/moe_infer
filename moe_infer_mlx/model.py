@@ -10,7 +10,7 @@ Python API for Flash-MoE inference engine.
 
 from __future__ import annotations
 
-import moe_infer_mlx._core as _core
+import moe_infer_mlx.core as _core
 
 
 class Cache:

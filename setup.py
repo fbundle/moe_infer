@@ -1,8 +1,8 @@
 """
 Build script for moe-infer-mlx Cython extension.
 
-Compiles the C wrapper (src/flashmoe_c.m, Objective-C) together with
-the Cython bridge (moe_infer_mlx/_core.pyx) into a single shared library.
+Compiles the C wrapper (moe_infer_mlx/core_src/moe_infer_c.m, Objective-C) together with
+the Cython bridge (moe_infer_mlx/core.pyx) into a single shared library.
 """
 
 from setuptools import setup, Extension
@@ -10,12 +10,12 @@ from Cython.Build import cythonize
 import numpy as np
 
 ext = Extension(
-    "moe_infer_mlx._core",
+    "moe_infer_mlx.core",
     sources=[
-        "moe_infer_mlx/_core.pyx",
-        "src/moe_infer_c.m",
+        "moe_infer_mlx/core.pyx",
+        "moe_infer_mlx/core_src/moe_infer_c.m",
     ],
-    include_dirs=["src", np.get_include()],
+    include_dirs=["moe_infer_mlx/core_src", np.get_include()],
     extra_compile_args=[
         "-O2",
         "-Wall",
@@ -39,5 +39,5 @@ setup(
         [ext],
         language_level="3",
     ),
-    packages=["moe_infer_mlx"],
+    packages=["moe_infer_mlx", "moe_infer_mlx.convert"],
 )

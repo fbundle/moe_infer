@@ -17,7 +17,7 @@ static void embed_lookup(WeightFile *wf, int token_id, float *out) {
 
     if (!w_info || !s_info || !b_info) {
         fprintf(stderr, "ERROR: embedding tensors not found\n");
-        memset(out, 0, HIDDEN_DIM * sizeof(float));
+        memset(out, 0, g_cfg.hidden_dim * sizeof(float));
         return;
     }
 
@@ -33,7 +33,7 @@ static void embed_lookup(WeightFile *wf, int token_id, float *out) {
     const uint16_t *s_row = S + (size_t)token_id * num_groups;
     const uint16_t *b_row = B + (size_t)token_id * num_groups;
 
-    int group_size = HIDDEN_DIM / num_groups;  // 4096/64 = 64
+    int group_size = g_cfg.hidden_dim / num_groups;  // 4096/64 = 64
     int packed_per_group = group_size / 8;     // 8
 
     for (int g = 0; g < num_groups; g++) {
@@ -75,7 +75,7 @@ static void lm_head_forward(WeightFile *wf, const float *hidden, float *logits) 
     uint16_t *B = (uint16_t *)((char *)wf->data + b_info->offset);
 
     // Full matmul — use GPU if available (248320 output rows!)
-    fast_dequant_matvec(W, S, B, hidden, logits, VOCAB_SIZE, HIDDEN_DIM, GROUP_SIZE);
+    fast_dequant_matvec(W, S, B, hidden, logits, g_cfg.vocab_size, g_cfg.hidden_dim, GROUP_SIZE);
 }
 
 
