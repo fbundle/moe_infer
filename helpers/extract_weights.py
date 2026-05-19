@@ -37,6 +37,92 @@ def parse_safetensors_header(filepath):
     return header, data_start
 
 
+def bf16_to_f32(u16):
+    """Convert bf16 (uint16) to float32."""
+    return struct.unpack('!f', struct.pack('!I', u16 << 16))[0]
+
+
+def f32_to_bf16(f32):
+    """Convert float32 to bf16 (uint16) with round-to-nearest-even."""
+    # Reinterpret f32 as uint32, add rounding bias, truncate to 16 bits
+    i = struct.unpack('!I', struct.pack('!f', f32))[0]
+    # Round to nearest even for the lower 16 bits
+    round_bit = (i >> 15) & 1
+    sticky = i & 0x7FFF
+    if round_bit and (sticky or (i >> 16) & 1):
+        i += 0x10000
+    return (i >> 16) & 0xFFFF
+
+
+def dequant_8bit_to_f32(weight_int8, scales_bf16, biases_bf16, out_dim, in_dim, group_size):
+    """Dequantize MLX 8-bit tensor to float32.
+
+    weight_int8: uint8 array [out_dim, in_dim]
+    scales_bf16: uint16 array [out_dim, in_dim//group_size]
+    biases_bf16: uint16 array [out_dim, in_dim//group_size]
+    Returns float32 array [out_dim, in_dim]
+    """
+    num_groups = in_dim // group_size
+    result = np.zeros(out_dim * in_dim, dtype=np.float32)
+    w = weight_int8.reshape(out_dim, num_groups, group_size)
+    s = scales_bf16.reshape(out_dim, num_groups)
+    b = biases_bf16.reshape(out_dim, num_groups)
+
+    for i in range(out_dim):
+        for g in range(num_groups):
+            scale = bf16_to_f32(int(s[i, g]))
+            bias = bf16_to_f32(int(b[i, g]))
+            start = (i * num_groups + g) * group_size
+            result[start:start + group_size] = (
+                w[i, g, :].astype(np.float32) * scale + bias
+            )
+    return result
+
+
+def quant_f32_to_4bit_packed(values, out_dim, in_dim, group_size):
+    """Quantize float32 array [out_dim, in_dim] to 4-bit packed.
+
+    Returns (packed_uint32, scales_bf16, biases_bf16) in the MLX 4-bit layout:
+      packed: uint32 array [out_dim * in_dim // 8]
+      scales: uint16 array [out_dim * in_dim // group_size]
+      biases: uint16 array [out_dim * in_dim // group_size]
+    """
+    num_groups = in_dim // group_size
+    total = out_dim * in_dim
+    packed = np.zeros(total // 8, dtype=np.uint32)
+    scales = np.zeros(out_dim * num_groups, dtype=np.uint16)
+    biases = np.zeros(out_dim * num_groups, dtype=np.uint16)
+
+    v = values.reshape(out_dim, num_groups, group_size)
+
+    for i in range(out_dim):
+        for g in range(num_groups):
+            chunk = v[i, g, :]
+            vmin = float(chunk.min())
+            vmax = float(chunk.max())
+            if vmax == vmin:
+                vmax = vmin + 1.0  # avoid div by zero
+
+            fscale = (vmax - vmin) / 15.0
+            fbias = vmin
+
+            # Store scale/bias as bf16
+            s_idx = i * num_groups + g
+            scales[s_idx] = f32_to_bf16(fscale)
+            biases[s_idx] = f32_to_bf16(fbias)
+
+            # Quantize each value and pack into nibbles
+            for j in range(group_size):
+                q = int(round((float(chunk[j]) - fbias) / fscale))
+                q = max(0, min(15, q))
+                global_idx = (i * num_groups + g) * group_size + j
+                word_idx = global_idx // 8
+                nibble_shift = (global_idx % 8) * 4
+                packed[word_idx] |= np.uint32(q & 0xF) << nibble_shift
+
+    return packed, scales, biases
+
+
 def main():
     parser = argparse.ArgumentParser(description='Extract non-expert weights to binary')
     parser.add_argument('--model', type=str, required=True,
@@ -196,6 +282,88 @@ def main():
             layer_types.append("linear_attention")
     manifest["config"]["layer_types"] = layer_types
 
+    # Detect 8-bit quantized tensors from quantization config.
+    # Qwen3.6+ uses INT8 for routing gate and shared_expert_gate tensors.
+    # We dequantize and re-quantize to 4-bit so the C engine needs no changes.
+    eight_bit_tensors = {}  # HF name -> {"group_size": N, "bits": 8}
+    if model_cfg_path.exists():
+        with open(model_cfg_path) as f:
+            hf_full = json.load(f)
+        # Check both "quantization" and "quantization_config" keys
+        for qkey in ("quantization", "quantization_config"):
+            qcfg = hf_full.get(qkey, {})
+            for tensor_path, tcfg in qcfg.items():
+                if isinstance(tcfg, dict) and tcfg.get("bits") == 8:
+                    eight_bit_tensors[tensor_path] = tcfg
+
+    # Pre-process 8-bit tensors: read weight+scales+biases, convert to 4-bit.
+    # Result stored as sanitized_name -> raw bytes for weight/scales/biases.
+    converted_4bit = {}  # sanitized_name -> bytes
+    if eight_bit_tensors:
+        print(f"\nConverting {len(eight_bit_tensors)} INT8 tensors to 4-bit...")
+        for hf_name, qcfg in sorted(eight_bit_tensors.items()):
+            gs = qcfg["group_size"]
+            san_base = sanitize_name(hf_name)
+
+            # Find the safetensors file containing this tensor
+            hf_weight_name = hf_name + ".weight"
+            if hf_weight_name not in weight_map:
+                print(f"  WARNING: {hf_weight_name} not in weight map, skipping")
+                continue
+            sf_name = weight_map[hf_weight_name]
+            sf_path = model_path / sf_name
+            header, data_start = header_cache[sf_name]
+
+            # Read weight (int8), scales (bf16), biases (bf16) from safetensors
+            def read_tensor(hdr_name):
+                if hdr_name not in header:
+                    return None
+                meta = header[hdr_name]
+                off = meta['data_offsets']
+                length = off[1] - off[0]
+                shape = meta['shape']
+                with open(sf_path, 'rb') as sf:
+                    sf.seek(data_start + off[0])
+                    return sf.read(length), shape
+
+            w_data = read_tensor(hf_weight_name)
+            s_data = read_tensor(hf_name + ".scales")
+            b_data = read_tensor(hf_name + ".biases")
+
+            if not all([w_data, s_data, b_data]):
+                print(f"  WARNING: incomplete data for {hf_name}, skipping")
+                continue
+
+            w_raw, w_shape = w_data
+            out_dim = w_shape[0]
+            # MLX stores INT8 packed as U32 (4 uint8 per uint32).
+            # The stated in_dim is U32 elements; actual int8 dim = in_dim * 4.
+            in_dim_u32 = w_shape[1]
+            in_dim = in_dim_u32 * 4  # actual int8 element count
+
+            # Dequantize 8-bit -> float32
+            weight_int8 = np.frombuffer(w_raw, dtype=np.uint8)
+            scales_bf16 = np.frombuffer(s_data[0], dtype=np.uint16)
+            biases_bf16 = np.frombuffer(b_data[0], dtype=np.uint16)
+
+            f32_vals = dequant_8bit_to_f32(
+                weight_int8, scales_bf16, biases_bf16,
+                out_dim, in_dim, gs
+            )
+
+            # Re-quantize float32 -> 4-bit packed
+            new_group_size = 64  # match GROUP_SIZE used by C engine
+            packed, new_scales, new_biases = quant_f32_to_4bit_packed(
+                f32_vals, out_dim, in_dim, new_group_size
+            )
+
+            converted_4bit[san_base + ".weight"] = packed.tobytes()
+            converted_4bit[san_base + ".scales"] = new_scales.tobytes()
+            converted_4bit[san_base + ".biases"] = new_biases.tobytes()
+
+            print(f"  {san_base}: {out_dim}x{in_dim} INT8 -> 4-bit "
+                  f"(packed={len(packed) * 4}B, s={len(new_scales) * 2}B, b={len(new_biases) * 2}B)")
+
     print(f"\nWriting {bin_path}...")
     t0 = time.time()
     offset = 0
@@ -205,29 +373,36 @@ def main():
 
     with open(bin_path, 'wb') as out_f:
         for i, (san_name, orig_name, filename) in enumerate(all_tensors):
-            filepath = model_path / filename
-            header, data_start = header_cache[filename]
+            # Check for 8-bit -> 4-bit converted data
+            if san_name in converted_4bit:
+                data = converted_4bit[san_name]
+                byte_len = len(data)
+                shape = []
+                dtype = "U32" if ".weight" in san_name else "BF16"
+            else:
+                filepath = model_path / filename
+                header, data_start = header_cache[filename]
 
-            if orig_name not in header:
-                print(f"  WARNING: {orig_name} not found in {filename}, skipping")
-                continue
+                if orig_name not in header:
+                    print(f"  WARNING: {orig_name} not found in {filename}, skipping")
+                    continue
 
-            meta = header[orig_name]
-            tensor_offsets = meta['data_offsets']
-            byte_len = tensor_offsets[1] - tensor_offsets[0]
-            shape = meta['shape']
-            dtype = meta['dtype']
+                meta = header[orig_name]
+                tensor_offsets = meta['data_offsets']
+                byte_len = tensor_offsets[1] - tensor_offsets[0]
+                shape = meta['shape']
+                dtype = meta['dtype']
+
+                # Read tensor data from safetensors
+                with open(filepath, 'rb') as sf:
+                    sf.seek(data_start + tensor_offsets[0])
+                    data = sf.read(byte_len)
 
             # Align offset
             if offset % ALIGN != 0:
                 pad = ALIGN - (offset % ALIGN)
                 out_f.write(b'\x00' * pad)
                 offset += pad
-
-            # Read tensor data from safetensors
-            with open(filepath, 'rb') as sf:
-                sf.seek(data_start + tensor_offsets[0])
-                data = sf.read(byte_len)
 
             out_f.write(data)
 
