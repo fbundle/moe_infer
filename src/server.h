@@ -647,7 +647,7 @@ static void serve_loop(
                 "Access-Control-Allow-Origin: *\r\n"
                 "Connection: close\r\n"
                 "\r\n"
-                "{\"status\":\"ok\",\"model\":\"qwen3.5-397b-a17b\"}\n";
+                "{\"status\":\"ok\",\"model\":\"flash-moe\"}\n";
             http_write_str(client_fd, resp);
             free(reqbuf); close(client_fd);
             continue;
@@ -661,7 +661,7 @@ static void serve_loop(
                 "Access-Control-Allow-Origin: *\r\n"
                 "Connection: close\r\n"
                 "\r\n"
-                "{\"object\":\"list\",\"data\":[{\"id\":\"qwen3.5-397b-a17b\","
+                "{\"object\":\"list\",\"data\":[{\"id\":\"flash-moe\","
                 "\"object\":\"model\",\"owned_by\":\"local\"}]}\n";
             http_write_str(client_fd, resp);
             free(reqbuf); close(client_fd);
