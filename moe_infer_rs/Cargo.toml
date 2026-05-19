@@ -1,0 +1,23 @@
+[package]
+name = "moe_infer_rs"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+name = "moe_infer_rs"
+crate-type = ["cdylib"]
+
+[features]
+python = ["pyo3/extension-module"]
+
+[dependencies]
+pyo3 = { version = "0.23" }
+metal = "0.29"
+objc = "0.2"
+objc-foundation = "0.1"
+half = "2"
+bytemuck = "1"
+parking_lot = "0.12"
+lz4_flex = "0.11"
+numpy = "0.23"
+rand = "0.8"
