@@ -11,10 +11,10 @@ import json
 import os
 import re
 import readline
+import socket
+import ssl
 import sys
 import time
-import urllib.request
-import urllib.error
 
 SESSIONS_DIR = os.path.expanduser("~/.flash-moe/sessions")
 
@@ -34,6 +34,8 @@ def load_sessions():
 def stream_chat(host: str, port: int, prompt: str, max_tokens: int,
                 session_id: str, show_think: bool = False) -> str:
     """Send chat request to infer.m server and stream SSE response.
+    Uses raw sockets to avoid urllib's 8KB BufferedReader — SSE events
+    are small and must be dispatched immediately for smooth animation.
     Returns the full response text.
     """
     body = json.dumps({
@@ -44,21 +46,39 @@ def stream_chat(host: str, port: int, prompt: str, max_tokens: int,
         "stream": True,
     }).encode()
 
-    url = f"http://{host}:{port}/v1/chat/completions"
-    req = urllib.request.Request(url, data=body, headers={
-        "Content-Type": "application/json",
-        "Accept": "text/event-stream",
-    })
+    request = (
+        f"POST /v1/chat/completions HTTP/1.1\r\n"
+        f"Host: {host}:{port}\r\n"
+        f"Content-Type: application/json\r\n"
+        f"Accept: text/event-stream\r\n"
+        f"Content-Length: {len(body)}\r\n"
+        f"Connection: close\r\n"
+        f"\r\n"
+    ).encode() + body
 
+    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+    sock.settimeout(300)
     try:
-        resp = urllib.request.urlopen(req, timeout=300)
-    except urllib.error.URLError as e:
-        if hasattr(e, 'reason') and isinstance(e.reason, ConnectionRefusedError):
-            print(f"\n[error] Cannot connect to server on {host}:{port}.")
-            print(f"        Start it: ./bin/infer --serve {port}")
-        else:
-            print(f"\n[error] {e}")
+        sock.connect((host, port))
+    except ConnectionRefusedError:
+        print(f"\n[error] Cannot connect to server on {host}:{port}.")
+        print(f"        Start it: ./bin/infer --serve {port}")
         return ""
+    sock.sendall(request)
+
+    # Read HTTP response headers
+    buf = b""
+    while b"\r\n\r\n" not in buf:
+        chunk = sock.recv(4096)
+        if not chunk:
+            sock.close()
+            return ""
+        buf += chunk
+
+    # buf now contains headers + potentially some body data after \r\n\r\n
+    header_end = buf.find(b"\r\n\r\n") + 4
+    body_remainder = buf[header_end:]
 
     full_text = []
     t0 = time.monotonic()
@@ -66,9 +86,10 @@ def stream_chat(host: str, port: int, prompt: str, max_tokens: int,
     in_think = False
     in_code_block = False
 
-    buf = b""
+    buf = body_remainder
     while True:
-        chunk = resp.read(4096)
+        # Small reads: avoid buffering multiple SSE events in one recv
+        chunk = sock.recv(256)
         if not chunk:
             break
         buf += chunk
@@ -101,6 +122,8 @@ def stream_chat(host: str, port: int, prompt: str, max_tokens: int,
 
             full_text.append(token)
             print(token, end="", flush=True)
+
+    sock.close()
 
     elapsed = time.monotonic() - t0
     n_tok = len(full_text)

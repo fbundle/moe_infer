@@ -247,13 +247,15 @@ static void http_write_str(int fd, const char *s) {
     http_write(fd, s, (int)strlen(s));
 }
 
-// BPE token cleanup: the tokenizer produces artifacts (Ġ for space, Ċ for newline,
-// various multi-byte sequences for punctuation). Clean them server-side so all
-// clients get readable text without needing BPE decoding logic.
-static const char *server_cleanup_token(const char *raw) {
-    static char buf[512];
-    char *w = buf;
-    const char *end = buf + sizeof(buf) - 1;
+// BPE text cleanup: the tokenizer produces artifacts (Ġ for space,
+// Ċ for newline, various multi-byte sequences for punctuation). Clean them
+// server-side so all clients get readable text.
+// Each BPE token is a self-contained UTF-8 string, so per-token cleanup
+// is equivalent to full-sequence cleanup.
+// Writes to caller-provided out buffer, returns byte count.
+static int server_cleanup_text(const char *raw, char *out, int out_size) {
+    char *w = out;
+    const char *end = out + out_size - 1;
     const unsigned char *r = (const unsigned char *)raw;
 
     while (*r && w < end) {
@@ -288,7 +290,7 @@ static const char *server_cleanup_token(const char *raw) {
         *w++ = *r++;
     }
     *w = '\0';
-    return buf;
+    return (int)(w - out);
 }
 
 // Send an SSE chunk with a token delta
@@ -905,15 +907,15 @@ static void serve_loop(
                 }
 
                 const char *raw_str = decode_token(vocab, next_token);
-                const char *tok_str = server_cleanup_token(raw_str);
+                char clean_buf[256];
+                int clean_len = server_cleanup_text(raw_str, clean_buf, sizeof(clean_buf));
                 // Accumulate non-thinking response for session persistence
-                if (!in_think && tok_str && gen_resp_len + (int)strlen(tok_str) < 256*1024 - 1) {
-                    int tlen = (int)strlen(tok_str);
-                    memcpy(gen_response + gen_resp_len, tok_str, tlen);
-                    gen_resp_len += tlen;
+                if (!in_think && clean_len > 0 && gen_resp_len + clean_len < 256*1024 - 1) {
+                    memcpy(gen_response + gen_resp_len, clean_buf, clean_len);
+                    gen_resp_len += clean_len;
                     gen_response[gen_resp_len] = 0;
                 }
-                if (sse_send_delta(client_fd, request_id, tok_str) < 0) {
+                if (sse_send_delta(client_fd, request_id, clean_buf) < 0) {
                     fprintf(stderr, "[serve] %s client disconnected, stopping generation\n", request_id);
                     break;
                 }
