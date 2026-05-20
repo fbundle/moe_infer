@@ -471,22 +471,18 @@ unsafe fn encode_cmd3_experts(
     ctx: &MetalCtx,
     cmd: &metal::CommandBufferRef,
     lc: &LayerWeightCache,
+    next_lc: Option<&LayerWeightCache>,
     actual_k: usize,
     shared_gate_score: f32,
     expert_weights: &[f32; MAX_K],
     valid: &[bool; MAX_K],
     use_2bit: bool,
     wf_base: *const u8,
-    _layer_idx: usize,
+    layer_idx: usize,
     expert_data_bufs: &[Option<&metal::Buffer>],
 ) -> bool {
-    // Expert forwards (batched into one cmd)
-    for k in 0..actual_k {
-        if valid[k] {
-            let data_buf = expert_data_bufs.get(k).and_then(|b| *b);
-            gpu_ops::gpu_encode_expert_forward_slot(cfg, ctx, cmd, k, use_2bit, data_buf);
-        }
-    }
+    // Expert forwards (batched — all experts in one command buffer)
+    gpu_ops::gpu_encode_experts_batched(cfg, ctx, cmd, actual_k, valid, expert_data_bufs, use_2bit);
 
     // Shared expert gate+up+SwiGLU+down
     let sg_w = lc.sg_w.map_or(std::ptr::null(), |o| wf_base.add(o) as *const u32);
@@ -500,14 +496,12 @@ unsafe fn encode_cmd3_experts(
     let sd_b = lc.sd_b.map_or(std::ptr::null(), |o| wf_base.add(o) as *const u16);
     gpu_ops::gpu_encode_shared_down_swiglu(cfg, ctx, cmd, sg_w, sg_s, sg_b, su_w, su_s, su_b, sd_w, sd_s, sd_b);
 
-    // GPU-side combine (if not last layer and moe_combine_residual pipeline available)
+    // GPU-side combine: moe_combine_residual + wf_buf + not-last-layer + next layer's
+    // input_norm_w.  (rms_norm_sum and rms_norm_apply_bf16 are always available.)
     let gpu_combine = ctx.moe_combine_residual.is_some()
         && ctx.wf_buf.is_some()
-        && cfg.num_layers as usize > 1  // must have at least 2 layers for next input_norm_w
-        && lc.input_norm_w.is_some();
-
-    // We need the NEXT layer's input_norm_w for GPU combine
-    // This is handled by the caller passing the appropriate weight
+        && layer_idx < cfg.num_layers as usize - 1
+        && next_lc.and_then(|nl| nl.input_norm_w).is_some();
 
     if gpu_combine {
         // Prepare combine params
@@ -550,28 +544,23 @@ unsafe fn encode_cmd3_experts(
             enc.end_encoding();
         }
 
-        // Enc C3: rms_norm_apply_bf16 (buf_moe_hidden + N+1 norm_w → buf_input)
+        // Enc C3: rms_norm_apply_bf16 (buf_moe_hidden + next layer's norm_w → buf_input)
         {
-            // Use next layer's input_norm_w — passed via the layer_cache
-            // lc is THIS layer's cache; we need NEXT layer's input_norm_w
-            // For now, disable GPU combine on last layer (checked above)
-            let next_norm_w = lc.input_norm_w; // caller will pass N+1 cache for combine
-            if let Some(nw_off) = next_norm_w {
-                let norm_off = (wf_base.add(nw_off) as *const u8).offset_from(wf_base) as u64;
-                let enc = cmd.new_compute_command_encoder();
-                let dim = cfg.hidden_dim as u32;
-                let eps = cfg.rms_norm_eps;
-                enc.set_compute_pipeline_state(&ctx.rms_norm_apply_bf16);
-                enc.set_buffer(0, Some(&ctx.buf_moe_hidden), 0);
-                enc.set_buffer(1, ctx.wf_buf.as_deref(), norm_off);
-                enc.set_buffer(2, Some(&ctx.buf_cmd3_sum_sq), 0);
-                enc.set_buffer(3, Some(&ctx.buf_input), 0);
-                enc.set_bytes(4, 4, &dim as *const u32 as *const _);
-                enc.set_bytes(5, 4, &eps as *const f32 as *const _);
-                let tgs = (dim + 255) / 256;
-                enc.dispatch_thread_groups(MTLSize::new(tgs as u64, 1, 1), MTLSize::new(256, 1, 1));
-                enc.end_encoding();
-            }
+            let next_norm_w = next_lc.and_then(|nl| nl.input_norm_w).unwrap();
+            let norm_off = (wf_base.add(next_norm_w) as *const u8).offset_from(wf_base) as u64;
+            let enc = cmd.new_compute_command_encoder();
+            let dim = cfg.hidden_dim as u32;
+            let eps = cfg.rms_norm_eps;
+            enc.set_compute_pipeline_state(&ctx.rms_norm_apply_bf16);
+            enc.set_buffer(0, Some(&ctx.buf_moe_hidden), 0);
+            enc.set_buffer(1, ctx.wf_buf.as_deref(), norm_off);
+            enc.set_buffer(2, Some(&ctx.buf_cmd3_sum_sq), 0);
+            enc.set_buffer(3, Some(&ctx.buf_input), 0);
+            enc.set_bytes(4, 4, &dim as *const u32 as *const _);
+            enc.set_bytes(5, 4, &eps as *const f32 as *const _);
+            let tgs = (dim + 255) / 256;
+            enc.dispatch_thread_groups(MTLSize::new(tgs as u64, 1, 1), MTLSize::new(256, 1, 1));
+            enc.end_encoding();
         }
     }
 
@@ -594,22 +583,25 @@ unsafe fn gpu_layer_forward_3cmd(
     cfg: &ModelConfig,
     wf_data: *const u8,
     lc: &LayerWeightCache,
-    _next_lc: Option<&LayerWeightCache>,  // N+1 layer cache (for GPU combine)
+    next_lc: Option<&LayerWeightCache>,  // N+1 layer cache (for GPU combine)
     hidden: &mut [f32],
     kv: Option<&mut KVCache>,
     la_state: Option<&mut LinearAttnState>,
     pos: i32,
     packed_fd: Option<&File>,
+    layer_mmap: *mut u8,
     use_2bit: bool,
     scratch: &mut CpuForwardScratch,
     ctx: &MetalCtx,
     mut expert_cache: Option<&mut ExpertLRUCache>,
+    mut malloc_cache: Option<&mut crate::expert_io::MallocExpertCache>,
     io_pool: Option<&IOPool>,
     layer_idx: usize,
     deferred: &mut Option<DeferredCmd3>,
     pred_experts: &mut [i32],
     pred_count: &mut [i32],
     pred_valid: &mut bool,
+    pred_generating: bool,
 ) {
     let hd = cfg.hidden_dim as usize;
     let is_full = kv.is_some();
@@ -618,27 +610,34 @@ unsafe fn gpu_layer_forward_3cmd(
     let f32o = |o: Option<usize>| o.map(|x| wf_data.add(x) as *const f32);
     let u32o = |o: Option<usize>| o.map(|x| wf_data.add(x) as *const u32);
 
-    // ---- Phase 0: Wait for deferred CMD3 from previous layer ----
-    // The previous layer submitted CMD3 asynchronously.  Wait for it now.
-    if let Some(ref mut d) = *deferred {
-        finalize_cmd3(ctx, d, hidden, hd, scratch);
-        // Unpin cache entries from previous CMD3
-        if let Some(ref mut cache) = expert_cache {
-            cache.unpin_batch(&d.pinned_entries);
+    // ---- Phase 0: Handle deferred CMD3 from previous layer ----
+    let prev_gpu_combined = deferred.as_ref().map_or(false, |d| d.gpu_combined);
+
+    if prev_gpu_combined {
+        // FAST PATH: CMD3(N-1) already wrote combined hidden to buf_moe_hidden
+        // and normed hidden to buf_input.  Submit CMD1 immediately — the GPU
+        // serializes CMD3(N-1) then CMD1(N).  Finalize after CMD1 completes.
+    } else {
+        // SLOW PATH: Wait for CMD3, CPU finalize, input_norm, copy to buf_input
+        if let Some(ref mut d) = *deferred {
+            finalize_cmd3(ctx, d, hidden, hd, scratch);
+            if let Some(ref mut cache) = expert_cache {
+                cache.unpin_batch(&d.pinned_entries);
+            }
         }
-    }
-    *deferred = None;
+        *deferred = None;
 
-    // Save residual
-    scratch.residual[..hd].copy_from_slice(hidden);
+        // Save residual
+        scratch.residual[..hd].copy_from_slice(hidden);
 
-    // Input norm
-    step_input_norm(hidden, u16o(lc.input_norm_w), &mut scratch.normed, hd, cfg.rms_norm_eps);
+        // Input norm
+        step_input_norm(hidden, u16o(lc.input_norm_w), &mut scratch.normed, hd, cfg.rms_norm_eps);
 
-    // Copy normed to GPU buf_input for CMD1
-    {
-        let dst = ctx.buf_input.contents() as *mut f32;
-        std::ptr::copy_nonoverlapping(scratch.normed.as_ptr(), dst, hd);
+        // Copy normed to GPU buf_input for CMD1
+        {
+            let dst = ctx.buf_input.contents() as *mut f32;
+            std::ptr::copy_nonoverlapping(scratch.normed.as_ptr(), dst, hd);
+        }
     }
 
     // ---- Phase 1: CMD1 — attention projections (batch matvec) ----
@@ -714,6 +713,7 @@ unsafe fn gpu_layer_forward_3cmd(
 
     // Prediction state (scoped outside CMD1 block so Phase 5 can access)
     let mut pred_handles: Vec<std::thread::JoinHandle<(usize, isize)>> = Vec::new();
+    let mut async_pread_handles: Vec<std::thread::JoinHandle<(usize, isize)>> = Vec::new();
     let mut pred_started = false;
 
     // Check GPU linear attention availability (before CMD1 encoding)
@@ -848,7 +848,7 @@ unsafe fn gpu_layer_forward_3cmd(
         // ---- Phase 1.5: Launch prediction preads during CMD1 GPU execution ----
         // Spawn threads to pread predicted experts (from prev token) into buf_B.
         // These run concurrently with CMD1 on GPU and subsequent CPU work.
-        pred_started = if *pred_valid && pred_count[layer_idx] > 0 {
+        pred_started = if pred_generating && *pred_valid && pred_count[layer_idx] > 0 {
             if let Some(fd) = packed_fd {
                 let raw_fd = fd.as_raw_fd();
                 let esz = active_expert_size(cfg, use_2bit);
@@ -879,6 +879,22 @@ unsafe fn gpu_layer_forward_3cmd(
         if !gpu_linear_attn {
             gpu_ops::gpu_flush_batch_results(ctx, &cmd1_specs[..num_attn_specs]);
         }
+    }
+
+    // ---- Fast-path deferred finalization ----
+    if prev_gpu_combined {
+        // CMD3(N-1) is now done (serialized before CMD1 on the GPU queue)
+        {
+            let src = ctx.buf_moe_hidden.contents() as *const f32;
+            std::ptr::copy_nonoverlapping(src, hidden.as_mut_ptr(), hd);
+        }
+        scratch.residual[..hd].copy_from_slice(hidden);
+        if let Some(ref mut d) = *deferred {
+            if let Some(ref mut cache) = expert_cache {
+                cache.unpin_batch(&d.pinned_entries);
+            }
+        }
+        *deferred = None;
     }
 
     // ---- Phase 2: Attention compute (GPU if possible, CPU fallback) ----
@@ -1052,7 +1068,7 @@ unsafe fn gpu_layer_forward_3cmd(
     );
     let actual_k = routing.expert_indices.len().min(MAX_K);
 
-    // ---- Phase 5: Expert I/O (prediction-aware) ----
+    // ---- Phase 5: Expert I/O (LRU cache → prediction → direct I/O) ----
     #[cfg(feature = "timing")]
     let t_p4 = Instant::now();
     let esz = active_expert_size(cfg, use_2bit);
@@ -1064,18 +1080,99 @@ unsafe fn gpu_layer_forward_3cmd(
     for _ in 0..actual_k { expert_data_bufs.push(None); }
 
     if let Some(fd) = packed_fd {
-        let base = layer_idx * MAX_K;
+        let raw_fd = fd.as_raw_fd();
 
-        if pred_started {
+        if let Some(ref mut mc) = malloc_cache {
+            // ---- Malloc Cache path (zero-copy Metal wrappers over page-aligned malloc) ----
+            let mut miss_indices: Vec<usize> = Vec::with_capacity(actual_k);
+            let mut miss_k_slots: Vec<usize> = Vec::with_capacity(actual_k);
+            let mut miss_data_ptrs: Vec<*mut u8> = Vec::with_capacity(actual_k);
+            let mut _hit_count: usize = 0;
+
+            for k in 0..actual_k {
+                #[allow(unused_variables)]
+                let (cidx, buf, data_ptr, is_hit) = mc.lookup_or_insert(
+                    layer_idx as i32, routing.expert_indices[k], cfg.num_experts);
+                expert_data_bufs[k] = Some(buf.clone());
+                if is_hit {
+                    _hit_count += 1;
+                } else {
+                    miss_indices.push(cidx);
+                    miss_k_slots.push(k);
+                    miss_data_ptrs.push(data_ptr);
+                }
+            }
+
+            #[cfg(feature = "timing")]
+            if pos == 0 {
+                eprintln!("[L{:02}-malloc] hits={} misses={}", layer_idx, _hit_count, miss_indices.len());
+            }
+
+            // Phase 2: memcpy from mmap'd expert file into malloc'd cache buffers
+            if !miss_indices.is_empty() && !layer_mmap.is_null() {
+                let num_misses = miss_indices.len();
+                for t in 0..num_misses {
+                    let k = miss_k_slots[t];
+                    let expert_idx = routing.expert_indices[k] as usize;
+                    unsafe {
+                        std::ptr::copy_nonoverlapping(
+                            layer_mmap.add(expert_idx * esz) as *const u8,
+                            miss_data_ptrs[t],
+                            esz,
+                        );
+                    }
+                }
+            }
+        } else if let Some(ref mut cache) = expert_cache {
+            // ---- LRU Cache path ----
+            let mut miss_indices: Vec<usize> = Vec::with_capacity(actual_k);
+            let mut miss_k_slots: Vec<usize> = Vec::with_capacity(actual_k);
+            let mut _hit_count: usize = 0;
+
+            for k in 0..actual_k {
+                let (cidx, buf, is_hit) = cache.lookup_or_insert(
+                    layer_idx as i32, routing.expert_indices[k], cfg.num_experts);
+                expert_data_bufs[k] = Some(buf.clone());
+                cache.pin(cidx);
+                pinned_entries.push(cidx);
+                if is_hit {
+                    _hit_count += 1;
+                } else {
+                    miss_indices.push(cidx);
+                    miss_k_slots.push(k);
+                }
+            }
+
+            #[cfg(feature = "timing")]
+            if pos == 0 {
+                eprintln!("[L{:02}-lru] hits={} misses={}", layer_idx, _hit_count, miss_indices.len());
+            }
+
+            // Phase 2: memcpy from mmap'd file into cache buffers (zero syscalls)
+            if !miss_indices.is_empty() && !layer_mmap.is_null() {
+                for t in 0..miss_indices.len() {
+                    let k = miss_k_slots[t];
+                    let expert_idx = routing.expert_indices[k] as usize;
+                    unsafe {
+                        std::ptr::copy_nonoverlapping(
+                            layer_mmap.add(expert_idx * esz) as *const u8,
+                            expert_data_bufs[k].as_ref().unwrap().contents() as *mut u8,
+                            esz,
+                        );
+                    }
+                }
+            }
+        } else if pred_started {
             // ---- Prediction path: wait for preads, match against actual routing ----
             let mut pred_results: Vec<(usize, isize)> = Vec::new();
             for h in pred_handles.drain(..) {
                 if let Ok(r) = h.join() { pred_results.push(r); }
             }
 
+            let base = layer_idx * MAX_K;
             let mut miss_ei: Vec<i32> = Vec::with_capacity(actual_k);
             let mut miss_slots: Vec<usize> = Vec::with_capacity(actual_k);
-            let mut hit_count: usize = 0;
+            let mut _hit_count: usize = 0;
 
             for k in 0..actual_k {
                 let mut found = false;
@@ -1083,10 +1180,9 @@ unsafe fn gpu_layer_forward_3cmd(
                     if result == esz as isize
                         && routing.expert_indices[k] == pred_experts[base + p_slot]
                     {
-                        // Hit! Expert was pre-loaded into buf_multi_expert_data_b[p_slot]
                         expert_data_bufs[k] = Some(ctx.buf_multi_expert_data_b[p_slot].clone());
                         found = true;
-                        hit_count += 1;
+                        _hit_count += 1;
                         break;
                     }
                 }
@@ -1097,13 +1193,12 @@ unsafe fn gpu_layer_forward_3cmd(
             }
             #[cfg(feature = "timing")]
             if hit_count > 0 || miss_ei.len() > 0 {
-                if pos == 0 { eprintln!("[L{:02}-pred] hits={} misses={}", layer_idx, hit_count, miss_ei.len()); }
+                if pos == 0 { eprintln!("[L{:02}-pred] hits={} misses={}", layer_idx, _hit_count, miss_ei.len()); }
             }
 
-            // ---- Read misses via direct I/O (OS page cache, no LRU) ----
+            // Read misses via direct I/O (OS page cache, no LRU)
             if !miss_ei.is_empty() {
                 let num_misses = miss_ei.len();
-                let raw_fd = fd.as_raw_fd();
                 if let Some(pool) = io_pool {
                     let mut tasks: Vec<crate::expert_io::IOPreadTask> = Vec::with_capacity(num_misses);
                     for i in 0..num_misses {
@@ -1128,15 +1223,18 @@ unsafe fn gpu_layer_forward_3cmd(
                 }
             }
         } else {
-            // ---- No prediction: direct I/O path (OS page cache only, no LRU) ----
-            let valid = direct_expert_read(
-                fd, &routing.expert_indices[..actual_k], actual_k, esz,
-                &ctx.buf_multi_expert_data, io_pool,
-            );
+            // ---- No cache / no prediction: async parallel pread ----
+            // Overlaps I/O with h_post/shared_gate/shared_up copies below.
             for k in 0..actual_k {
-                if valid[k] {
-                    expert_data_bufs[k] = Some(ctx.buf_multi_expert_data[k].clone());
-                }
+                let ei = routing.expert_indices[k];
+                let dst_addr = ctx.buf_multi_expert_data[k].contents() as usize;
+                expert_data_bufs[k] = Some(ctx.buf_multi_expert_data[k].clone());
+                let fd2 = raw_fd;
+                async_pread_handles.push(std::thread::spawn(move || {
+                    let dst = dst_addr as *mut u8;
+                    let result = unsafe { pread(fd2, dst, esz, ei as i64 * esz as i64) };
+                    (k, result)
+                }));
             }
         }
     }
@@ -1157,6 +1255,19 @@ unsafe fn gpu_layer_forward_3cmd(
         std::ptr::copy_nonoverlapping(src_up, dst_up, cfg.shared_intermediate as usize);
     }
 
+    // ---- Wait for non-prediction async preads (overlapped with copies above) ----
+    if !pred_started && !async_pread_handles.is_empty() {
+        for h in async_pread_handles.drain(..) {
+            if let Ok((k, result)) = h.join() {
+                if result != esz as isize {
+                    expert_data_bufs[k] = None;
+                    eprintln!("WARNING: expert {} async pread: {}/{}",
+                        routing.expert_indices[k], result, esz);
+                }
+            }
+        }
+    }
+
     // ---- Phase 6: CMD3 — experts + shared + GPU combine (ASYNC) ----
     #[cfg(feature = "timing")]
     let t_p5 = Instant::now();
@@ -1172,7 +1283,7 @@ unsafe fn gpu_layer_forward_3cmd(
     // Convert owned buffers to refs for encoding
     let expert_buf_refs: Vec<Option<&metal::Buffer>> = expert_data_bufs.iter().map(|b| b.as_ref()).collect();
     let gpu_combine = encode_cmd3_experts(
-        cfg, ctx, cmd3_ref, lc,
+        cfg, ctx, cmd3_ref, lc, next_lc,
         actual_k, routing.shared_gate_score,
         &expert_weights_arr, &valid_arr,
         use_2bit, wf_data, layer_idx,
@@ -1200,13 +1311,15 @@ unsafe fn gpu_layer_forward_3cmd(
 
     // ---- Save routing for next token's temporal prediction ----
     // MUST happen AFTER prediction hit check (which reads pred_experts).
-    let base = layer_idx * MAX_K;
-    for k in 0..actual_k {
-        pred_experts[base + k] = routing.expert_indices[k];
-    }
-    pred_count[layer_idx] = actual_k as i32;
-    if layer_idx == cfg.num_layers as usize - 1 {
-        *pred_valid = true;
+    if pred_generating {
+        let base = layer_idx * MAX_K;
+        for k in 0..actual_k {
+            pred_experts[base + k] = routing.expert_indices[k];
+        }
+        pred_count[layer_idx] = actual_k as i32;
+        if layer_idx == cfg.num_layers as usize - 1 {
+            *pred_valid = true;
+        }
     }
 
     #[cfg(feature = "timing")]
@@ -1248,6 +1361,7 @@ unsafe fn gpu_layer_forward_2cmd(
     scratch: &mut CpuForwardScratch,
     ctx: &MetalCtx,
     mut expert_cache: Option<&mut ExpertLRUCache>,
+    mut malloc_cache: Option<&mut crate::expert_io::MallocExpertCache>,
     io_pool: Option<&IOPool>,
     layer_idx: usize,
     _pred_experts: &mut [i32],
@@ -1352,7 +1466,7 @@ unsafe fn gpu_layer_forward_2cmd(
 
     // DEBUG: Compare GPU path vs full CPU path for first linear layer
     // Save GPU-path hidden for comparison
-    let mut gpu_hidden_before_layer = if pos == 0 && layer_idx == 0 && !is_full {
+    let _gpu_hidden_before_layer = if pos == 0 && layer_idx == 0 && !is_full {
         hidden.to_vec()
     } else {
         Vec::new()
@@ -1621,19 +1735,104 @@ unsafe fn gpu_layer_forward_2cmd(
         std::ptr::copy_nonoverlapping(scratch.h_post.as_ptr(), dst, hd);
     }
 
-    // Expert I/O (direct read into GPU buffers)
+    // Expert I/O (cache → direct read)
     let esz = active_expert_size(cfg, use_2bit);
     let mut expert_data_bufs: Vec<Option<metal::Buffer>> = Vec::new();
     if let Some(fd) = packed_fd {
-        let valid = direct_expert_read(
-            fd, &routing.expert_indices[..actual_k], actual_k, esz,
-            &ctx.buf_multi_expert_data, io_pool,
-        );
-        for k in 0..actual_k {
-            if valid[k] {
-                expert_data_bufs.push(Some(ctx.buf_multi_expert_data[k].clone()));
-            } else {
-                expert_data_bufs.push(None);
+        let raw_fd = fd.as_raw_fd();
+
+        if let Some(ref mut mc) = malloc_cache {
+            // ---- Malloc cache path (2cmd) ----
+            let mut miss_data_ptrs: Vec<*mut u8> = Vec::with_capacity(actual_k);
+            let mut miss_slots: Vec<usize> = Vec::with_capacity(actual_k);
+
+            for k in 0..actual_k {
+                let (_cidx, buf, data_ptr, is_hit) = mc.lookup_or_insert(
+                    layer_idx as i32, routing.expert_indices[k], cfg.num_experts);
+                expert_data_bufs.push(Some(buf.clone()));
+                if !is_hit {
+                    miss_data_ptrs.push(data_ptr);
+                    miss_slots.push(k);
+                }
+            }
+
+            if !miss_data_ptrs.is_empty() {
+                let num_misses = miss_data_ptrs.len();
+                if let Some(pool) = io_pool {
+                    let mut tasks: Vec<crate::expert_io::IOPreadTask> = Vec::with_capacity(num_misses);
+                    for t in 0..num_misses {
+                        let k = miss_slots[t];
+                        tasks.push(crate::expert_io::IOPreadTask {
+                            fd: raw_fd,
+                            dst: miss_data_ptrs[t],
+                            offset: routing.expert_indices[k] as u64 * esz as u64,
+                            size: esz,
+                            result: 0,
+                            lz4_comp_buf: std::ptr::null_mut(),
+                            lz4_comp_size: 0,
+                        });
+                    }
+                    pool.dispatch(&mut tasks);
+                    for t in 0..num_misses {
+                        if tasks[t].result != esz as isize {
+                            let k = miss_slots[t];
+                            expert_data_bufs[k] = None;
+                        }
+                    }
+                }
+            }
+        } else if let Some(ref mut cache) = expert_cache {
+            // ---- LRU cache path (2cmd) ----
+            let mut miss_slots: Vec<usize> = Vec::with_capacity(actual_k);
+
+            for k in 0..actual_k {
+                let (cidx, buf, is_hit) = cache.lookup_or_insert(
+                    layer_idx as i32, routing.expert_indices[k], cfg.num_experts);
+                expert_data_bufs.push(Some(buf.clone()));
+                cache.pin(cidx);
+                if !is_hit {
+                    miss_slots.push(k);
+                }
+            }
+
+            if !miss_slots.is_empty() {
+                let num_misses = miss_slots.len();
+                if let Some(pool) = io_pool {
+                    let mut tasks: Vec<crate::expert_io::IOPreadTask> = Vec::with_capacity(num_misses);
+                    for t in 0..num_misses {
+                        let k = miss_slots[t];
+                        tasks.push(crate::expert_io::IOPreadTask {
+                            fd: raw_fd,
+                            dst: expert_data_bufs[k].as_ref().unwrap().contents() as *mut u8,
+                            offset: routing.expert_indices[k] as u64 * esz as u64,
+                            size: esz,
+                            result: 0,
+                            lz4_comp_buf: std::ptr::null_mut(),
+                            lz4_comp_size: 0,
+                        });
+                    }
+                    pool.dispatch(&mut tasks);
+                    for t in 0..num_misses {
+                        if tasks[t].result != esz as isize {
+                            let k = miss_slots[t];
+                            expert_data_bufs[k] = None;
+                        }
+                    }
+                }
+                // Unpin after sync CMD2 completes (done after cmd2.wait_until_completed below)
+            }
+        } else {
+            // ---- No cache: direct I/O path (2cmd) ----
+            let valid = direct_expert_read(
+                fd, &routing.expert_indices[..actual_k], actual_k, esz,
+                &ctx.buf_multi_expert_data, io_pool,
+            );
+            for k in 0..actual_k {
+                if valid[k] {
+                    expert_data_bufs.push(Some(ctx.buf_multi_expert_data[k].clone()));
+                } else {
+                    expert_data_bufs.push(None);
+                }
             }
         }
     }
@@ -1660,6 +1859,21 @@ unsafe fn gpu_layer_forward_2cmd(
 
     cmd2.commit();
     cmd2.wait_until_completed();
+
+    // Unpin LRU cache entries (now that CMD2 has completed)
+    if let Some(ref mut cache) = expert_cache {
+        // Collect pinned indices from the expert I/O phase
+        let mut pinned: Vec<usize> = Vec::new();
+        // The 2cmd LRU path pins during lookup — collect and unpin
+        for k in 0..actual_k {
+            let ei = routing.expert_indices[k];
+            let cidx = cache.entry_index(layer_idx as i32, ei, cfg.num_experts);
+            if cidx >= 0 {
+                pinned.push(cidx as usize);
+            }
+        }
+        cache.unpin_batch(&pinned);
+    }
 
     // Manual combine on CPU
     scratch.moe_out[..hd].fill(0.0);
@@ -1713,35 +1927,37 @@ pub unsafe fn gpu_layer_forward(
     la_state: Option<&mut LinearAttnState>,
     pos: i32,
     packed_fd: Option<&File>,
+    layer_mmap: *mut u8,
     use_2bit: bool,
     scratch: &mut CpuForwardScratch,
-    metal_ctx: Option<&MetalCtx>,
+    metal_ctx: &MetalCtx,
     mut expert_cache: Option<&mut ExpertLRUCache>,
+    malloc_cache: Option<&mut crate::expert_io::MallocExpertCache>,
     io_pool: Option<&IOPool>,
     layer_idx: usize,
     deferred: &mut Option<DeferredCmd3>,
-    mode: GpuMode,
+    _mode: GpuMode,
     pred_experts: &mut [i32],
     pred_count: &mut [i32],
     pred_valid: &mut bool,
+    pred_generating: bool,
 ) {
     let lc = &layer_caches[layer_idx];
-    let hd = cfg.hidden_dim as usize;
-    let is_full = kv.is_some();
-    let gpu_available = metal_ctx.is_some() && metal_ctx.as_ref().unwrap().wf_buf.is_some();
 
-    // Enable GPU dequant for all attention/routing projections via thread-local
-    crate::cpu_forward::set_tl_gpu_ctx(metal_ctx);
+    // Always use 3-Command GPU pipeline — no CPU fallback.
+    let next_lc = layer_caches.get(layer_idx + 1);
+    return gpu_layer_forward_3cmd(
+        cfg, wf_data, lc, next_lc,
+        hidden, kv, la_state, pos, packed_fd, layer_mmap, use_2bit, scratch,
+        metal_ctx,
+        expert_cache, malloc_cache, io_pool, layer_idx, deferred,
+        pred_experts, pred_count, pred_valid, pred_generating,
+    );
+}
 
-    // Helper: offset → pointer (null fallback for required weights)
-    let u32p = |o: Option<usize>| o.map_or(std::ptr::null(), |x| wf_data.add(x) as *const u32);
-    let u16p = |o: Option<usize>| o.map_or(std::ptr::null(), |x| wf_data.add(x) as *const u16);
-    let u16o = |o: Option<usize>| o.map(|x| wf_data.add(x) as *const u16);
-    let f32o = |o: Option<usize>| o.map(|x| wf_data.add(x) as *const f32);
-    let u32o = |o: Option<usize>| o.map(|x| wf_data.add(x) as *const u32);
+// CPU fallback removed — function always takes GPU path and returns above.
+// The closing brace below is the function's own closing brace.
 
-    // -- save residual --
-    scratch.residual[..hd].copy_from_slice(hidden);
 
     // -- step 1: input norm --
     step_input_norm(hidden, u16o(lc.input_norm_w), &mut scratch.normed, hd, cfg.rms_norm_eps);

@@ -170,3 +170,45 @@ pub fn generate_step(
 
     Ok(())
 }
+
+// ---------------------------------------------------------------------------
+// Full autoregressive loop
+// ---------------------------------------------------------------------------
+
+/// Run the full autoregressive loop: feed `first_token_id`, sample, feed again,
+/// until `max_tokens` tokens are generated or `eos_token_id` is hit.
+///
+/// Returns the list of generated token IDs (excluding `first_token_id` and
+/// stopping before `eos_token_id`).
+///
+/// The first `forward()` call for the initial token is done here — the caller
+/// should pass the result of argmax on the prefill logits as `first_token_id`.
+pub fn generate(
+    model: &mut FlashMoEContext,
+    cache: &mut FlashMoECache,
+    first_token_id: i32,
+    max_tokens: i32,
+    eos_token_id: i32,
+    temperature: f32,
+    top_k: i32,
+    top_p: f32,
+    min_p: f32,
+) -> Result<Vec<i32>, String> {
+    let vocab_size = model.cfg.vocab_size as usize;
+    let mut logits_buf = vec![0.0f32; vocab_size];
+    let mut next_id = first_token_id;
+    let mut tokens = Vec::with_capacity(max_tokens as usize);
+
+    for _ in 0..max_tokens {
+        generate_step(
+            model, cache, &mut next_id, &mut logits_buf,
+            eos_token_id, temperature, top_k, top_p, min_p,
+        )?;
+        if next_id == eos_token_id {
+            break;
+        }
+        tokens.push(next_id);
+    }
+
+    Ok(tokens)
+}

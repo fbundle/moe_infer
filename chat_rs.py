@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Interactive chat using moe-infer (C backend) with streaming output.
+"""Interactive chat using moe-infer-rs (Rust backend) with streaming output.
 
 Usage:
   uv run chat.py --model data --tokenizer Qwen/Qwen3-8B
@@ -11,34 +11,35 @@ import time
 
 from transformers import AutoTokenizer
 
-import moe_infer as _core
+import moe_infer_rs as _core
 
 
-def generate_c(model, cache, prompt_ids, max_tokens, eos_token_id,
-               temperature, top_k, top_p, min_p):
-    """Run prefill then token-by-token autoregressive generation using C backend."""
-    # Prefill: process all prompt tokens through the model
-    logits, _ = model.forward(prompt_ids, cache)
+def generate_rust(model, cache, prompt_ids, max_tokens, eos_token_id,
+                   temperature, top_k, top_p, min_p):
+    """Run prefill then token-by-token autoregressive generation.
+    The prefill runs in forward(), then the autoregressive loop runs entirely
+    in Rust for speed.  We still yield from Python to preserve streaming output."""
+    pos = cache.position
+    new_ids = prompt_ids[pos:]
 
-    # logits is (n_tokens, vocab_size) — take the last token's row
+    if new_ids:
+        logits, _ = model.forward(new_ids, cache)
+    else:
+        logits, _ = model.forward([prompt_ids[-1]], cache)
+
+    # logits is (n_tokens, vocab_size) numpy array — take the last token's row
     last_logits = logits[-1]
     first_id = max(range(len(last_logits)), key=lambda i: last_logits[i])
 
-    # Yield the first token immediately
-    if first_id == eos_token_id:
-        return
-    yield first_id
-
-    # C's generate() handles the autoregressive loop internally
+    # Rust-side autoregressive loop — returns all generated tokens at once
     yield from model.generate(
-        first_id, cache, eos_token_id,
-        max_tokens=max_tokens - 1,
-        temperature=temperature, top_k=top_k, top_p=top_p, min_p=min_p,
+        first_id, cache, max_tokens - 1,
+        eos_token_id, temperature, top_k, top_p, min_p,
     )
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Interactive chat with Flash-MoE (C)")
+    parser = argparse.ArgumentParser(description="Interactive chat with Flash-MoE (Rust)")
     parser.add_argument("--model", "-m", default="data")
     parser.add_argument("--tokenizer", "-t", default=None)
     parser.add_argument("--max-tokens", "-n", type=int, default=512)
@@ -54,7 +55,8 @@ def main():
 
     print(f"Loading model from {args.model} ...")
     model = _core.Model(args.model)
-    model.load()
+    if not model.has_gpu:
+        raise SystemExit("ERROR: No Metal GPU device available. Flash-MoE requires Apple Silicon GPU.")
     messages = []
 
     print(f"Ready. {model.num_layers} layers, "
@@ -81,10 +83,10 @@ def main():
         ttft = 0.0
         response_ids = []
 
-        for token_id in generate_c(model, cache, prompt_ids,
-                                   args.max_tokens, tok.eos_token_id,
-                                   args.temperature, args.top_k,
-                                   args.top_p, args.min_p):
+        for token_id in generate_rust(model, cache, prompt_ids,
+                                       args.max_tokens, tok.eos_token_id,
+                                       args.temperature, args.top_k,
+                                       args.top_p, args.min_p):
             if not response_ids:
                 ttft = time.monotonic() - t0
             response_ids.append(token_id)

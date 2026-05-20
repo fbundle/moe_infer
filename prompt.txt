@@ -1,0 +1,6 @@
+we are porting C code into Rust code
+our goal is to port 100% C code into Rust code
+and reach C performance, the current C performance is 4-5 tok/s
+moreover, the output must be correct
+user will test using
+python chat_rs.py --model output/models--mlx-community--Qwen3.6-35B-A3B-4bit --tokenizer hub/models--mlx-community--Qwen3.6-35B-A3B-4bit --temperature 0.0 2> /dev/null

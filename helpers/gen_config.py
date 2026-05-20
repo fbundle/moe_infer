@@ -104,7 +104,7 @@ def generate(args):
     )
 
     repo_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-    out_path = os.path.join(repo_root, "moe_infer_mlx", "core_src", "config.h")
+    out_path = os.path.join(repo_root, "moe_infer", "core_src", "config.h")
     return _write_if_changed(out_path, config_h)
 
 
@@ -120,7 +120,7 @@ def generate_default():
         args.use_cpu_dequant_fma, args.use_heap_topk, args.use_fused_gate_up_swiglu,
     )
     repo_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-    out_path = os.path.join(repo_root, "moe_infer_mlx", "core_src", "config.h")
+    out_path = os.path.join(repo_root, "moe_infer", "core_src", "config.h")
     return _write_if_changed(out_path, config_h)
 
 

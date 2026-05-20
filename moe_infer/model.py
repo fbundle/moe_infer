@@ -1,7 +1,7 @@
 """
 Python API for Flash-MoE inference engine.
 
-    import moe_infer_mlx as fm
+    import moe_infer as fm
 
     with fm.Model("data") as model:
         cache = fm.Cache()
@@ -10,7 +10,7 @@ Python API for Flash-MoE inference engine.
 
 from __future__ import annotations
 
-import moe_infer_mlx.core as _core
+import moe_infer.core as _core
 
 
 class Cache:

@@ -196,6 +196,7 @@ version = "0.1.0"
 dependencies = [
  "bytemuck",
  "half",
+ "libc",
  "lz4_flex",
  "metal",
  "numpy",

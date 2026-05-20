@@ -1,5 +1,5 @@
 [project]
-name = "moe-infer-mlx"
+name = "moe-infer"
 version = "0.1.0"
 requires-python = ">=3.10"
 dependencies = [
@@ -16,7 +16,7 @@ requires = [
 build-backend = "setuptools.build_meta"
 
 [tool.setuptools]
-packages = ["moe_infer_mlx"]
+packages = ["moe_infer"]
 
 [dependency-groups]
 dev = [

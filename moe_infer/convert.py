@@ -1,20 +1,20 @@
 #!/usr/bin/env python3
 """
-moe_infer_mlx.convert — Convert a HuggingFace Qwen3 MoE model to Flash-MoE format.
+moe_infer.convert — Convert a HuggingFace Qwen3 MoE model to Flash-MoE format.
 
 Usage:
-    python -m moe_infer_mlx.convert --model path/to/hf-model --output data
+    python -m moe_infer.convert --model path/to/hf-model --output data
 
-    from moe_infer_mlx.convert import convert
+    from moe_infer.convert import convert
     convert("path/to/hf-model", "data")
 """
 
 import argparse
 from pathlib import Path
 
-from moe_infer_mlx.convert.gen_model_config import generate_json, load_hf_config
-from moe_infer_mlx.convert.extract_weights import run as extract_weights
-from moe_infer_mlx.convert.repack_experts_4bit import run as repack_4bit
+from moe_infer.convert.gen_model_config import generate_json, load_hf_config
+from moe_infer.convert.extract_weights import run as extract_weights
+from moe_infer.convert.repack_experts_4bit import run as repack_4bit
 
 
 def convert(model_path: str, output_dir: str = "data"):

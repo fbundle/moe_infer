@@ -33,7 +33,7 @@ def generate(src_path, dst_path):
 
 if __name__ == "__main__":
     repo_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-    core_src = os.path.join(repo_dir, "moe_infer_mlx", "core_src")
+    core_src = os.path.join(repo_dir, "moe_infer", "core_src")
     generate(
         os.path.join(core_src, "shaders.metal"),
         os.path.join(core_src, "shaders.h"),

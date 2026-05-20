@@ -38,3 +38,4 @@ build/
 moe_infer_rs/target/
 moe_infer_mlx/core.c
 moe_infer_mlx/core_src/shaders.h
+data

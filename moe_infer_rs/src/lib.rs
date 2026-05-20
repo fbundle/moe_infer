@@ -21,6 +21,7 @@ pub mod cpu_forward;
 use constants::MAX_K;
 use types::*;
 use std::fs::File;
+use std::os::fd::AsRawFd;
 #[cfg(feature = "timing")]
 use std::time::Instant;
 
@@ -91,6 +92,8 @@ pub struct FlashMoEContext {
 
     // Expert file I/O
     pub layer_fds: Vec<Option<File>>,
+    pub layer_mmaps: Vec<*mut u8>,      // mmap'd expert files (zero-syscall access)
+    pub layer_mmap_sizes: Vec<usize>,
 
     // Working buffers
     pub hidden: Vec<f32>,
@@ -104,8 +107,8 @@ pub struct FlashMoEContext {
     // Persistent I/O thread pool (4 workers)
     pub io_pool: Option<expert_io::IOPool>,
 
-    // Metal GPU context (None if GPU unavailable)
-    pub metal_ctx: Option<metal::MetalCtx>,
+    // Metal GPU context (required — no CPU fallback)
+    pub metal_ctx: metal::MetalCtx,
 
     // Per-layer weight caches (pre-computed offsets)
     pub layer_caches: Vec<gpu_forward::LayerWeightCache>,
@@ -136,6 +139,16 @@ impl FlashMoEContext {
     pub fn vocab_size(&self) -> i32 { self.cfg.vocab_size }
     pub fn hidden_dim(&self) -> i32 { self.cfg.hidden_dim }
     pub fn num_layers(&self) -> i32 { self.cfg.num_layers }
+}
+
+impl Drop for FlashMoEContext {
+    fn drop(&mut self) {
+        for i in 0..self.layer_mmaps.len() {
+            if !self.layer_mmaps[i].is_null() {
+                unsafe { expert_io::munmap(self.layer_mmaps[i], self.layer_mmap_sizes[i]); }
+            }
+        }
+    }
 }
 
 // SAFETY: FlashMoEContext owns all its resources (mmap, files, GPU context).
@@ -184,7 +197,7 @@ pub fn flashmoe_forward(
             m.cfg.hidden_dim, &mut m.hidden,
         );
         // Layer loop — GPU when Metal available, CPU fallback
-        let gpu_ctx = m.metal_ctx.as_ref();
+        let gpu_ctx = &m.metal_ctx;
         #[cfg(feature = "timing")]
         let t_layers = Instant::now();
         for layer in 0..m.cfg.num_layers as usize {
@@ -202,6 +215,7 @@ pub fn flashmoe_forward(
             };
 
             let packed_fd = m.layer_fds[layer].as_ref();
+            let layer_mmap = m.layer_mmaps[layer];
 
             unsafe {
                 gpu_forward::gpu_layer_forward(
@@ -213,10 +227,12 @@ pub fn flashmoe_forward(
                     la_state,
                     pos,
                     packed_fd,
+                    layer_mmap,
                     m.use_2bit,
                     &mut m.layer_scratch,
                     gpu_ctx,
                     m.expert_cache.as_mut(),
+                    m.malloc_cache.as_mut(),
                     m.io_pool.as_ref(),
                     layer,
                     &mut m.deferred,
@@ -224,6 +240,7 @@ pub fn flashmoe_forward(
                     &mut m.pred_experts,
                     &mut m.pred_count,
                     &mut m.pred_valid,
+                    m.pred_generating,
                 );
             }
 
@@ -231,16 +248,14 @@ pub fn flashmoe_forward(
 
         // Complete any pending deferred CMD3 from the last layer
         unsafe {
-            if let Some(ctx) = m.metal_ctx.as_ref() {
-                gpu_forward::complete_deferred_experts(
-                    ctx,
-                    &mut m.deferred,
-                    &mut m.hidden,
-                    hidden_dim,
-                    &mut m.layer_scratch,
-                    m.expert_cache.as_mut(),
-                );
-            }
+            gpu_forward::complete_deferred_experts(
+                &m.metal_ctx,
+                &mut m.deferred,
+                &mut m.hidden,
+                hidden_dim,
+                &mut m.layer_scratch,
+                m.expert_cache.as_mut(),
+            );
         }
 
         pos += 1;
@@ -298,31 +313,25 @@ pub fn flashmoe_init(model_path: &str) -> Result<FlashMoEContext, String> {
     let wf = weights::open_weights(&weights_path, &manifest_path)?;
     let ht = weights::OwnedTensorHashTable::new(&wf.manifest);
 
-    // ------ Metal GPU init ------
-    let mut metal_ctx = metal::MetalCtx::new(&cfg).ok();
+    // ------ Metal GPU init (required — no CPU fallback) ------
+    let mut metal_ctx = metal::MetalCtx::new(&cfg)
+        .map_err(|e| format!("Metal GPU unavailable: {}", e))?;
 
     // Wrap weight file in a Metal buffer (unified memory — no copy)
-    if let Some(ref mut mctx) = metal_ctx {
-        let wf_buf = mctx.device.new_buffer_with_bytes_no_copy(
-            wf.data as *const std::ffi::c_void,
-            wf.size as u64,
-            metal::MTLResourceOptions::StorageModeShared,
-            None,
-        );
-        mctx.wf_buf = Some(wf_buf);
-    }
+    metal_ctx.set_weights(wf.data, wf.size);
 
     // ------ Expert LRU cache (GPU only) ------
     let detect_2bit = {
         let probe = format!("{}/packed_experts_2bit/layer_00.bin", model_path);
         std::path::Path::new(&probe).exists()
     };
-    let expert_cache = metal_ctx.as_ref().map(|mctx| {
-        let esz = if detect_2bit { cfg.expert_size_2bit as usize } else { cfg.expert_size_4bit as usize };
-        // Cache up to 256 experts (~500 MB for 4-bit, ~250 MB for 2-bit)
-        let max_entries = 256.min(cfg.num_experts as usize * cfg.num_layers as usize);
-        expert_io::ExpertLRUCache::new(cfg.num_layers, cfg.num_experts, max_entries, esz, &mctx.device)
-    });
+    let esz = if detect_2bit { cfg.expert_size_2bit as usize } else { cfg.expert_size_4bit as usize };
+    let max_entries = 32; // small cache — mmap provides zero-syscall reads for misses
+
+    // malloc_cache: posix_memalign + zero-copy Metal wrappers (always used)
+    let malloc_cache = Some(expert_io::MallocExpertCache::new(
+        cfg.num_layers, cfg.num_experts, max_entries, esz, &metal_ctx.device));
+    let expert_cache = None; // only used as fallback when malloc_cache is None
 
     // ------ Build per-layer weight caches ------
     let layer_caches = unsafe {
@@ -342,10 +351,37 @@ pub fn flashmoe_init(model_path: &str) -> Result<FlashMoEContext, String> {
     let num_layers = cfg.num_layers as usize;
     let mut layer_fds: Vec<Option<File>> = Vec::with_capacity(num_layers);
 
+    // mmap expert files for zero-syscall access (matches C's pattern)
+    let mut layer_mmaps: Vec<*mut u8> = Vec::with_capacity(num_layers);
+    let mut layer_mmap_sizes: Vec<usize> = Vec::with_capacity(num_layers);
+
     for i in 0..num_layers {
         let path = format!("{}/{}/layer_{:02}.bin", model_path, expert_dir, i);
-        let fd = File::open(&path).ok();
-        layer_fds.push(fd);
+        let fd = File::open(&path);
+        if let Ok(f) = fd {
+            let raw_fd = f.as_raw_fd();
+            // Disable read-ahead (random access pattern for experts)
+            unsafe { libc::fcntl(raw_fd, libc::F_RDAHEAD, 0); }
+            let sz = f.metadata().map(|m| m.len() as usize).unwrap_or(0);
+            if sz > 0 {
+                let ptr = unsafe { expert_io::mmap(std::ptr::null_mut(), sz, expert_io::PROT_READ, expert_io::MAP_PRIVATE, raw_fd, 0) };
+                if ptr != expert_io::MAP_FAILED {
+                    layer_mmaps.push(ptr);
+                    layer_mmap_sizes.push(sz);
+                } else {
+                    layer_mmaps.push(std::ptr::null_mut());
+                    layer_mmap_sizes.push(0);
+                }
+            } else {
+                layer_mmaps.push(std::ptr::null_mut());
+                layer_mmap_sizes.push(0);
+            }
+            layer_fds.push(Some(f));
+        } else {
+            layer_fds.push(None);
+            layer_mmaps.push(std::ptr::null_mut());
+            layer_mmap_sizes.push(0);
+        }
     }
 
     // ------ Allocate working buffers ------
@@ -370,11 +406,7 @@ pub fn flashmoe_init(model_path: &str) -> Result<FlashMoEContext, String> {
     println!("[init] Temporal prediction enabled (prev-token routing → next-token prefetch)");
     println!("[init] Model loaded: {} layers ({} full + {} linear)",
         cfg.num_layers, cfg.num_full_attn_layers, cfg.num_linear_layers);
-    if metal_ctx.is_some() {
-        println!("[init] Metal GPU context initialized");
-    } else {
-        println!("[init] No Metal GPU — CPU-only inference");
-    }
+    println!("[init] Metal GPU context initialized");
 
     Ok(FlashMoEContext {
         cfg,
@@ -382,11 +414,13 @@ pub fn flashmoe_init(model_path: &str) -> Result<FlashMoEContext, String> {
         wf,
         ht_data: ht,
         layer_fds,
+        layer_mmaps,
+        layer_mmap_sizes,
         hidden,
         logits,
         final_norm_w,
         expert_cache,
-        malloc_cache: None,
+        malloc_cache,
         io_pool,
         metal_ctx,
         layer_caches,
@@ -411,7 +445,7 @@ pub fn flashmoe_init(model_path: &str) -> Result<FlashMoEContext, String> {
 #[cfg(feature = "python")]
 mod python {
     use pyo3::prelude::*;
-    use pyo3::types::PyList;
+    use numpy::{PyArray1, PyArray2, PyArrayMethods};
     use std::sync::Mutex;
 
     use super::*;
@@ -426,6 +460,71 @@ mod python {
     pub struct Cache {
         inner: Mutex<FlashMoECache>,
         cfg: ModelConfig, // copy needed for reset
+    }
+
+    /// Streaming token-by-token iterator returned by `Model.generate()`.
+    /// Each `__next__` call runs one forward+sample step in Rust and returns
+    /// immediately, so tokens are produced as they're sampled (true streaming).
+    #[pyclass]
+    pub struct GenerateIterator {
+        model: Py<Model>,
+        cache: Py<Cache>,
+        state: Mutex<GenerateIterState>,
+    }
+
+    struct GenerateIterState {
+        next_id: i32,
+        remaining: i32,
+        eos_token_id: i32,
+        temperature: f32,
+        top_k: i32,
+        top_p: f32,
+        min_p: f32,
+        logits_buf: Vec<f32>,
+        finished: bool,
+    }
+
+    #[pymethods]
+    impl GenerateIterator {
+        fn __iter__(slf: PyRef<'_, Self>) -> PyRef<'_, Self> {
+            slf
+        }
+
+        fn __next__(&self, py: Python<'_>) -> PyResult<Option<i32>> {
+            // Snapshot params + take the reusable logits buffer under state lock
+            let (mut next, eos_id, temp, t_k, t_p, m_p, mut logits_buf) = {
+                let mut s = self.state.lock().unwrap();
+                if s.finished || s.remaining <= 0 {
+                    return Ok(None);
+                }
+                (s.next_id, s.eos_token_id, s.temperature, s.top_k, s.top_p, s.min_p,
+                 std::mem::take(&mut s.logits_buf))
+            };
+
+            // Lock model + cache, run one forward + sample step
+            let model_ref = self.model.bind(py).borrow();
+            let cache_ref = self.cache.bind(py).borrow();
+            let mut ctx = model_ref.ctx.lock().unwrap();
+            let mut c = cache_ref.inner.lock().unwrap();
+
+            generate::generate_step(
+                &mut ctx, &mut c, &mut next, &mut logits_buf,
+                eos_id, temp, t_k, t_p, m_p,
+            ).map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e))?;
+
+            // Write back state
+            {
+                let mut s = self.state.lock().unwrap();
+                s.next_id = next;
+                s.logits_buf = logits_buf;
+                s.remaining -= 1;
+                if next == eos_id {
+                    s.finished = true;
+                }
+            }
+
+            Ok(Some(next))
+        }
     }
 
     #[pymethods]
@@ -470,7 +569,7 @@ mod python {
             Ok(Self { ctx: Mutex::new(ctx) })
         }
 
-        fn forward(&self, py: Python<'_>, input_ids: Vec<i32>, cache: &Cache) -> PyResult<(Py<PyAny>, Py<PyAny>)> {
+        fn forward(&self, py: Python<'_>, input_ids: Vec<i32>, cache: &Cache) -> PyResult<(Py<PyArray2<f32>>, Py<PyAny>)> {
             let mut ctx = self.ctx.lock().unwrap();
             let mut c = cache.inner.lock().unwrap();
             let vocab = ctx.cfg.vocab_size as usize;
@@ -480,12 +579,50 @@ mod python {
             flashmoe_forward(&mut ctx, &input_ids, n as i32, &mut logits, &mut c)
                 .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e))?;
 
-            let logits_list = PyList::empty(py);
-            for &v in &logits {
-                logits_list.append(v)?;
-            }
+            let arr1d = PyArray1::from_vec(py, logits);
+            let arr = arr1d.reshape([n, vocab])
+                .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(format!("{:?}", e)))?;
 
-            Ok((logits_list.into(), py.None()))
+            Ok((arr.into(), py.None()))
+        }
+
+        /// Full autoregressive loop in Rust with true streaming.
+        /// Returns a Python iterator that yields tokens one by one as they are
+        /// sampled — each `__next__` call runs one forward + sample step in Rust.
+        /// Much faster than calling `sample()` in a Python loop.
+        #[pyo3(signature = (first_token_id, cache, max_tokens, eos_token_id,
+                            temperature, top_k, top_p, min_p))]
+        fn generate(
+            self_: Bound<'_, Self>,
+            first_token_id: i32,
+            cache: Bound<'_, Cache>,
+            max_tokens: i32,
+            eos_token_id: i32,
+            temperature: f32,
+            top_k: i32,
+            top_p: f32,
+            min_p: f32,
+        ) -> PyResult<Py<GenerateIterator>> {
+            let py = self_.py();
+            let guard = self_.borrow();
+            let vocab = guard.ctx.lock().unwrap().cfg.vocab_size as usize;
+            drop(guard);
+            let iter = GenerateIterator {
+                model: self_.clone().unbind(),
+                cache: cache.unbind(),
+                state: Mutex::new(GenerateIterState {
+                    next_id: first_token_id,
+                    remaining: max_tokens,
+                    eos_token_id,
+                    temperature,
+                    top_k,
+                    top_p,
+                    min_p,
+                    logits_buf: vec![0.0f32; vocab],
+                    finished: false,
+                }),
+            };
+            Py::new(py, iter)
         }
 
         /// Single forward + sample step. Takes the current token_id, runs one
@@ -530,6 +667,11 @@ mod python {
         fn vocab_size(&self) -> PyResult<i32> {
             Ok(self.ctx.lock().unwrap().cfg.vocab_size)
         }
+
+        #[getter]
+        fn has_gpu(&self) -> PyResult<bool> {
+            Ok(true) // always true — we fail at init if no GPU
+        }
     }
 
     /// Python module entry point
@@ -537,6 +679,7 @@ mod python {
     fn moe_infer_rs(_py: Python, m: &Bound<'_, PyModule>) -> PyResult<()> {
         m.add_class::<Model>()?;
         m.add_class::<Cache>()?;
+        m.add_class::<GenerateIterator>()?;
         Ok(())
     }
 }

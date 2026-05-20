@@ -245,6 +245,133 @@ pub fn gpu_encode_expert_forward_slot(
     }
 }
 
+// ---- Batched expert forward encoding (port of gpu_encode_experts_batched) ----
+
+pub fn gpu_encode_experts_batched(
+    cfg: &ModelConfig,
+    ctx: &MetalCtx,
+    cmd: &CommandBufferRef,
+    k: usize,
+    valid: &[bool; MAX_K],
+    expert_bufs: &[Option<&Buffer>],
+    use_2bit: bool,
+) {
+    let layout = if use_2bit { &cfg.layout_2bit } else { &cfg.layout_4bit };
+    let go = cfg.moe_intermediate as u32;
+    let gi = cfg.hidden_dim as u32;
+    let dout = cfg.hidden_dim as u32;
+    let din = cfg.moe_intermediate as u32;
+    let gs = cfg.group_size as u32;
+    let gate_up_tgs = ((go + 7) / 8) as u64;
+    let down_tgs = ((dout + 7) / 8) as u64;
+    let swiglu_tgs = ((go + 255) / 256) as u64;
+
+    let fused_pipe = if !use_2bit { ctx.fused_gate_up_swiglu.as_ref() } else { None };
+    let pipe = if use_2bit {
+        ctx.matvec_2bit.as_ref().unwrap_or(&ctx.matvec_v3)
+    } else {
+        &ctx.matvec_v3
+    };
+
+    for i in 0..k {
+        if !valid[i] { continue; }
+        let expert_data = match expert_bufs.get(i).and_then(|b| *b) {
+            Some(b) => b,
+            None => continue,
+        };
+
+        if let Some(fused) = fused_pipe {
+            // Fused gate_up_swiglu (single encoder for gate+up+swiglu)
+            {
+                let enc = cmd.new_compute_command_encoder();
+                enc.set_compute_pipeline_state(fused);
+                enc.set_buffer(0, Some(expert_data), layout.gate_w_off as u64);
+                enc.set_buffer(1, Some(expert_data), layout.gate_s_off as u64);
+                enc.set_buffer(2, Some(expert_data), layout.gate_b_off as u64);
+                enc.set_buffer(3, Some(expert_data), layout.up_w_off as u64);
+                enc.set_buffer(4, Some(expert_data), layout.up_s_off as u64);
+                enc.set_buffer(5, Some(expert_data), layout.up_b_off as u64);
+                enc.set_buffer(6, Some(&ctx.buf_multi_expert_input), 0);
+                enc.set_buffer(7, Some(&ctx.buf_multi_expert_act[i]), 0);
+                enc.set_bytes(8, 4, &go as *const u32 as *const _);
+                enc.set_bytes(9, 4, &gi as *const u32 as *const _);
+                enc.set_bytes(10, 4, &gs as *const u32 as *const _);
+                enc.dispatch_thread_groups(MTLSize::new(go as u64, 1, 1), MTLSize::new(256, 1, 1));
+                enc.end_encoding();
+            }
+            // down_proj
+            {
+                let enc = cmd.new_compute_command_encoder();
+                enc.set_compute_pipeline_state(pipe);
+                enc.set_buffer(0, Some(expert_data), layout.down_w_off as u64);
+                enc.set_buffer(1, Some(expert_data), layout.down_s_off as u64);
+                enc.set_buffer(2, Some(expert_data), layout.down_b_off as u64);
+                enc.set_buffer(3, Some(&ctx.buf_multi_expert_act[i]), 0);
+                enc.set_buffer(4, Some(&ctx.buf_multi_expert_out[i]), 0);
+                enc.set_bytes(5, 4, &dout as *const u32 as *const _);
+                enc.set_bytes(6, 4, &din as *const u32 as *const _);
+                enc.set_bytes(7, 4, &gs as *const u32 as *const _);
+                enc.dispatch_thread_groups(MTLSize::new(down_tgs, 1, 1), MTLSize::new(256, 1, 1));
+                enc.end_encoding();
+            }
+        } else {
+            // 2-bit path: 4 encoders per expert (gate, up, swiglu, down)
+            {
+                let enc = cmd.new_compute_command_encoder();
+                enc.set_compute_pipeline_state(pipe);
+                enc.set_buffer(0, Some(expert_data), layout.gate_w_off as u64);
+                enc.set_buffer(1, Some(expert_data), layout.gate_s_off as u64);
+                enc.set_buffer(2, Some(expert_data), layout.gate_b_off as u64);
+                enc.set_buffer(3, Some(&ctx.buf_multi_expert_input), 0);
+                enc.set_buffer(4, Some(&ctx.buf_multi_expert_gate[i]), 0);
+                enc.set_bytes(5, 4, &go as *const u32 as *const _);
+                enc.set_bytes(6, 4, &gi as *const u32 as *const _);
+                enc.set_bytes(7, 4, &gs as *const u32 as *const _);
+                enc.dispatch_thread_groups(MTLSize::new(gate_up_tgs, 1, 1), MTLSize::new(256, 1, 1));
+                enc.end_encoding();
+            }
+            {
+                let enc = cmd.new_compute_command_encoder();
+                enc.set_compute_pipeline_state(pipe);
+                enc.set_buffer(0, Some(expert_data), layout.up_w_off as u64);
+                enc.set_buffer(1, Some(expert_data), layout.up_s_off as u64);
+                enc.set_buffer(2, Some(expert_data), layout.up_b_off as u64);
+                enc.set_buffer(3, Some(&ctx.buf_multi_expert_input), 0);
+                enc.set_buffer(4, Some(&ctx.buf_multi_expert_up[i]), 0);
+                enc.set_bytes(5, 4, &go as *const u32 as *const _);
+                enc.set_bytes(6, 4, &gi as *const u32 as *const _);
+                enc.set_bytes(7, 4, &gs as *const u32 as *const _);
+                enc.dispatch_thread_groups(MTLSize::new(gate_up_tgs, 1, 1), MTLSize::new(256, 1, 1));
+                enc.end_encoding();
+            }
+            {
+                let enc = cmd.new_compute_command_encoder();
+                enc.set_compute_pipeline_state(&ctx.swiglu);
+                enc.set_buffer(0, Some(&ctx.buf_multi_expert_gate[i]), 0);
+                enc.set_buffer(1, Some(&ctx.buf_multi_expert_up[i]), 0);
+                enc.set_buffer(2, Some(&ctx.buf_multi_expert_act[i]), 0);
+                enc.set_bytes(3, 4, &go as *const u32 as *const _);
+                enc.dispatch_thread_groups(MTLSize::new(swiglu_tgs, 1, 1), MTLSize::new(256, 1, 1));
+                enc.end_encoding();
+            }
+            {
+                let enc = cmd.new_compute_command_encoder();
+                enc.set_compute_pipeline_state(pipe);
+                enc.set_buffer(0, Some(expert_data), layout.down_w_off as u64);
+                enc.set_buffer(1, Some(expert_data), layout.down_s_off as u64);
+                enc.set_buffer(2, Some(expert_data), layout.down_b_off as u64);
+                enc.set_buffer(3, Some(&ctx.buf_multi_expert_act[i]), 0);
+                enc.set_buffer(4, Some(&ctx.buf_multi_expert_out[i]), 0);
+                enc.set_bytes(5, 4, &dout as *const u32 as *const _);
+                enc.set_bytes(6, 4, &din as *const u32 as *const _);
+                enc.set_bytes(7, 4, &gs as *const u32 as *const _);
+                enc.dispatch_thread_groups(MTLSize::new(down_tgs, 1, 1), MTLSize::new(256, 1, 1));
+                enc.end_encoding();
+            }
+        }
+    }
+}
+
 // ---- Encode shared expert down+swiglu into command buffer ----
 
 pub fn gpu_encode_shared_down_swiglu(

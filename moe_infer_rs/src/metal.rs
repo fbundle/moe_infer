@@ -25,6 +25,7 @@ pub struct MetalCtx {
     pub rms_norm_apply_bf16: ComputePipelineState,
     pub residual_add: ComputePipelineState,
     pub swiglu: ComputePipelineState,
+    pub fused_gate_up_swiglu: Option<ComputePipelineState>,
     pub attn_scores_pipe: Option<ComputePipelineState>,
     pub attn_softmax_pipe: Option<ComputePipelineState>,
     pub attn_values_pipe: Option<ComputePipelineState>,
@@ -104,7 +105,7 @@ pub struct MetalCtx {
 // Embedded Metal Shading Language source.
 // Kept as a const string — the C version uses gen_shaders.py to embed it.
 // For now, this is a placeholder; the actual shaders would be set at build time.
-const SHADER_SOURCE: &str = include_str!("../../moe_infer_mlx/core_src/shaders.metal");
+const SHADER_SOURCE: &str = include_str!("../../moe_infer/core_src/shaders.metal");
 
 fn make_pipe(library: &Library, device: &Device, name: &str) -> Option<ComputePipelineState> {
     let func = library.get_function(name, None).ok()?;
@@ -154,6 +155,7 @@ impl MetalCtx {
             .ok_or_else(|| "ERROR: Required pipeline missing: residual_add".to_string())?;
         let swiglu = make_pipe(&library, &device, "swiglu_fused")
             .ok_or_else(|| "ERROR: Required pipeline missing: swiglu_fused".to_string())?;
+        let fused_gate_up_swiglu = make_pipe(&library, &device, "fused_gate_up_swiglu");
 
         let attn_scores_pipe = make_pipe(&library, &device, "attn_scores_batched");
         let attn_softmax_pipe = make_pipe(&library, &device, "attn_softmax_batched");
@@ -286,6 +288,7 @@ impl MetalCtx {
             rms_norm_apply_bf16,
             residual_add,
             swiglu,
+            fused_gate_up_swiglu,
             attn_scores_pipe,
             attn_softmax_pipe,
             attn_values_pipe,

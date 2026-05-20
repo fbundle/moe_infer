@@ -14,7 +14,21 @@ use metal::Buffer;
 
 extern "C" {
     fn pread(fd: i32, buf: *mut u8, count: usize, offset: i64) -> isize;
+    fn compression_decode_buffer(
+        dst: *mut u8, dst_size: usize,
+        src: *const u8, src_size: usize,
+        scratch: *mut u8, algorithm: u32,
+    ) -> usize;
+    pub fn mmap(addr: *mut u8, length: usize, prot: i32, flags: i32, fd: i32, offset: i64) -> *mut u8;
+    pub fn munmap(addr: *mut u8, length: usize) -> i32;
 }
+
+pub const PROT_READ: i32 = 0x1;
+pub const MAP_PRIVATE: i32 = 0x2;
+/// MAP_FAILED sentinel: (void*)-1
+pub const MAP_FAILED: *mut u8 = usize::MAX as *mut u8;
+
+const COMPRESSION_LZ4: u32 = 0x100;
 
 // ---- Expert LRU Cache ----
 
@@ -150,6 +164,52 @@ impl ExpertLRUCache {
         &self.entries[target].buffer
     }
 
+    /// Lookup or insert, returning (entry_index, buffer, is_hit).
+    /// Caller must pin the entry and call `unpin_batch` after GPU commands complete.
+    /// - `is_hit == true`: buffer already holds valid expert data (zero-copy dispatch)
+    /// - `is_hit == false`: caller must pread expert data into the buffer
+    pub fn lookup_or_insert(&mut self, layer_idx: i32, expert_idx: i32, num_experts: i32) -> (usize, &Buffer, bool) {
+        let ei = layer_idx as usize * num_experts as usize + expert_idx as usize;
+
+        if self.entry_idx[ei] >= 0 {
+            let idx = self.entry_idx[ei] as usize;
+            self.entries[idx].last_used = { self.access_counter += 1; self.access_counter };
+            self.hits += 1;
+            return (idx, &self.entries[idx].buffer, true);
+        }
+        self.misses += 1;
+
+        let target = if self.used_entries < self.max_entries {
+            let t = self.used_entries;
+            self.used_entries += 1;
+            t
+        } else {
+            let mut lru_idx = 0usize;
+            let mut min_used = u64::MAX;
+            for i in 0..self.entries.len() {
+                if self.pin_mask[i] == 0 && self.entries[i].last_used < min_used {
+                    min_used = self.entries[i].last_used;
+                    lru_idx = i;
+                }
+            }
+            if min_used == u64::MAX {
+                lru_idx = 0;
+            }
+            let old_layer = self.entries[lru_idx].layer_idx;
+            let old_expert = self.entries[lru_idx].expert_idx;
+            if old_layer >= 0 && old_expert >= 0 {
+                self.entry_idx[old_layer as usize * num_experts as usize + old_expert as usize] = -1;
+            }
+            lru_idx
+        };
+
+        self.entries[target].layer_idx = layer_idx;
+        self.entries[target].expert_idx = expert_idx;
+        self.entries[target].last_used = { self.access_counter += 1; self.access_counter };
+        self.entry_idx[ei] = target as i32;
+        (target, &self.entries[target].buffer, false)
+    }
+
     pub fn stats(&self) -> (u64, u64) {
         (self.hits, self.misses)
     }
@@ -176,7 +236,7 @@ pub struct MallocExpertCache {
 unsafe impl Send for MallocExpertCache {}
 
 impl MallocExpertCache {
-    pub fn new(num_layers: i32, num_experts: i32, max_entries: usize, expert_size: usize, _device: &metal::Device) -> Self {
+    pub fn new(num_layers: i32, num_experts: i32, max_entries: usize, expert_size: usize, device: &metal::Device) -> Self {
         let total = (num_layers as usize) * (num_experts as usize);
         let page_size = 16384;
         let aligned_size = (expert_size + page_size - 1) & !(page_size - 1);
@@ -198,12 +258,18 @@ impl MallocExpertCache {
             misses: 0,
         };
 
-        // We don't create Metal buffers here since Rust doesn't have `newBufferWithBytesNoCopy`
-        // easily accessible. The managed buffer approach uses separate allocations.
         for _i in 0..max_entries {
             let layout = std::alloc::Layout::from_size_align(aligned_size, page_size).unwrap();
             let ptr = unsafe { std::alloc::alloc_zeroed(layout) };
             cache.data.push(ptr);
+            // Create zero-copy Metal buffer wrapping the malloc'd memory
+            let metal_buf = device.new_buffer_with_bytes_no_copy(
+                ptr as *const std::ffi::c_void,
+                aligned_size as u64,
+                metal::MTLResourceOptions::StorageModeShared,
+                None,
+            );
+            cache.metal_bufs.push(metal_buf);
         }
         cache
     }
@@ -218,6 +284,53 @@ impl MallocExpertCache {
             self.misses += 1;
             None
         }
+    }
+
+    /// Get the Metal buffer for a cache entry (zero-copy GPU dispatch).
+    pub fn metal_buf(&self, entry_idx: usize) -> &Buffer {
+        &self.metal_bufs[entry_idx]
+    }
+
+    /// Lookup or insert, returning (entry_index, Metal buffer, is_hit, data_ptr).
+    /// - `is_hit == true`: data already loaded in cache
+    /// - `is_hit == false`: caller must pread into `data_ptr` (which backs the Metal buffer)
+    pub fn lookup_or_insert(&mut self, layer: i32, expert: i32, num_experts: i32) -> (usize, &Buffer, *mut u8, bool) {
+        let ei = layer as usize * num_experts as usize + expert as usize;
+
+        if self.entry_idx[ei] >= 0 {
+            let idx = self.entry_idx[ei] as usize;
+            self.last_used[idx] = { self.access_counter += 1; self.access_counter };
+            self.hits += 1;
+            return (idx, &self.metal_bufs[idx], self.data[idx], true);
+        }
+        self.misses += 1;
+
+        let target = if self.used_entries < self.max_entries {
+            let t = self.used_entries;
+            self.used_entries += 1;
+            t
+        } else {
+            let mut lru = 0usize;
+            let mut min_used = self.last_used[0];
+            for i in 1..self.max_entries {
+                if self.last_used[i] < min_used {
+                    min_used = self.last_used[i];
+                    lru = i;
+                }
+            }
+            let old_l = self.layer_idx[lru];
+            let old_e = self.expert_idx[lru];
+            if old_l >= 0 && old_e >= 0 {
+                self.entry_idx[old_l as usize * num_experts as usize + old_e as usize] = -1;
+            }
+            lru
+        };
+
+        self.layer_idx[target] = layer;
+        self.expert_idx[target] = expert;
+        self.last_used[target] = { self.access_counter += 1; self.access_counter };
+        self.entry_idx[ei] = target as i32;
+        (target, &self.metal_bufs[target], self.data[target], false)
     }
 
     pub fn insert(&mut self, layer: i32, expert: i32, num_experts: i32) -> (*mut u8, usize) {
@@ -255,6 +368,10 @@ impl MallocExpertCache {
         self.last_used[target] = { self.access_counter += 1; self.access_counter };
         self.entry_idx[ei] = target as i32;
         (self.data[target], target)
+    }
+
+    pub fn stats(&self) -> (u64, u64) {
+        (self.hits, self.misses)
     }
 }
 
@@ -368,11 +485,16 @@ impl IOPool {
             while i < num_tasks {
                 let t = unsafe { &*tasks_ptr.add(i as usize) };
                 let result = if !t.lz4_comp_buf.is_null() && t.lz4_comp_size > 0 {
-                    // LZ4 decompression path (placeholder — not yet wired up)
                     let nr = unsafe { pread(t.fd, t.lz4_comp_buf, t.lz4_comp_size as usize, t.offset as i64) };
                     if nr == t.lz4_comp_size as isize {
-                        // TODO: lz4_flex decompress into t.dst
-                        -1 // not yet implemented
+                        let dec = unsafe {
+                            compression_decode_buffer(
+                                t.dst, t.size,
+                                t.lz4_comp_buf, t.lz4_comp_size as usize,
+                                std::ptr::null_mut(), COMPRESSION_LZ4,
+                            )
+                        };
+                        dec as isize
                     } else {
                         -1
                     }

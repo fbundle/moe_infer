@@ -229,7 +229,7 @@ wheels = [
 ]
 
 [[package]]
-name = "moe-infer-mlx"
+name = "moe-infer"
 version = "0.1.0"
 source = { editable = "." }
 dependencies = [
