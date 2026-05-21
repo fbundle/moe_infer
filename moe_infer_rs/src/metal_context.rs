@@ -214,6 +214,8 @@ pub struct MetalContext {
     pub buf_input: Option<Buffer>,
     /// CMD3 RMS norm sum-of-squares scratch [4 bytes]
     pub buf_cmd3_sum_sq: Option<Buffer>,
+    /// CMD3 moe_combine_residual output — next layer reads hidden from here (FAST PATH)
+    pub buf_moe_hidden: Option<Buffer>,
 }
 
 impl MetalContext {
@@ -227,6 +229,7 @@ impl MetalContext {
         total_value: usize,
         key_dim: usize,
         value_dim: usize,
+        hidden_dim: usize,
     ) {
         self.buf_conv_state.clear();
         self.buf_delta_state.clear();
@@ -249,6 +252,10 @@ impl MetalContext {
         self.batch_out.push(metal_buf_shared(&self.device, 4));                 // 5: unused
         self.batch_out.push(metal_buf_shared(&self.device, total_value * 4));   // 6: gated_rms_norm output
         self.batch_out.push(metal_buf_shared(&self.device, 4));                 // 7: unused
+        // CMD3 GPU-side combine + input_norm buffers (matches C buf_cmd3_sum_sq, buf_input, buf_moe_hidden)
+        self.buf_cmd3_sum_sq = Some(metal_buf_shared(&self.device, 4));
+        self.buf_input = Some(metal_buf_shared(&self.device, hidden_dim * 4));
+        self.buf_moe_hidden = Some(metal_buf_shared(&self.device, hidden_dim * 4));
     }
 
     /// Allocate persistent GPU buffers for expert I/O. Returns the state which
@@ -390,6 +397,9 @@ impl MetalContext {
                 buf_delta_beta: None,
                 buf_delta_output: None,
                 batch_out: Vec::new(),
+                buf_input: None,
+                buf_cmd3_sum_sq: None,
+                buf_moe_hidden: None,
             })
         })
     }

@@ -64,6 +64,7 @@ impl ModelState {
             config.linear_total_value,
             key_dim,
             value_dim,
+            config.hidden_dim,
         );
         let expert_io = Some(ctx.init_expert_buffers(
             config.expert_size_4bit,
@@ -181,9 +182,15 @@ fn process_token(m: &mut ModelState, hidden: &mut [f32], pos: usize,
             eprintln!("[RUST-PRE] prev_layer={} hidden_rms={:.6} hidden[..5]=[{:.6},{:.6},{:.6},{:.6},{:.6}]",
                 prev_layer, rms_pre, hidden[0], hidden[1], hidden[2], hidden[3], hidden[4]);
         }
-        // Complete previous layer's async MoE → writes previous layer's output to hidden
-        if let Some(ref mut def) = deferred.take() {
-            def.complete(hidden, m.config.hidden_dim);
+
+        // FAST PATH: previous CMD3 wrote input_norm to buf_input. Skip CPU rms_norm
+        // and submit CMD1 immediately — GPU queue serializes CMD3(N-1) then CMD1(N).
+        let prev_gpu_combined = deferred.as_ref().map_or(false, |d| d.gpu_combined);
+        if !prev_gpu_combined {
+            // SLOW PATH: complete previous layer's async MoE (CPU wait + readback)
+            if let Some(ref mut def) = deferred.take() {
+                def.complete(hidden, m.config.hidden_dim);
+            }
         }
         {
             let prev_layer = if layer > 0 { (layer - 1) as i32 } else { -1i32 };
@@ -203,7 +210,9 @@ fn process_token(m: &mut ModelState, hidden: &mut [f32], pos: usize,
             let li = layer - (layer + 1) / FULL_ATTN_INTERVAL;
             // In Fused3, h_mid must be saved before linear_attention_forward because
             // it doesn't modify hidden (matching C: CMD2 handles residual_add).
-            if mode == PipelineMode::Fused3 {
+            // FAST PATH: hidden is stale (CMD3(N-1) not yet completed), so defer
+            // h_mid capture until after CMD1 + complete_fast().
+            if mode == PipelineMode::Fused3 && !prev_gpu_combined {
                 h_mid_saved = Some(hidden.to_vec());
             }
             lin_state = linear_attention_forward(
@@ -211,8 +220,21 @@ fn process_token(m: &mut ModelState, hidden: &mut [f32], pos: usize,
                 m.config.hidden_dim,
                 m.config.linear_num_k_heads, m.config.linear_num_v_heads,
                 m.config.linear_total_key, m.config.linear_total_value, m.config.linear_conv_dim,
-                Some(&m.gpu_wf), Some(&m.ctx), li, mode,
+                Some(&m.gpu_wf), Some(&m.ctx), li, mode, prev_gpu_combined,
             );
+
+            if prev_gpu_combined {
+                // CMD1 completed → GPU queue guarantees CMD3(N-1) finished first.
+                // Read hidden from CMD3(N-1)'s combine output (buf_moe_hidden).
+                if let Some(ref mut def) = deferred.take() {
+                    def.complete_fast(hidden, m.config.hidden_dim);
+                }
+                // Fix h_mid in the state — was set from stale hidden during CMD1
+                if let Some(ref mut ls) = lin_state {
+                    ls.h_mid.copy_from_slice(hidden);
+                }
+                h_mid_saved = Some(hidden.to_vec());
+            }
             // In Fused3: restore hidden to h_mid so moe_layer_forward uses pre-attention state
             if let Some(ref hmid) = h_mid_saved {
                 hidden.copy_from_slice(hmid);

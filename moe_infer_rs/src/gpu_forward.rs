@@ -482,6 +482,8 @@ pub struct DeferredExperts {
     out_buf: Option<metal::Buffer>,
     /// All intermediate GPU buffers kept alive until CMD completes.
     _keep_alive: Vec<metal::Buffer>,
+    /// CMD3 wrote input_norm to buf_input → next layer can skip CPU rms_norm.
+    pub gpu_combined: bool,
 }
 
 impl DeferredExperts {
@@ -490,6 +492,7 @@ impl DeferredExperts {
             cmd_buf: None,
             out_buf: None,
             _keep_alive: Vec::new(),
+            gpu_combined: false,
         }
     }
 
@@ -498,10 +501,31 @@ impl DeferredExperts {
     }
 
     /// Complete deferred CMD3: wait for GPU, copy result into hidden.
+    /// When gpu_combined, CMD1(N+1) was submitted before this wait, so the
+    /// GPU queue serialized CMD3(N) → CMD1(N+1). The wait is nearly free.
     pub fn complete(&mut self, hidden: &mut [f32], hidden_dim: usize) {
         if let Some(ref cmd_buf) = self.cmd_buf {
             cmd_buf.wait_until_completed();
         }
+        if let Some(ref out_buf) = self.out_buf {
+            unsafe {
+                std::ptr::copy_nonoverlapping(
+                    out_buf.contents() as *const f32,
+                    hidden.as_mut_ptr(),
+                    hidden_dim,
+                );
+            }
+        }
+        self.cmd_buf = None;
+        self.out_buf = None;
+        self._keep_alive.clear();
+    }
+
+    /// Complete after CMD1 wait — CMD3 is already done (GPU-queue serialized).
+    /// Only used on FAST PATH (gpu_combined).
+    pub fn complete_fast(&mut self, hidden: &mut [f32], hidden_dim: usize) {
+        // CMD3 already completed by the GPU queue (serialized before CMD1 of next layer)
+        // Just drain the command buffer reference and copy result
         if let Some(ref out_buf) = self.out_buf {
             unsafe {
                 std::ptr::copy_nonoverlapping(
@@ -528,6 +552,10 @@ impl DeferredExperts {
 
 /// Full linear attention forward (GatedDeltaNet) for single-token incremental inference.
 /// Port of fused_layer_forward from layer_forward.h (CMD1 linear attention pipeline).
+///
+/// When `prev_gpu_combined` is true, buf_input already holds normed hidden from the
+/// previous layer's CMD3, so CPU rms_norm is skipped and CMD1 reads directly from
+/// buf_input (FAST PATH matching C's prev_gpu_combined optimization).
 pub fn linear_attention_forward(
     wf: &WeightFile,
     layer_idx: usize,
@@ -543,6 +571,7 @@ pub fn linear_attention_forward(
     ctx: Option<&MetalContext>,
     linear_idx: usize,  // index into persistent GPU state buffers
     mode: PipelineMode,
+    prev_gpu_combined: bool,
 ) -> Option<LinearAttnFused3State> {
     let use_gpu = mode != PipelineMode::CpuOnly
         && gpu_wf.is_some()
@@ -763,8 +792,16 @@ pub fn linear_attention_forward(
         let prefix_b = format!("{}.in_proj_b", prefix);
         let prefix_a = format!("{}.in_proj_a", prefix);
 
-        let x_buf = metal_buf_shared(&c.device, hidden_dim * 4);
-        unsafe { let dst = x_buf.contents() as *mut f32; std::ptr::copy_nonoverlapping(normed.as_ptr(), dst, hidden_dim); }
+        // When prev CMD3 did GPU-side input_norm, buf_input has normed hidden on GPU.
+        // Skip CPU upload and use buf_input directly (matches C FAST PATH).
+        let input_buf: Buffer;
+        if prev_gpu_combined && c.buf_input.is_some() {
+            input_buf = c.buf_input.as_ref().unwrap().clone();
+        } else {
+            let x = metal_buf_shared(&c.device, hidden_dim * 4);
+            unsafe { std::ptr::copy_nonoverlapping(normed.as_ptr(), x.contents() as *mut f32, hidden_dim); }
+            input_buf = x;
+        }
 
         // CMD1: encoders 1-5 only (projections + conv1d + rms_norm_qk + decay_beta + SSM)
         let cmd_buf = c.queue.new_command_buffer();
@@ -772,10 +809,10 @@ pub fn linear_attention_forward(
         // Encoder 1: 4 attention projections
         {
             let enc = cmd_buf.new_compute_command_encoder();
-            gw.encode_matvec_into(wf, c, &enc, &prefix_std, &x_buf, 0, &c.batch_out[0], 0, qkv_dim, hidden_dim);
-            gw.encode_matvec_into(wf, c, &enc, &prefix_z, &x_buf, 0, &c.batch_out[1], 0, total_value, hidden_dim);
-            gw.encode_matvec_into(wf, c, &enc, &prefix_b, &x_buf, 0, &c.batch_out[2], 0, num_v_heads, hidden_dim);
-            gw.encode_matvec_into(wf, c, &enc, &prefix_a, &x_buf, 0, &c.batch_out[3], 0, num_v_heads, hidden_dim);
+            gw.encode_matvec_into(wf, c, &enc, &prefix_std, &input_buf, 0, &c.batch_out[0], 0, qkv_dim, hidden_dim);
+            gw.encode_matvec_into(wf, c, &enc, &prefix_z, &input_buf, 0, &c.batch_out[1], 0, total_value, hidden_dim);
+            gw.encode_matvec_into(wf, c, &enc, &prefix_b, &input_buf, 0, &c.batch_out[2], 0, num_v_heads, hidden_dim);
+            gw.encode_matvec_into(wf, c, &enc, &prefix_a, &input_buf, 0, &c.batch_out[3], 0, num_v_heads, hidden_dim);
             enc.end_encoding();
         }
 
@@ -1597,7 +1634,7 @@ pub fn moe_layer_forward(
             let io_ref = expert_io.as_deref();  // Option<&ExpertIOState>
 
             let (x_buf, gate_out, up_out, act_out, out_bufs,
-                 shared_act_gpu, shared_down_gpu, hidden_out, params_buf)
+                 shared_act_gpu, shared_down_gpu, _hidden_out, params_buf)
                 = if let Some(io) = io_ref {
                 // Pre-allocated path: reuse persistent Metal buffers
                 unsafe { let dst = io.input_buf.contents() as *mut f32; std::ptr::copy_nonoverlapping(h_post.as_ptr(), dst, hidden_dim); }
@@ -1677,18 +1714,18 @@ pub fn moe_layer_forward(
                 &format!("{}.shared_expert.down_proj", prefix),
                 &shared_act_gpu, 0, &shared_down_gpu, 0, hidden_dim, shared_inter);
 
-            // ── moe_combine_residual ──
+            // ── moe_combine_residual (writes to persistent buf_moe_hidden for GPU input_norm) ──
             {
                 let mcr_pipe = ctx.moe_combine_residual.as_ref().unwrap();
                 enc.set_compute_pipeline_state(mcr_pipe);
                 enc.set_buffer(0, Some(&hmid_gpu), 0);
                 enc.set_buffer(1, Some(&shared_down_gpu), 0);
-                enc.set_buffer(2, Some(&hidden_out), 0);
+                enc.set_buffer(2, Some(ctx.buf_moe_hidden.as_ref().unwrap()), 0);
                 for ei in 0..MAX_K {
                     if ei < actual_k && valid[ei] {
                         enc.set_buffer(3 + ei as u64, Some(&out_bufs[ei]), 0);
                     } else {
-                        enc.set_buffer(3 + ei as u64, Some(&hidden_out), 0);
+                        enc.set_buffer(3 + ei as u64, Some(ctx.buf_moe_hidden.as_ref().unwrap()), 0);
                     }
                 }
                 let mut params = [0.0f32; 10];
@@ -1707,10 +1744,48 @@ pub fn moe_layer_forward(
                 );
             }
 
+            // GPU-side input_norm for next layer (matches C Enc C2 + Enc C3)
+            let gpu_combined = layer_idx + 1 < config.num_layers
+                && ctx.rms_norm_apply_bf16.is_some()
+                && wf.get_tensor_ptr(&format!("model.layers.{}.input_layernorm.weight", layer_idx + 1)).is_some();
+            if gpu_combined {
+                let next_norm_ptr = wf.get_tensor_ptr(
+                    &format!("model.layers.{}.input_layernorm.weight", layer_idx + 1)).unwrap();
+                let next_norm_off = (next_norm_ptr as usize - gw.base as usize) as u64;
+                let buf_moe = ctx.buf_moe_hidden.as_ref().unwrap();
+
+                // Enc C2: rms_norm_sum_sq (buf_moe_hidden -> buf_cmd3_sum_sq)
+                {
+                    enc.set_compute_pipeline_state(&ctx.rms_norm_sum);
+                    enc.set_buffer(0, Some(buf_moe), 0);
+                    enc.set_buffer(1, Some(ctx.buf_cmd3_sum_sq.as_ref().unwrap()), 0);
+                    unsafe { enc.set_bytes(2, 4, &hidden_u32 as *const u32 as *const c_void); }
+                    enc.dispatch_thread_groups(MTLSize::new(1, 1, 1), MTLSize::new(256, 1, 1));
+                }
+
+                // Enc C3: rms_norm_apply_bf16 (buf_moe_hidden + next_norm_w -> buf_input)
+                {
+                    let pipe = ctx.rms_norm_apply_bf16.as_ref().unwrap();
+                    enc.set_compute_pipeline_state(pipe);
+                    enc.set_buffer(0, Some(buf_moe), 0);
+                    enc.set_buffer(1, Some(&gw.buf), next_norm_off);
+                    enc.set_buffer(2, Some(ctx.buf_cmd3_sum_sq.as_ref().unwrap()), 0);
+                    enc.set_buffer(3, Some(ctx.buf_input.as_ref().unwrap()), 0);
+                    unsafe {
+                        enc.set_bytes(4, 4, &hidden_u32 as *const u32 as *const c_void);
+                        let eps = RMS_NORM_EPS;
+                        enc.set_bytes(5, 4, &eps as *const f32 as *const c_void);
+                    }
+                    enc.dispatch_thread_groups(
+                        MTLSize::new(((hidden_dim + 255) / 256) as u64, 1, 1),
+                        MTLSize::new(256, 1, 1),
+                    );
+                }
+            }
+
             enc.end_encoding();
             cmd_buf.commit();
 
-            // Only per-layer-allocated buffers need keep_alive; pre-allocated live in ExpertIOState
             let mut keep_alive = Vec::with_capacity(4);
             keep_alive.push(hmid_gpu);
             if io_ref.is_none() {
@@ -1724,13 +1799,15 @@ pub fn moe_layer_forward(
                 keep_alive.extend(out_bufs);
                 keep_alive.extend(fallback_expert_bufs);
             }
+            // hidden_out no longer in keep_alive — buf_moe_hidden is persistent (MetalContext)
             if let Some(b) = sg_buf_gpu.take() { keep_alive.push(b); }
             if let Some(b) = su_buf_gpu.take() { keep_alive.push(b); }
 
             return Ok(Some(DeferredExperts {
                 cmd_buf: Some(cmd_buf.to_owned()),
-                out_buf: Some(hidden_out),
+                out_buf: ctx.buf_moe_hidden.clone(),
                 _keep_alive: keep_alive,
+                gpu_combined,
             }));
         }
         // No experts loaded — fall through to CPU below
