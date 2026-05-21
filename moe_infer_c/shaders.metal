@@ -5,7 +5,7 @@
  *   1. dequant_matvec_4bit: Naive 4-bit affine dequant matvec (reference)
  *   2. dequant_matvec_4bit_fast: SIMD-optimized with simd_sum reduction
  *   3. dequant_matvec_4bit_v3: Fully optimized — tiled threadgroup, vector loads,
- *      coalesced access, shared input cache.
+ *      coalesced access, shared input cache. Target: <0.1ms per matmul.
  *   4. swiglu_fused / swiglu_fused_vec4: SwiGLU activation
  *   5. weighted_sum: combine expert outputs with routing weights
  *   6. rms_norm: RMS normalization
@@ -17,19 +17,16 @@
  *   - Groups of 64 elements share one (scale, bias) pair
  *
  * Matrix layout for expert projections:
- *   gate_proj/up_proj: [moe_intermediate, hidden/8] uint32 (out=moe_intermediate, in=hidden)
- *   down_proj: [hidden, moe_intermediate/8] uint32 (out=hidden, in=moe_intermediate)
+ *   gate_proj/up_proj: [1024, 512] uint32 = [1024, 4096] logical (out=1024, in=4096)
+ *   down_proj: [4096, 128] uint32 = [4096, 1024] logical (out=4096, in=1024)
  *
- * All matrix dimensions are passed at runtime via constant buffers.
- * MAX_INPUT_DIM = 4096: maximum supported hidden_dim for threadgroup shared memory.
+ *   Scales/biases: [out_dim, in_dim/group_size]
+ *   gate/up scales: [1024, 64]   (4096/64 = 64 groups)
+ *   down scales:    [4096, 16]   (1024/64 = 16 groups)
  */
 
 #include <metal_stdlib>
 using namespace metal;
-
-// Maximum supported input dimension for threadgroup shared memory.
-// Models with larger hidden_dim would need dynamic threadgroup memory.
-#define MAX_INPUT_DIM 4096
 
 // ============================================================================
 // BFloat16 helpers
@@ -274,7 +271,7 @@ kernel void dequant_matvec_4bit_v3(
     // ---- Cache input vector in threadgroup shared memory ----
     // Max in_dim = 4096, so we need 4096 floats = 16KB shared memory
     // This is well within the 32KB threadgroup memory limit on M3
-    threadgroup float x_shared[MAX_INPUT_DIM];
+    threadgroup float x_shared[4096];
 
     // Cooperative load: 256 threads load 4096 floats (16 per thread)
     // ALL threads must participate in this load + barrier, even if their
@@ -372,7 +369,7 @@ kernel void dequant_matvec_4bit_v5(
     uint num_groups  = in_dim / group_size;
     uint packed_per_group = group_size / 8;
 
-    threadgroup float x_shared[MAX_INPUT_DIM];
+    threadgroup float x_shared[4096];
     for (uint i = lid; i < in_dim; i += 256) {
         x_shared[i] = x[i];
     }
@@ -446,7 +443,7 @@ kernel void dequant_matvec_2bit(
     uint packed_cols = in_dim / 16;  // 16 values per uint32 for 2-bit
     uint num_groups  = in_dim / group_size;
 
-    threadgroup float x_shared[MAX_INPUT_DIM];
+    threadgroup float x_shared[4096];
     for (uint i = lid; i < in_dim; i += 256) {
         x_shared[i] = x[i];
     }
@@ -527,7 +524,7 @@ kernel void dequant_matvec_4bit_v4(
     uint num_groups  = in_dim / group_size;
 
     // Cache input vector — ALL threads must participate before the barrier
-    threadgroup float x_shared[MAX_INPUT_DIM];
+    threadgroup float x_shared[4096];
     for (uint i = lid; i < in_dim; i += 256) {
         x_shared[i] = x[i];
     }
@@ -624,7 +621,7 @@ kernel void dequant_matvec_4bit_batched(
     uint num_groups  = in_dim / group_size;
 
     // Cache this expert's input vector
-    threadgroup float x_shared[MAX_INPUT_DIM];
+    threadgroup float x_shared[4096];
     device const float* x_k = x_inputs + expert_k * in_dim;
     for (uint i = lid; i < in_dim; i += 256) {
         x_shared[i] = x_k[i];
@@ -820,65 +817,6 @@ kernel void rms_norm_apply_bf16(
 
 
 // ============================================================================
-// Kernel 4c: Fused RMS Normalization (single-kernel reduce+apply)
-// ============================================================================
-// Combines sum-of-squares reduction + apply in one dispatch with a threadgroup
-// barrier. Saves one command buffer and one kernel dispatch vs the two-pass
-// rms_norm_sum_sq + rms_norm_apply pattern.
-//
-// Dispatch: 1 threadgroup, 256 threads. Each thread processes dim/256 elements.
-// Weight: bf16 (uint16_t), converted inline.
-
-#if USE_FUSED_RMS_NORM
-kernel void rms_norm_fused(
-    device const float*    x       [[buffer(0)]],
-    device const uint16_t* weight  [[buffer(1)]],  // bf16 weights
-    device float*          out     [[buffer(2)]],
-    constant uint&         dim     [[buffer(3)]],
-    constant float&        eps     [[buffer(4)]],
-    uint tid  [[thread_position_in_grid]],
-    uint lid  [[thread_position_in_threadgroup]],
-    uint tg_size [[threads_per_threadgroup]]
-) {
-    // Pass 1: sum of squares reduction
-    threadgroup float shared_sum_sq[32];
-
-    float acc = 0.0f;
-    for (uint i = tid; i < dim; i += tg_size) {
-        float val = x[i];
-        acc += val * val;
-    }
-
-    float simd_val = simd_sum(acc);
-    uint simd_lane = lid % 32;
-    uint simd_group = lid / 32;
-
-    if (simd_lane == 0) {
-        shared_sum_sq[simd_group] = simd_val;
-    }
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-
-    threadgroup float tg_sum_sq;
-    if (simd_group == 0) {
-        float val = (simd_lane < (tg_size + 31) / 32) ? shared_sum_sq[simd_lane] : 0.0f;
-        if (simd_lane == 0) {
-            tg_sum_sq = simd_sum(val);
-        }
-    }
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-
-    float inv_rms = rsqrt(tg_sum_sq / float(dim) + eps);
-
-    // Pass 2: apply normalization
-    for (uint i = tid; i < dim; i += tg_size) {
-        float w = bf16_to_f32(weight[i]);
-        out[i] = x[i] * inv_rms * w;
-    }
-}
-#endif // USE_FUSED_RMS_NORM
-
-
-// ============================================================================
 // Kernel 5: Residual add
 // ============================================================================
 // out[i] = a[i] + b[i]
@@ -913,11 +851,7 @@ kernel void residual_add(
 
 kernel void attn_scores_batched(
     device const float* Q          [[buffer(0)]],  // [num_heads, head_dim]
-#if USE_KV_CACHE_BF16
-    device const uint16_t* K_cache [[buffer(1)]],  // [max_seq, kv_dim] bf16
-#else
     device const float* K_cache    [[buffer(1)]],  // [max_seq, kv_dim]
-#endif
     device float*       scores     [[buffer(2)]],  // [num_heads, seq_stride]
     constant uint&      head_dim   [[buffer(3)]],  // 256
     constant uint&      kv_dim     [[buffer(4)]],  // 512
@@ -936,19 +870,11 @@ kernel void attn_scores_batched(
 
     uint kv_h = h / heads_per_kv;
     device const float* qh = Q + h * head_dim;
-#if USE_KV_CACHE_BF16
-    device const uint16_t* kp = K_cache + pos * kv_dim + kv_h * head_dim;
-#else
     device const float* kp = K_cache + pos * kv_dim + kv_h * head_dim;
-#endif
 
     float acc = 0.0f;
     for (uint d = lid; d < head_dim; d += tg_size) {
-#if USE_KV_CACHE_BF16
-        acc += qh[d] * bf16_to_f32(kp[d]);
-#else
         acc += qh[d] * kp[d];
-#endif
     }
 
     // SIMD reduction
@@ -1044,11 +970,7 @@ kernel void attn_softmax_batched(
 
 kernel void attn_values_batched(
     device const float* scores   [[buffer(0)]],  // [num_heads, seq_stride]
-#if USE_KV_CACHE_BF16
-    device const uint16_t* V_cache [[buffer(1)]],  // [max_seq, kv_dim] bf16
-#else
     device const float* V_cache  [[buffer(1)]],  // [max_seq, kv_dim]
-#endif
     device float*       out      [[buffer(2)]],  // [num_heads, head_dim]
     constant uint&      head_dim  [[buffer(3)]],  // 256
     constant uint&      kv_dim    [[buffer(4)]],  // 512
@@ -1065,11 +987,7 @@ kernel void attn_values_batched(
 
     float acc = 0.0f;
     for (uint p = 0; p < seq_len; p++) {
-#if USE_KV_CACHE_BF16
-        acc += s[p] * bf16_to_f32(V_cache[p * kv_dim + kv_h * head_dim + d]);
-#else
         acc += s[p] * V_cache[p * kv_dim + kv_h * head_dim + d];
-#endif
     }
     out[h * head_dim + d] = acc;
 }
