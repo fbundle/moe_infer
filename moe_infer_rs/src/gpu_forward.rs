@@ -4,10 +4,14 @@
 /// from moe_infer/core_src/layer_forward.h and attention.h.
 use std::os::fd::RawFd;
 
-use metal::Buffer;
+use std::ffi::c_void;
+
+use metal::{Buffer, MTLSize};
 use crate::config::ModelConfig;
 use crate::error::MoEError;
 use crate::kernels;
+
+const MAX_SEQ: usize = 4096;
 use crate::metal_context::{metal_buf_shared, GpuWeightCtx, MetalContext};
 use crate::quant::{bf16_to_f32, cpu_dequant_matvec_4bit, cpu_rms_norm};
 use crate::weights::WeightFile;
@@ -36,11 +40,11 @@ pub enum PipelineMode {
     CpuOnly,
     /// GPU path: individual Metal dispatches per operation (no command-buffer fusion).
     Gpu,
-    /// 2-CMD fused: merge CMD1+CMD2 (everything up to routing gate), then CMD3 (experts).
-    /// Fewer command buffers than Fused3 but attention and o_proj share one commit.
-    Fused2,
-    /// 3-CMD fused: CMD1 (attention) + CMD2 (o_proj/routing) + CMD3 (experts).
-    /// Matches the original C engine architecture. Isolates attention from o_proj.
+    /// Fused experiment: what we currently have — fused CMD1 (linear attention qkv/z/b/a),
+    /// but MoE experts are dispatched individually (no CMD3 batching, no GPU combine).
+    FusedExp,
+    /// 3-CMD fused: CMD1 (attention) + CMD2 (o_proj/routing) + CMD3 (async experts + GPU combine).
+    /// Matches the original C engine architecture. NOT YET IMPLEMENTED — will fail if used.
     Fused3,
 }
 
@@ -327,32 +331,143 @@ pub fn full_attention_forward(
     kv.v_cache[cache_pos * kv_dim..(cache_pos + 1) * kv_dim].copy_from_slice(&v);
     kv.len += 1;
 
-    // Scaled dot-product attention (CPU)
+    // GPU batched attention (scores + softmax + values + sigmoid gate)
     let heads_per_kv = num_attn_heads / num_kv_heads;
     let scale = 1.0f32 / (head_dim as f32).sqrt();
+    let seq_len = kv.len;
+    let seq_stride = MAX_SEQ;
     let mut attn_out = vec![0.0f32; q_dim];
-    for h in 0..num_attn_heads {
-        let kv_h = h / heads_per_kv;
-        let qh = &q[h * head_dim..];
-        let seq_len = kv.len;
-        let mut scores = vec![0.0f32; seq_len];
-        for p in 0..seq_len {
-            let kp = &kv.k_cache[p * kv_dim + kv_h * head_dim..];
-            scores[p] = qh.iter().zip(kp.iter()).map(|(&a, &b)| a * b).sum::<f32>() * scale;
-        }
-        let max_val = scores.iter().fold(f32::NEG_INFINITY, |a, &b| a.max(b));
-        let sum: f32 = scores.iter().map(|&s| (s - max_val).exp()).sum();
-        let inv_sum = 1.0 / sum;
-        let oh = &mut attn_out[h * head_dim..];
-        for p in 0..seq_len {
-            let weight = (scores[p] - max_val).exp() * inv_sum;
-            let vp = &kv.v_cache[p * kv_dim + kv_h * head_dim..];
-            for d in 0..head_dim { oh[d] += weight * vp[d]; }
-        }
-    }
 
-    // Q-gate (sigmoid)
-    for i in 0..q_dim { attn_out[i] *= 1.0f32 / (1.0f32 + (-q_gate[i]).exp()); }
+    let use_gpu_attn = ctx.is_some()
+        && gpu_wf.is_some()
+        && ctx.unwrap().attn_scores_batched.is_some()
+        && ctx.unwrap().attn_softmax_batched.is_some()
+        && ctx.unwrap().attn_values_batched.is_some();
+
+    if use_gpu_attn {
+        let c = ctx.unwrap();
+        // Upload Q, K_cache, V_cache, Q_gate
+        let q_buf = metal_buf_shared(&c.device, q_dim * 4);
+        let kc_buf = metal_buf_shared(&c.device, seq_stride * kv_dim * 4);
+        let vc_buf = metal_buf_shared(&c.device, seq_stride * kv_dim * 4);
+        let scores_buf = metal_buf_shared(&c.device, num_attn_heads * seq_stride * 4);
+        let out_buf = metal_buf_shared(&c.device, q_dim * 4);
+        let q_gate_buf = metal_buf_shared(&c.device, q_dim * 4);
+        unsafe {
+            std::ptr::copy_nonoverlapping(q.as_ptr(), q_buf.contents() as *mut f32, q_dim);
+            std::ptr::copy_nonoverlapping(kv.k_cache.as_ptr(), kc_buf.contents() as *mut f32, seq_len * kv_dim);
+            std::ptr::copy_nonoverlapping(kv.v_cache.as_ptr(), vc_buf.contents() as *mut f32, seq_len * kv_dim);
+            std::ptr::copy_nonoverlapping(q_gate.as_ptr(), q_gate_buf.contents() as *mut f32, q_dim);
+        }
+
+        let cmd_buf = c.queue.new_command_buffer();
+        let enc = cmd_buf.new_compute_command_encoder();
+        let num_seq_tgs = seq_len;
+
+        // Helper: set u32/f32 constant bytes (stack-allocated → raw ptr)
+        unsafe fn set_u32(enc: &metal::ComputeCommandEncoderRef, idx: u64, v: u32) {
+            let p: *const u32 = &v;
+            enc.set_bytes(idx, 4, p as *const c_void);
+        }
+        unsafe fn set_f32(enc: &metal::ComputeCommandEncoderRef, idx: u64, v: f32) {
+            let p: *const f32 = &v;
+            enc.set_bytes(idx, 4, p as *const c_void);
+        }
+
+        // 1. attn_scores_batched: Q @ K^T
+        enc.set_compute_pipeline_state(c.attn_scores_batched.as_ref().unwrap());
+        enc.set_buffer(0, Some(&q_buf), 0);
+        enc.set_buffer(1, Some(&kc_buf), 0);
+        enc.set_buffer(2, Some(&scores_buf), 0);
+        unsafe {
+            set_u32(&enc, 3, head_dim as u32);
+            set_u32(&enc, 4, kv_dim as u32);
+            set_u32(&enc, 5, seq_len as u32);
+            set_u32(&enc, 6, seq_stride as u32);
+            set_f32(&enc, 7, scale);
+            set_u32(&enc, 8, heads_per_kv as u32);
+            set_u32(&enc, 9, num_seq_tgs as u32);
+        }
+        enc.dispatch_thread_groups(
+            MTLSize::new(num_attn_heads as u64 * num_seq_tgs as u64, 1, 1),
+            MTLSize::new(256, 1, 1),
+        );
+
+        // 2. attn_softmax_batched
+        enc.set_compute_pipeline_state(c.attn_softmax_batched.as_ref().unwrap());
+        enc.set_buffer(0, Some(&scores_buf), 0);
+        unsafe {
+            set_u32(&enc, 1, seq_len as u32);
+            set_u32(&enc, 2, seq_stride as u32);
+        }
+        enc.dispatch_thread_groups(
+            MTLSize::new(num_attn_heads as u64, 1, 1),
+            MTLSize::new(256, 1, 1),
+        );
+
+        // 3. attn_values_batched: scores @ V
+        enc.set_compute_pipeline_state(c.attn_values_batched.as_ref().unwrap());
+        enc.set_buffer(0, Some(&scores_buf), 0);
+        enc.set_buffer(1, Some(&vc_buf), 0);
+        enc.set_buffer(2, Some(&out_buf), 0);
+        unsafe {
+            set_u32(&enc, 3, head_dim as u32);
+            set_u32(&enc, 4, kv_dim as u32);
+            set_u32(&enc, 5, seq_len as u32);
+            set_u32(&enc, 6, seq_stride as u32);
+            set_u32(&enc, 7, heads_per_kv as u32);
+        }
+        enc.dispatch_thread_groups(
+            MTLSize::new((num_attn_heads * head_dim) as u64, 1, 1),
+            MTLSize::new(1, 1, 1),
+        );
+
+        // 4. sigmoid_gate
+        if let Some(ref sig_pipe) = c.sigmoid_gate {
+            enc.set_compute_pipeline_state(sig_pipe);
+            enc.set_buffer(0, Some(&out_buf), 0);
+            enc.set_buffer(1, Some(&q_gate_buf), 0);
+            unsafe { set_u32(&enc, 2, q_dim as u32); }
+            enc.dispatch_thread_groups(
+                MTLSize::new(((q_dim + 255) / 256) as u64, 1, 1),
+                MTLSize::new(256, 1, 1),
+            );
+        }
+
+        enc.end_encoding();
+        cmd_buf.commit();
+        cmd_buf.wait_until_completed();
+
+        unsafe {
+            std::ptr::copy_nonoverlapping(out_buf.contents() as *const f32, attn_out.as_mut_ptr(), q_dim);
+        }
+
+        // CPU sigmoid fallback if GPU kernel not available
+        if c.sigmoid_gate.is_none() {
+            for i in 0..q_dim { attn_out[i] *= 1.0f32 / (1.0f32 + (-q_gate[i]).exp()); }
+        }
+    } else {
+        // CPU fallback for scaled dot-product attention
+        for h in 0..num_attn_heads {
+            let kv_h = h / heads_per_kv;
+            let qh = &q[h * head_dim..];
+            let mut scores = vec![0.0f32; seq_len];
+            for p in 0..seq_len {
+                let kp = &kv.k_cache[p * kv_dim + kv_h * head_dim..];
+                scores[p] = qh.iter().zip(kp.iter()).map(|(&a, &b)| a * b).sum::<f32>() * scale;
+            }
+            let max_val = scores.iter().fold(f32::NEG_INFINITY, |a, &b| a.max(b));
+            let sum: f32 = scores.iter().map(|&s| (s - max_val).exp()).sum();
+            let inv_sum = 1.0 / sum;
+            let oh = &mut attn_out[h * head_dim..];
+            for p in 0..seq_len {
+                let weight = (scores[p] - max_val).exp() * inv_sum;
+                let vp = &kv.v_cache[p * kv_dim + kv_h * head_dim..];
+                for d in 0..head_dim { oh[d] += weight * vp[d]; }
+            }
+        }
+        for i in 0..q_dim { attn_out[i] *= 1.0f32 / (1.0f32 + (-q_gate[i]).exp()); }
+    }
 
     // o_proj
     let o_prefix = format!("model.layers.{}.self_attn.o_proj", layer_idx);
@@ -457,7 +572,7 @@ pub fn linear_attention_forward(
 
     // ── Fused GPU path (CMD1): attention projections + conv1d + SSM in ONE command buffer ──
     let gpu_compatible = key_dim == 128 && value_dim == 128 && use_gpu;
-    let use_fused_gpu = mode == PipelineMode::Fused3 || mode == PipelineMode::Fused2
+    let use_fused_gpu = mode == PipelineMode::FusedExp
         && gpu_compatible
         && ctx.is_some()
         && ctx.unwrap().buf_conv_output.is_some()
