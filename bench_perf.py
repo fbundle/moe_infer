@@ -206,22 +206,23 @@ def bench_rust(prompt_ids, tok):
     first_token = int(np.argmax(last_logits))
     print(f"  First token: {first_token}")
 
-    # Generation (one token at a time)
+    # Generation (one token at a time — forward() expects full sequence, uses cache.pos to skip)
     print(f"  Generating up to {NUM_TOKENS} tokens (greedy)...")
-    gen_tokens = [first_token]
+    all_ids = list(prompt_ids) + [first_token]
     t_gen_start = time.time()
 
     for _ in range(NUM_TOKENS):
-        ids_arr = np.array([gen_tokens[-1]], dtype=np.int64)
+        ids_arr = np.array(all_ids, dtype=np.int64)
         logits_all = ctx.forward(ids_arr, cache)
         last_logits = np.array(logits_all[-1], dtype=np.float32)
         next_token = int(np.argmax(last_logits))
-        gen_tokens.append(next_token)
+        all_ids.append(next_token)
         if next_token == EOS_1 or next_token == EOS_2:
             break
 
     gen_ms = (time.time() - t_gen_start) * 1000
-    gen_count = len(gen_tokens) - 1
+    gen_tokens = all_ids[len(prompt_ids):]  # all generated tokens
+    gen_count = len(gen_tokens)
     tok_s = gen_count * 1000.0 / gen_ms if gen_ms > 0 else 0
 
     decoded = tok.decode(gen_tokens)

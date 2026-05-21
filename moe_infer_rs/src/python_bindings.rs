@@ -14,7 +14,7 @@ use pyo3::prelude::*;
 use crate::config::{load_model_config, ModelConfig};
 use crate::gpu_forward::{
     full_attention_forward, linear_attention_forward, moe_layer_forward, DeferredExperts,
-    FullAttnCache, FullAttnCmd2State, LinearAttnState, PipelineMode,
+    FullAttnCache, FullAttnCmd2State, LinearAttnFused3State, LinearAttnState, PipelineMode,
 };
 use crate::metal_context::{metal_buf_shared, GpuWeightCtx, MetalContext};
 use crate::quant::bf16_to_f32;
@@ -186,23 +186,34 @@ fn process_token(m: &ModelState, hidden: &mut [f32], pos: usize,
         }
         let is_full = (layer + 1) % FULL_ATTN_INTERVAL == 0;
         let mut attn_state: Option<FullAttnCmd2State> = None;
+        let mut lin_state: Option<LinearAttnFused3State> = None;
+        let mut h_mid_saved: Option<Vec<f32>> = None;
         if is_full {
             if let Some(ref mut kv) = kv[layer] {
                 attn_state = full_attention_forward(&m.wf, layer, hidden, kv, pos, &m.config, Some(&m.gpu_wf), Some(&m.ctx), mode);
             }
         } else if let Some(ref mut s) = lin[layer] {
             let li = layer - (layer + 1) / FULL_ATTN_INTERVAL;
-            linear_attention_forward(
+            // In Fused3, h_mid must be saved before linear_attention_forward because
+            // it doesn't modify hidden (matching C: CMD2 handles residual_add).
+            if mode == PipelineMode::Fused3 {
+                h_mid_saved = Some(hidden.to_vec());
+            }
+            lin_state = linear_attention_forward(
                 &m.wf, layer, hidden, s,
                 m.config.hidden_dim,
                 m.config.linear_num_k_heads, m.config.linear_num_v_heads,
                 m.config.linear_total_key, m.config.linear_total_value, m.config.linear_conv_dim,
                 Some(&m.gpu_wf), Some(&m.ctx), li, mode,
             );
+            // In Fused3: restore hidden to h_mid so moe_layer_forward uses pre-attention state
+            if let Some(ref hmid) = h_mid_saved {
+                hidden.copy_from_slice(hmid);
+            }
         }
         let r = moe_layer_forward(
             &m.wf, layer, hidden, m.layer_fds[layer],
-            Some(&m.ctx), Some(&m.gpu_wf), &m.config, mode, attn_state,
+            Some(&m.ctx), Some(&m.gpu_wf), &m.config, mode, attn_state, lin_state,
         );
         deferred = r.unwrap_or(None);
     }

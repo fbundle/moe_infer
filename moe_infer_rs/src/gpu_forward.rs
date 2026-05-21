@@ -254,6 +254,19 @@ pub struct FullAttnCmd2State {
     pub o_prefix: String,
 }
 
+/// GPU/CPU state from linear attention CMD1 for Fused3 (matching C engine exactly).
+///
+/// C does gated_norm on CPU after CMD1, then out_proj + residual + norm + gate
+/// in CMD2. This struct carries the gated attention output and pre-attention
+/// hidden state (h_mid) into moe_layer_forward's CMD2.
+pub struct LinearAttnFused3State {
+    pub gated_out: Vec<f32>,       // gated_norm output (total_value floats, CPU)
+    pub h_mid: Vec<f32>,           // pre-attention hidden (hidden_dim floats)
+    pub total_value: usize,
+    pub o_prefix: String,
+    pub post_norm_name: String,
+}
+
 // ─── Full attention forward ───────────────────────────────────────────────
 
 /// Single-token full (self) attention forward: QKV proj, Q/K norms, RoPE,
@@ -531,7 +544,7 @@ pub fn linear_attention_forward(
     ctx: Option<&MetalContext>,
     linear_idx: usize,  // index into persistent GPU state buffers
     mode: PipelineMode,
-) {
+) -> Option<LinearAttnFused3State> {
     let use_gpu = mode != PipelineMode::CpuOnly
         && gpu_wf.is_some()
         && ctx.is_some();
@@ -569,7 +582,7 @@ pub fn linear_attention_forward(
 
     // ── Fused GPU path (CMD1): attention projections + conv1d + SSM in ONE command buffer ──
     let gpu_compatible = key_dim == 128 && value_dim == 128 && use_gpu;
-    let use_fused_gpu = (mode == PipelineMode::FusedExp || mode == PipelineMode::Fused3)
+    let use_fused_gpu = (mode == PipelineMode::FusedExp)
         && gpu_compatible
         && ctx.is_some()
         && ctx.unwrap().buf_conv_output.is_some()
@@ -730,9 +743,155 @@ pub fn linear_attention_forward(
         state.conv_state[state_off..state_off + qkv_dim].fill(0.0);
 
         // Skip separate out_proj + residual (already done in CMD1)
-        return;
+        return None;
     }
-    else {
+
+    // ── Fused3 path (matching C exactly): CMD1 without gated_norm/out_proj/residual ──
+    // C does: CMD1(qkvz+ba+conv1d+SSM) → CPU(gated_norm) → CMD2(out_proj+residual+norm+gate+shared)
+    let use_fused3_gpu = mode == PipelineMode::Fused3
+        && gpu_compatible
+        && ctx.is_some()
+        && ctx.unwrap().buf_conv_output.is_some()
+        && linear_idx < ctx.unwrap().buf_conv_state.len()
+        && linear_idx < ctx.unwrap().buf_delta_state.len()
+        && ctx.unwrap().batch_out.len() >= 4;
+
+    if use_fused3_gpu {
+        let c = ctx.unwrap();
+        let gw = gpu_wf.unwrap();
+        let prefix_std = format!("{}.in_proj_qkv", prefix);
+        let prefix_z = format!("{}.in_proj_z", prefix);
+        let prefix_b = format!("{}.in_proj_b", prefix);
+        let prefix_a = format!("{}.in_proj_a", prefix);
+
+        let x_buf = metal_buf_shared(&c.device, hidden_dim * 4);
+        unsafe { let dst = x_buf.contents() as *mut f32; std::ptr::copy_nonoverlapping(normed.as_ptr(), dst, hidden_dim); }
+
+        // CMD1: encoders 1-5 only (projections + conv1d + rms_norm_qk + decay_beta + SSM)
+        let cmd_buf = c.queue.new_command_buffer();
+
+        // Encoder 1: 4 attention projections
+        {
+            let enc = cmd_buf.new_compute_command_encoder();
+            gw.encode_matvec_into(wf, c, &enc, &prefix_std, &x_buf, 0, &c.batch_out[0], 0, qkv_dim, hidden_dim);
+            gw.encode_matvec_into(wf, c, &enc, &prefix_z, &x_buf, 0, &c.batch_out[1], 0, total_value, hidden_dim);
+            gw.encode_matvec_into(wf, c, &enc, &prefix_b, &x_buf, 0, &c.batch_out[2], 0, num_v_heads, hidden_dim);
+            gw.encode_matvec_into(wf, c, &enc, &prefix_a, &x_buf, 0, &c.batch_out[3], 0, num_v_heads, hidden_dim);
+            enc.end_encoding();
+        }
+
+        // Encoder 2: conv1d_step
+        if let Some(conv_w_ptr) = wf.get_tensor_ptr(&format!("{}.conv1d.weight", prefix)) {
+            let conv_w_off = (conv_w_ptr as usize - gw.base as usize) as u64;
+            let enc = cmd_buf.new_compute_command_encoder();
+            kernels::encode_conv1d_step(c, &enc,
+                &c.buf_conv_state[linear_idx],
+                &c.batch_out[0],
+                &gw.buf, conv_w_off,
+                c.buf_conv_output.as_ref().unwrap(),
+                qkv_dim as u32);
+            enc.end_encoding();
+        }
+
+        // Encoder 3: rms_norm_qk
+        {
+            let enc = cmd_buf.new_compute_command_encoder();
+            kernels::encode_rms_norm_qk(c, &enc,
+                c.buf_conv_output.as_ref().unwrap(), 0,
+                c.buf_conv_output.as_ref().unwrap(), (total_key * 4) as u64,
+                num_k_heads as u32, key_dim as u32, inv_scale);
+            enc.end_encoding();
+        }
+
+        // Encoder 4: compute_decay_beta
+        {
+            let a_log_ptr = wf.get_tensor_ptr(&format!("{}.A_log", prefix));
+            let dt_bias_ptr = wf.get_tensor_ptr(&format!("{}.dt_bias", prefix));
+            let a_log_off = a_log_ptr.map_or(0, |p| (p as usize - gw.base as usize) as u64);
+            let dt_bias_off = dt_bias_ptr.map_or(0, |p| (p as usize - gw.base as usize) as u64);
+            let enc = cmd_buf.new_compute_command_encoder();
+            kernels::encode_compute_decay_beta(c, &enc,
+                &c.batch_out[3],
+                &c.batch_out[2],
+                if a_log_ptr.is_some() { &gw.buf } else { &c.batch_out[3] }, a_log_off,
+                if dt_bias_ptr.is_some() { &gw.buf } else { &c.batch_out[2] }, dt_bias_off,
+                c.buf_delta_g_decay.as_ref().unwrap(),
+                c.buf_delta_beta.as_ref().unwrap(),
+                num_v_heads as u32);
+            enc.end_encoding();
+        }
+
+        // Encoder 5: gated_delta_net_step
+        {
+            let q_off = 0u64;
+            let k_off = (total_key * 4) as u64;
+            let v_off = (2 * total_key * 4) as u64;
+            let conv_out = c.buf_conv_output.as_ref().unwrap();
+            let enc = cmd_buf.new_compute_command_encoder();
+            kernels::encode_gated_delta_net_step(c, &enc,
+                &c.buf_delta_state[linear_idx],
+                conv_out, q_off,
+                conv_out, k_off,
+                conv_out, v_off,
+                c.buf_delta_g_decay.as_ref().unwrap(),
+                c.buf_delta_beta.as_ref().unwrap(),
+                c.buf_delta_output.as_ref().unwrap(),
+                num_v_heads as u32, k_heads_per_v as u32, key_dim as u32, value_dim as u32);
+            enc.end_encoding();
+        }
+
+        // NO encoders 6-8 (gated_norm, out_proj, residual) — those go in CMD2
+
+        cmd_buf.commit();
+        cmd_buf.wait_until_completed();
+
+        // Read back SSM output and z for CPU gated_norm (matching C's CPU-side _precise_swiglu)
+        let mut ssm_out = vec![0.0f32; total_value];
+        let mut z_cpu = vec![0.0f32; total_value];
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                c.buf_delta_output.as_ref().unwrap().contents() as *const f32,
+                ssm_out.as_mut_ptr(), total_value);
+            std::ptr::copy_nonoverlapping(
+                c.batch_out[1].contents() as *const f32,
+                z_cpu.as_mut_ptr(), total_value);
+        }
+
+        // CPU gated_norm: sigmoid(z) * rms_norm(ssm_out)
+        let gnw = wf.get_tensor_u16(&format!("{}.norm.weight", prefix));
+        let gnw_f32: Vec<f32> = gnw.map_or(vec![1.0f32; value_dim], |w| w.iter().map(|&v| bf16_to_f32(v)).collect());
+        for hv in 0..num_v_heads {
+            let v_start = hv * value_dim;
+            let v_end = v_start + value_dim;
+            // rms_norm
+            let sum_sq: f32 = ssm_out[v_start..v_end].iter().map(|&x| x * x).sum();
+            let inv_rms = 1.0 / (sum_sq / value_dim as f32 + RMS_NORM_EPS).sqrt();
+            for i in 0..value_dim {
+                ssm_out[v_start + i] = ssm_out[v_start + i] * inv_rms * gnw_f32[i];
+            }
+            // silu gate: silu(z) * rms_norm(x) = z * sigmoid(z) * rms_norm(x)
+            for i in 0..value_dim {
+                let z_val = z_cpu[hv * value_dim + i];
+                let gate_i = z_val / (1.0 + (-z_val).exp());  // silu(z) = z * sigmoid(z)
+                ssm_out[v_start + i] *= gate_i;
+            }
+        }
+
+        // Update CPU conv_state for consistency
+        let state_off = (CONV_KERNEL_SIZE - 2) * qkv_dim;
+        state.conv_state.copy_within(qkv_dim.., 0);
+        state.conv_state[state_off..state_off + qkv_dim].fill(0.0);
+
+        return Some(LinearAttnFused3State {
+            gated_out: ssm_out,
+            h_mid: residual,  // pre-attention hidden (saved before norm)
+            total_value,
+            o_prefix: format!("{}.out_proj", prefix),
+            post_norm_name: format!("model.layers.{}.post_attention_layernorm.weight", layer_idx),
+        });
+    }
+
+    {
         // ── Non-fused or CPU path ──
         if debug_this_layer {
             let rms_normed: f32 = (normed.iter().map(|&x| x*x).sum::<f32>() / normed.len() as f32).sqrt();
@@ -961,6 +1120,7 @@ pub fn linear_attention_forward(
         let rms_out: f32 = (hidden.iter().map(|&x| x*x).sum::<f32>() / hidden.len() as f32).sqrt();
         eprintln!("[RUST-CPU-L0] hidden_out_rms={:.6} hidden_out_first5=[{:.8},{:.8},{:.8},{:.8},{:.8}]", rms_out, hidden[0], hidden[1], hidden[2], hidden[3], hidden[4]);
     }
+    None
 }
 
 // ─── MoE layer forward ─────────────────────────────────────────────────────
@@ -969,8 +1129,8 @@ pub fn linear_attention_forward(
 ///
 /// When `attn_state` is `Some`, fuses batched attention + o_proj + residual + norm + gate
 /// into a single CMD2 (matching the C engine's 3-CMD architecture).
-/// When `attn_state` is `None`, runs gate + shared projections in a separate CMD
-/// (compatible with linear attention layers that don't produce a FullAttnCmd2State).
+/// When `attn_state` is `None` and `lin_attn` is `Some`, fuses out_proj + residual + norm + gate
+/// into a single CMD2 for linear attention layers (Fused3 mode, matching C exactly).
 ///
 /// Returns `Some(DeferredExperts)` when GPU expert dispatch is used (async CMD3).
 pub fn moe_layer_forward(
@@ -983,6 +1143,7 @@ pub fn moe_layer_forward(
     config: &ModelConfig,
     mode: PipelineMode,
     attn_state: Option<FullAttnCmd2State>,
+    lin_attn: Option<LinearAttnFused3State>,
 ) -> Result<Option<DeferredExperts>, MoEError> {
     let hidden_dim = config.hidden_dim;
     let num_experts = config.num_experts;
@@ -1187,6 +1348,106 @@ pub fn moe_layer_forward(
         // h_post already set from normed_buf readback above (stored in hidden[])
         h_post.copy_from_slice(hidden);
         // temp_buf = h_mid + attn_out — use as hmid_gpu in CMD3 combine
+        hmid_gpu_override = Some(temp_buf);
+    } else if lin_attn.is_some() && use_gpu
+        && ctx.is_some()
+        && ctx.unwrap().residual_add.is_some()
+        && ctx.unwrap().rms_norm_apply_bf16.is_some()
+    {
+        // ── Fused3 linear CMD2: out_proj + residual_add + rms_norm + gate + shared ──
+        // Matches C engine exactly: CMD1(SSM) → CPU(gated_norm) → CMD2(this block) → CMD3
+        let c = ctx.unwrap();
+        let gw = gpu_wf.unwrap();
+        let la = lin_attn.unwrap();
+
+        // Upload gated_out and h_mid to GPU
+        let gated_buf = metal_buf_shared(&c.device, la.total_value * 4);
+        let hmid_buf = metal_buf_shared(&c.device, hidden_dim * 4);
+        unsafe {
+            std::ptr::copy_nonoverlapping(la.gated_out.as_ptr(), gated_buf.contents() as *mut f32, la.total_value);
+            std::ptr::copy_nonoverlapping(la.h_mid.as_ptr(), hmid_buf.contents() as *mut f32, hidden_dim);
+        }
+
+        let o_proj_buf = metal_buf_shared(&c.device, hidden_dim * 4);
+        let temp_buf = metal_buf_shared(&c.device, hidden_dim * 4);
+        let sum_sq_buf = metal_buf_shared(&c.device, 4);
+        let normed_buf = metal_buf_shared(&c.device, hidden_dim * 4);
+        let gate_buf = metal_buf_shared(&c.device, num_experts * 4);
+        let sg_buf = metal_buf_shared(&c.device, shared_inter * 4);
+        let su_buf = metal_buf_shared(&c.device, shared_inter * 4);
+        let sge_buf = metal_buf_shared(&c.device, 4);
+
+        let cmd_buf = c.queue.new_command_buffer();
+        let enc = cmd_buf.new_compute_command_encoder();
+
+        // Step 1: out_proj (gated_out → hidden_dim)
+        gw.encode_matvec_into(wf, c, &enc, &la.o_prefix, &gated_buf, 0, &o_proj_buf, 0, hidden_dim, la.total_value);
+
+        // Step 2: residual_add (o_proj_out + h_mid → temp_buf)
+        {
+            let pipe = c.residual_add.as_ref().unwrap();
+            enc.set_compute_pipeline_state(pipe);
+            enc.set_buffer(0, Some(&o_proj_buf), 0);
+            enc.set_buffer(1, Some(&hmid_buf), 0);
+            enc.set_buffer(2, Some(&temp_buf), 0);
+            unsafe { enc.set_bytes(3, 4, &(hidden_dim as u32) as *const u32 as *const c_void); }
+            enc.dispatch_thread_groups(
+                MTLSize::new(((hidden_dim + 255) / 256) as u64, 1, 1),
+                MTLSize::new(256, 1, 1),
+            );
+        }
+
+        // Step 3: post_attention_layernorm (rms_norm_sum + rms_norm_apply_bf16)
+        {
+            enc.set_compute_pipeline_state(&c.rms_norm_sum);
+            enc.set_buffer(0, Some(&temp_buf), 0);
+            enc.set_buffer(1, Some(&sum_sq_buf), 0);
+            unsafe { enc.set_bytes(2, 4, &(hidden_dim as u32) as *const u32 as *const c_void); }
+            enc.dispatch_thread_groups(MTLSize::new(1, 1, 1), MTLSize::new(256, 1, 1));
+        }
+        {
+            let pipe = c.rms_norm_apply_bf16.as_ref().unwrap();
+            enc.set_compute_pipeline_state(pipe);
+            enc.set_buffer(0, Some(&temp_buf), 0);
+            let pnw_ptr = wf.get_tensor_ptr(&la.post_norm_name).unwrap();
+            let pnw_off = (pnw_ptr as usize - gw.base as usize) as u64;
+            enc.set_buffer(1, Some(&gw.buf), pnw_off);
+            enc.set_buffer(2, Some(&sum_sq_buf), 0);
+            enc.set_buffer(3, Some(&normed_buf), 0);
+            unsafe {
+                enc.set_bytes(4, 4, &(hidden_dim as u32) as *const u32 as *const c_void);
+                enc.set_bytes(5, 4, &RMS_NORM_EPS as *const f32 as *const c_void);
+            }
+            enc.dispatch_thread_groups(
+                MTLSize::new(((hidden_dim + 255) / 256) as u64, 1, 1),
+                MTLSize::new(256, 1, 1),
+            );
+        }
+
+        // Step 4: gate, shared_gate, shared_up, shared_expert_gate matvecs (on normed hidden)
+        gw.encode_matvec_into(wf, c, &enc, &format!("{}.gate", prefix), &normed_buf, 0, &gate_buf, 0, num_experts, hidden_dim);
+        gw.encode_matvec_into(wf, c, &enc, &format!("{}.shared_expert.gate_proj", prefix), &normed_buf, 0, &sg_buf, 0, shared_inter, hidden_dim);
+        gw.encode_matvec_into(wf, c, &enc, &format!("{}.shared_expert.up_proj", prefix), &normed_buf, 0, &su_buf, 0, shared_inter, hidden_dim);
+        gw.encode_matvec_into(wf, c, &enc, &format!("{}.shared_expert_gate", prefix), &normed_buf, 0, &sge_buf, 0, 1, hidden_dim);
+
+        enc.end_encoding();
+        cmd_buf.commit();
+        cmd_buf.wait_until_completed();
+
+        // Read back results
+        unsafe {
+            std::ptr::copy_nonoverlapping(gate_buf.contents() as *const f32, gate_scores.as_mut_ptr(), num_experts);
+            std::ptr::copy_nonoverlapping(sg_buf.contents() as *const f32, shared_gate.as_mut_ptr(), shared_inter);
+            std::ptr::copy_nonoverlapping(su_buf.contents() as *const f32, shared_up.as_mut_ptr(), shared_inter);
+            shared_gate_score = *(sge_buf.contents() as *const f32);
+            // Update hidden to post-normed value
+            std::ptr::copy_nonoverlapping(normed_buf.contents() as *const f32, hidden.as_mut_ptr(), hidden_dim);
+        }
+
+        sg_buf_gpu = Some(sg_buf);
+        su_buf_gpu = Some(su_buf);
+        h_post.copy_from_slice(hidden);
+        // temp_buf = h_mid + out_proj(attn_out) — use as hmid_gpu in CMD3 combine
         hmid_gpu_override = Some(temp_buf);
     } else {
         // ── Non-fused path: post-norm on CPU, router CMD separately ──
