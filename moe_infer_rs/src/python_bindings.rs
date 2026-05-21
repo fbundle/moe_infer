@@ -318,9 +318,7 @@ impl Context {
             "CpuOnly" => PipelineMode::CpuOnly,
             "Gpu" => PipelineMode::Gpu,
             "FusedExp" => PipelineMode::FusedExp,
-            "Fused3" => return Err(pyo3::exceptions::PyNotImplementedError::new_err(
-                "Fused3 is not yet implemented. Use FusedExp (current experimental fused path) instead."
-            )),
+            "Fused3" => PipelineMode::Fused3,
             _ => return Err(pyo3::exceptions::PyValueError::new_err(
                 format!("Unknown pipeline_mode: {}. Use CpuOnly|Gpu|FusedExp", pipeline_mode)
             )),

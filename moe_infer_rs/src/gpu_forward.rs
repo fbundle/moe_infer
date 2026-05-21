@@ -44,7 +44,7 @@ pub enum PipelineMode {
     /// but MoE experts are dispatched individually (no CMD3 batching, no GPU combine).
     FusedExp,
     /// 3-CMD fused: CMD1 (attention) + CMD2 (o_proj/routing) + CMD3 (async experts + GPU combine).
-    /// Matches the original C engine architecture. NOT YET IMPLEMENTED — will fail if used.
+    /// Matches the original C engine architecture: 2 sync points for all 40 layers.
     Fused3,
 }
 
@@ -557,13 +557,14 @@ pub fn linear_attention_forward(
 
     // ── Fused GPU path (CMD1): attention projections + conv1d + SSM in ONE command buffer ──
     let gpu_compatible = key_dim == 128 && value_dim == 128 && use_gpu;
-    let use_fused_gpu = mode == PipelineMode::FusedExp
+    let use_fused_gpu = (mode == PipelineMode::FusedExp || mode == PipelineMode::Fused3)
         && gpu_compatible
         && ctx.is_some()
         && ctx.unwrap().buf_conv_output.is_some()
         && linear_idx < ctx.unwrap().buf_conv_state.len()
         && linear_idx < ctx.unwrap().buf_delta_state.len()
-        && ctx.unwrap().batch_out.len() >= 4;
+        && ctx.unwrap().batch_out.len() >= 4
+        && ctx.unwrap().residual_add.is_some();
 
     if use_fused_gpu {
         let c = ctx.unwrap();
@@ -573,9 +574,15 @@ pub fn linear_attention_forward(
         let prefix_b = format!("{}.in_proj_b", prefix);
         let prefix_a = format!("{}.in_proj_a", prefix);
 
-        // Upload normed input once
+        // Upload normed input + residual once
         let x_buf = metal_buf_shared(&c.device, hidden_dim * 4);
-        unsafe { let dst = x_buf.contents() as *mut f32; std::ptr::copy_nonoverlapping(normed.as_ptr(), dst, hidden_dim); }
+        let residual_buf = metal_buf_shared(&c.device, hidden_dim * 4);
+        unsafe {
+            let dst = x_buf.contents() as *mut f32;
+            std::ptr::copy_nonoverlapping(normed.as_ptr(), dst, hidden_dim);
+            let dst_r = residual_buf.contents() as *mut f32;
+            std::ptr::copy_nonoverlapping(residual.as_ptr(), dst_r, hidden_dim);
+        }
 
         // CMD1: Single command buffer — attention projs + full linear attn pipeline
         let cmd_buf = c.queue.new_command_buffer();
@@ -667,11 +674,40 @@ pub fn linear_attention_forward(
             enc.end_encoding();
         }
 
+        // ── Encoder 7: out_proj matvec (gated_out → hidden_dim) ──
+        let o_proj_buf = metal_buf_shared(&c.device, hidden_dim * 4);
+        {
+            let enc = cmd_buf.new_compute_command_encoder();
+            gw.encode_matvec_into(wf, c, &enc, &format!("{}.out_proj", prefix),
+                &gated_gpu, 0, &o_proj_buf, 0, hidden_dim, total_value);
+            enc.end_encoding();
+        }
+
+        // ── Encoder 8: residual_add (o_proj_out + residual → hidden_out) ──
+        let hidden_out = metal_buf_shared(&c.device, hidden_dim * 4);
+        {
+            let enc = cmd_buf.new_compute_command_encoder();
+            let pipe = c.residual_add.as_ref().unwrap();
+            enc.set_compute_pipeline_state(pipe);
+            enc.set_buffer(0, Some(&o_proj_buf), 0);
+            enc.set_buffer(1, Some(&residual_buf), 0);
+            enc.set_buffer(2, Some(&hidden_out), 0);
+            unsafe { enc.set_bytes(3, 4, &(hidden_dim as u32) as *const u32 as *const c_void); }
+            enc.dispatch_thread_groups(
+                MTLSize::new(((hidden_dim + 255) / 256) as u64, 1, 1),
+                MTLSize::new(256, 1, 1),
+            );
+            enc.end_encoding();
+        }
+
         cmd_buf.commit();
         cmd_buf.wait_until_completed();
 
-        // Read gated_out result
+        // Read final hidden (already has residual + attn_out)
         unsafe {
+            std::ptr::copy_nonoverlapping(hidden_out.contents() as *const f32,
+                hidden.as_mut_ptr(), hidden_dim);
+            // Also keep gated_out for potential fallback use
             std::ptr::copy_nonoverlapping(gated_gpu.contents() as *const f32,
                 gated_out.as_mut_ptr(), total_value);
         }
@@ -679,10 +715,12 @@ pub fn linear_attention_forward(
         // Update CPU conv_state for non-fused fallback / debugging
         let state_off = (CONV_KERNEL_SIZE - 2) * qkv_dim;
         state.conv_state.copy_within(qkv_dim.., 0);
-        // We don't have qkv on CPU in the fused path — only needed for CPU fallback
-        // Fill with zeros as placeholder (CPU path won't be used if GPU is active)
         state.conv_state[state_off..state_off + qkv_dim].fill(0.0);
-    } else {
+
+        // Skip separate out_proj + residual (already done in CMD1)
+        return;
+    }
+    else {
         // ── Non-fused or CPU path ──
         // CPU: attention projections
         if let (Some(qw), Some(qs), Some(qb)) = (
@@ -917,6 +955,8 @@ pub fn moe_layer_forward(
     // GPU buffers (preserved for expert dispatch combine)
     let mut sg_buf_gpu: Option<Buffer> = None;
     let mut su_buf_gpu: Option<Buffer> = None;
+    // When set, CMD3 uses this instead of uploading h_mid from CPU
+    let mut hmid_gpu_override: Option<Buffer> = None;
 
     // ── CMD2 fusion path: batched attn + o_proj + residual + norm + gate ──
     let use_cmd2_fusion = attn_state.is_some()
@@ -1088,6 +1128,8 @@ pub fn moe_layer_forward(
 
         // h_post already set from normed_buf readback above (stored in hidden[])
         h_post.copy_from_slice(hidden);
+        // temp_buf = h_mid + attn_out — use as hmid_gpu in CMD3 combine
+        hmid_gpu_override = Some(temp_buf);
     } else {
         // ── Non-fused path: post-norm on CPU, router CMD separately ──
         let pnw = wf.get_tensor_u16(&post_norm_name);
@@ -1212,8 +1254,14 @@ pub fn moe_layer_forward(
             let shared_down_gpu = metal_buf_shared(&ctx.device, hidden_dim * 4);
 
             // h_mid on GPU for moe_combine_residual
-            let hmid_gpu = metal_buf_shared(&ctx.device, hidden_dim * 4);
-            unsafe { let dst = hmid_gpu.contents() as *mut f32; std::ptr::copy_nonoverlapping(h_mid.as_ptr(), dst, hidden_dim); }
+            // Use CMD2-fused temp_buf (already has h_mid + attn_out) when available
+            let hmid_gpu = if let Some(buf) = hmid_gpu_override.take() {
+                buf
+            } else {
+                let buf = metal_buf_shared(&ctx.device, hidden_dim * 4);
+                unsafe { let dst = buf.contents() as *mut f32; std::ptr::copy_nonoverlapping(h_mid.as_ptr(), dst, hidden_dim); }
+                buf
+            };
 
             // ── FUSED CMD: K experts + shared SwiGLU + shared down_proj + moe_combine_residual ──
             let cmd_buf = ctx.queue.new_command_buffer();
