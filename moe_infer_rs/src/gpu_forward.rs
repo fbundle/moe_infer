@@ -557,7 +557,7 @@ pub fn linear_attention_forward(
 
     // ── Fused GPU path (CMD1): attention projections + conv1d + SSM in ONE command buffer ──
     let gpu_compatible = key_dim == 128 && value_dim == 128 && use_gpu;
-    let use_fused_gpu = (mode == PipelineMode::FusedExp || mode == PipelineMode::Fused3)
+    let use_fused_gpu = mode == PipelineMode::FusedExp
         && gpu_compatible
         && ctx.is_some()
         && ctx.unwrap().buf_conv_output.is_some()
