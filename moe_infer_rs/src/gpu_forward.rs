@@ -151,6 +151,29 @@ fn cpu_conv1d_step(
     cpu_silu(&mut out[..channels]);
 }
 
+// ─── Full attention KV cache ──────────────────────────────────────────────
+
+/// CPU-side KV cache for a full-attention layer.
+pub struct FullAttnCache {
+    pub k_cache: Vec<f32>,
+    pub v_cache: Vec<f32>,
+    pub len: usize,
+}
+
+impl FullAttnCache {
+    pub fn new(max_seq: usize, kv_dim: usize) -> Self {
+        FullAttnCache {
+            k_cache: vec![0.0f32; max_seq * kv_dim],
+            v_cache: vec![0.0f32; max_seq * kv_dim],
+            len: 0,
+        }
+    }
+
+    pub fn reset(&mut self) {
+        self.len = 0;
+    }
+}
+
 // ─── Linear attention state ────────────────────────────────────────────────
 
 pub struct LinearAttnState {
@@ -170,6 +193,183 @@ impl LinearAttnState {
             ssm_state_gpu: None,
         }
     }
+}
+
+// ─── RoPE ─────────────────────────────────────────────────────────────────
+
+fn apply_rope(
+    q: &mut [f32], k: &mut [f32], pos: usize,
+    num_q_heads: usize, num_kv_heads: usize,
+    head_dim: usize, rotary_dim: usize, rope_theta: f64,
+) {
+    let pos_f = pos as f32;
+    for h in 0..num_q_heads {
+        let qh = &mut q[h * head_dim..];
+        for d in (0..rotary_dim).step_by(2) {
+            let theta = pos_f as f64 * rope_theta.powf(-2.0 * (d as f64) / rotary_dim as f64);
+            let cos = theta.cos() as f32;
+            let sin = theta.sin() as f32;
+            let (q0, q1) = (qh[d], qh[d + 1]);
+            qh[d] = q0 * cos - q1 * sin;
+            qh[d + 1] = q0 * sin + q1 * cos;
+        }
+    }
+    for h in 0..num_kv_heads {
+        let kh = &mut k[h * head_dim..];
+        for d in (0..rotary_dim).step_by(2) {
+            let theta = pos_f as f64 * rope_theta.powf(-2.0 * (d as f64) / rotary_dim as f64);
+            let cos = theta.cos() as f32;
+            let sin = theta.sin() as f32;
+            let (k0, k1) = (kh[d], kh[d + 1]);
+            kh[d] = k0 * cos - k1 * sin;
+            kh[d + 1] = k0 * sin + k1 * cos;
+        }
+    }
+}
+
+// ─── Full attention forward ───────────────────────────────────────────────
+
+/// Single-token full (self) attention forward: QKV proj, Q/K norms, RoPE,
+/// KV cache append, scaled dot-product attention, Q-gate, o_proj, residual.
+pub fn full_attention_forward(
+    wf: &WeightFile,
+    layer_idx: usize,
+    hidden: &mut [f32],
+    kv: &mut FullAttnCache,
+    pos: usize,
+    config: &ModelConfig,
+    gpu_wf: Option<&GpuWeightCtx>,
+    ctx: Option<&MetalContext>,
+) {
+    let hidden_dim = config.hidden_dim;
+    let num_attn_heads = config.num_attn_heads;
+    let num_kv_heads = config.num_kv_heads;
+    let head_dim = config.head_dim;
+    let rotary_dim = config.rotary_dim;
+    let rope_theta = config.rope_theta;
+
+    let q_proj_dim = num_attn_heads * head_dim * 2;
+    let q_dim = num_attn_heads * head_dim;
+    let kv_dim = num_kv_heads * head_dim;
+
+    // Input RMS norm
+    let norm_name = format!("model.layers.{}.input_layernorm.weight", layer_idx);
+    let nw = wf.get_tensor_u16(&norm_name);
+    let mut normed = vec![0.0f32; hidden_dim];
+    if let Some(nw) = nw {
+        let nw_f32: Vec<f32> = nw.iter().map(|&v| bf16_to_f32(v)).collect();
+        cpu_rms_norm(hidden, &nw_f32, &mut normed, hidden_dim, RMS_NORM_EPS);
+    } else {
+        normed.copy_from_slice(hidden);
+    }
+
+    // QKV projections (GPU)
+    let mut q_proj_out = vec![0.0f32; q_proj_dim];
+    let mut k = vec![0.0f32; kv_dim];
+    let mut v = vec![0.0f32; kv_dim];
+    if let (Some(gw), Some(c)) = (gpu_wf, ctx) {
+        let x_buf = metal_buf_shared(&c.device, hidden_dim * 4);
+        unsafe { let dst = x_buf.contents() as *mut f32; std::ptr::copy_nonoverlapping(normed.as_ptr(), dst, hidden_dim); }
+        let qbuf = metal_buf_shared(&c.device, q_proj_dim * 4);
+        let kbuf = metal_buf_shared(&c.device, kv_dim * 4);
+        let vbuf = metal_buf_shared(&c.device, kv_dim * 4);
+        let cm = c.queue.new_command_buffer();
+        let enc = cm.new_compute_command_encoder();
+        let q_name = format!("model.layers.{}.self_attn.q_proj", layer_idx);
+        let k_name = format!("model.layers.{}.self_attn.k_proj", layer_idx);
+        let v_name = format!("model.layers.{}.self_attn.v_proj", layer_idx);
+        gw.encode_matvec_into(wf, c, &enc, &q_name, &x_buf, 0, &qbuf, 0, q_proj_dim, hidden_dim);
+        gw.encode_matvec_into(wf, c, &enc, &k_name, &x_buf, 0, &kbuf, 0, kv_dim, hidden_dim);
+        gw.encode_matvec_into(wf, c, &enc, &v_name, &x_buf, 0, &vbuf, 0, kv_dim, hidden_dim);
+        enc.end_encoding(); cm.commit(); cm.wait_until_completed();
+        unsafe {
+            std::ptr::copy_nonoverlapping(qbuf.contents() as *const f32, q_proj_out.as_mut_ptr(), q_proj_dim);
+            std::ptr::copy_nonoverlapping(kbuf.contents() as *const f32, k.as_mut_ptr(), kv_dim);
+            std::ptr::copy_nonoverlapping(vbuf.contents() as *const f32, v.as_mut_ptr(), kv_dim);
+        }
+    }
+
+    // Split Q and Q-gate from concatenated output
+    let mut q = vec![0.0f32; q_dim];
+    let mut q_gate = vec![0.0f32; q_dim];
+    for h in 0..num_attn_heads {
+        let src = &q_proj_out[h * 2 * head_dim..];
+        q[h * head_dim..h * head_dim + head_dim].copy_from_slice(&src[..head_dim]);
+        q_gate[h * head_dim..h * head_dim + head_dim].copy_from_slice(&src[head_dim..2 * head_dim]);
+    }
+
+    // Q/K norms
+    let qn_name = format!("model.layers.{}.self_attn.q_norm.weight", layer_idx);
+    let kn_name = format!("model.layers.{}.self_attn.k_norm.weight", layer_idx);
+    if let Some(qnw) = wf.get_tensor_u16(&qn_name) {
+        for h in 0..num_attn_heads {
+            let qh = &mut q[h * head_dim..];
+            let sum_sq: f32 = qh.iter().map(|&x| x * x).sum();
+            let inv_rms = 1.0 / (sum_sq / head_dim as f32 + RMS_NORM_EPS).sqrt();
+            for i in 0..qh.len().min(qnw.len()) { qh[i] = qh[i] * inv_rms * bf16_to_f32(qnw[i]); }
+        }
+    }
+    if let Some(knw) = wf.get_tensor_u16(&kn_name) {
+        for h in 0..num_kv_heads {
+            let kh = &mut k[h * head_dim..];
+            let sum_sq: f32 = kh.iter().map(|&x| x * x).sum();
+            let inv_rms = 1.0 / (sum_sq / head_dim as f32 + RMS_NORM_EPS).sqrt();
+            for i in 0..kh.len().min(knw.len()) { kh[i] = kh[i] * inv_rms * bf16_to_f32(knw[i]); }
+        }
+    }
+
+    // RoPE
+    apply_rope(&mut q, &mut k, pos, num_attn_heads, num_kv_heads, head_dim, rotary_dim, rope_theta);
+
+    // Append K, V to cache
+    let cache_pos = kv.len;
+    kv.k_cache[cache_pos * kv_dim..(cache_pos + 1) * kv_dim].copy_from_slice(&k);
+    kv.v_cache[cache_pos * kv_dim..(cache_pos + 1) * kv_dim].copy_from_slice(&v);
+    kv.len += 1;
+
+    // Scaled dot-product attention (CPU)
+    let heads_per_kv = num_attn_heads / num_kv_heads;
+    let scale = 1.0f32 / (head_dim as f32).sqrt();
+    let mut attn_out = vec![0.0f32; q_dim];
+    for h in 0..num_attn_heads {
+        let kv_h = h / heads_per_kv;
+        let qh = &q[h * head_dim..];
+        let seq_len = kv.len;
+        let mut scores = vec![0.0f32; seq_len];
+        for p in 0..seq_len {
+            let kp = &kv.k_cache[p * kv_dim + kv_h * head_dim..];
+            scores[p] = qh.iter().zip(kp.iter()).map(|(&a, &b)| a * b).sum::<f32>() * scale;
+        }
+        let max_val = scores.iter().fold(f32::NEG_INFINITY, |a, &b| a.max(b));
+        let sum: f32 = scores.iter().map(|&s| (s - max_val).exp()).sum();
+        let inv_sum = 1.0 / sum;
+        let oh = &mut attn_out[h * head_dim..];
+        for p in 0..seq_len {
+            let weight = (scores[p] - max_val).exp() * inv_sum;
+            let vp = &kv.v_cache[p * kv_dim + kv_h * head_dim..];
+            for d in 0..head_dim { oh[d] += weight * vp[d]; }
+        }
+    }
+
+    // Q-gate (sigmoid)
+    for i in 0..q_dim { attn_out[i] *= 1.0f32 / (1.0f32 + (-q_gate[i]).exp()); }
+
+    // o_proj
+    let o_prefix = format!("model.layers.{}.self_attn.o_proj", layer_idx);
+    let mut o_out = vec![0.0f32; hidden_dim];
+    if let (Some(gw), Some(c)) = (gpu_wf, ctx) {
+        let attn_buf = metal_buf_shared(&c.device, q_dim * 4);
+        unsafe { let dst = attn_buf.contents() as *mut f32; std::ptr::copy_nonoverlapping(attn_out.as_ptr(), dst, q_dim); }
+        let out_buf = metal_buf_shared(&c.device, hidden_dim * 4);
+        let cm = c.queue.new_command_buffer();
+        let enc = cm.new_compute_command_encoder();
+        gw.encode_matvec_into(wf, c, &enc, &o_prefix, &attn_buf, 0, &out_buf, 0, hidden_dim, q_dim);
+        enc.end_encoding(); cm.commit(); cm.wait_until_completed();
+        unsafe { std::ptr::copy_nonoverlapping(out_buf.contents() as *const f32, o_out.as_mut_ptr(), hidden_dim); }
+    }
+
+    // Residual add
+    for i in 0..hidden_dim { hidden[i] += o_out[i]; }
 }
 
 // ─── Deferred expert results (CMD3 async dispatch) ─────────────────────────

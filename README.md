@@ -1,168 +1,125 @@
 # Flash-MoE
 
-Pure C/Metal inference engine for Mixture-of-Experts models on Apple Silicon. Streams expert weights from SSD on demand — no Python, no frameworks, just C, Objective-C, and hand-tuned Metal shaders.
+Pure C/Metal and Rust/Metal inference engine for Mixture-of-Experts models on Apple Silicon. Streams expert weights from SSD on demand — no Python ML frameworks, just C, Rust, and hand-tuned Metal shaders.
 
-Supports both `mlx-community/Qwen3.5-35B-A3B-4bit` and `mlx-community/Qwen3.6-35B-A3B-4bit` — identical architecture, same binary, just point `--model` at the right data directory.
+Supports both `mlx-community/Qwen3.5-35B-A3B-4bit` and `mlx-community/Qwen3.6-35B-A3B-4bit`.
 
-## Building from Scratch
-
-Start from the HuggingFace model and end with a running inference engine.
-
-### 1. Download
+## Quick Start (Python)
 
 ```bash
-# Install hf CLI if needed
-pip install huggingface_hub
+# Build Rust + Python bindings
+cd moe_infer_rs
+maturin develop --release --features python-bindings
 
-# Download the MLX 4-bit model (~19GB)
+# Run the example
+cd ..
+python example.py
+```
+
+## Rust Build
+
+### Prerequisites
+
+- macOS with Apple Silicon (M1/M2/M3/M4)
+- Rust toolchain (via [rustup](https://rustup.rs))
+- Xcode Command Line Tools (for Metal framework)
+
+### Prepare model data
+
+```bash
+# Download model into hub/
+pip install huggingface_hub
 hf download mlx-community/Qwen3.5-35B-A3B-4bit \
   --local-dir hub/models--mlx-community--Qwen3.5-35B-A3B-4bit
 
-# Or Qwen3.6
-hf download mlx-community/Qwen3.6-35B-A3B-4bit \
-  --local-dir hub/models--mlx-community--Qwen3.6-35B-A3B-4bit
+# Convert to Flash-MoE format → data/
+python helpers/convert.py \
+  --model hub/models--mlx-community--Qwen3.5-35B-A3B-4bit \
+  --output data
 ```
 
-### 2. Generate model data
-
-Extract tokenizer, non-expert weights, and repacked experts from the HF model into a data directory
+### Build and run
 
 ```bash
-# Set your model and data directory
-MODEL=hub/models--mlx-community--Qwen3.5-35B-A3B-4bit
-OUTPUT=output/models--mlx-community--Qwen3.5-35B-A3B-4bit
-
-# Tokenizer — vocab.bin + tokenizer.bin
-python helpers/export_tokenizer.py --model $MODEL --output $OUTPUT
-
-# Non-expert weights — model_weights.bin (~1.38 GB) + manifest
-python helpers/extract_weights.py --model $MODEL --output $OUTPUT
-
-# Expert weights — per-layer binaries (18.1 GB total, streamed from SSD)
-python helpers/repack_experts_4bit.py --model $MODEL --output $OUTPUT/packed_experts
+# Benchmark binary (pure Rust, no Python)
+cd moe_infer_rs
+cargo run --release --bin bench -- \
+  --model ../data/models--mlx-community--Qwen3.5-35B-A3B-4bit \
+  --tokens 500
 ```
 
-
-### 3. Compile
-
-Generate headers and build.
+### Python bindings
 
 ```bash
-# Model dimensions — src/model_config.h (same for Qwen3.5 and Qwen3.6)
-python helpers/gen_model_config.py --model $MODEL
+cd moe_infer_rs
 
-# Experiment knobs — src/config.h
-python helpers/gen_config.py --active_experts 8 --use_gpu_linear 1
+# Build and install into current Python environment
+maturin develop --release --features python-bindings
 
-# Optimization flags — src/optimization.h (all off by default)
-python helpers/gen_optimizations.py
-
-# Or enable specific flags
-python helpers/gen_optimizations.py --kv-bf16 --heap-topk
-
-# Build
-make
+# Python usage
+python -c "
+from moe_infer import Context, Cache
+ctx = Context()
+ctx.load_model('data/models--mlx-community--Qwen3.5-35B-A3B-4bit')
+cache = ctx.new_cache()
+# ... feed input_ids via ctx.forward(...) or ctx.generate(...)
+"
 ```
 
-Run `python autotune.py` later to sweep configs and find the best values.
-
-## Running
+### Rust server
 
 ```bash
-# One-shot inference (use --model to pick which model)
-./bin/infer --model $OUTPUT --prompt "Explain quantum computing" --tokens 100
-
-# HTTP server + chat client
-./bin/infer --model $OUTPUT --serve 8080 &
-python helpers/chat.py --port 8080
-
-# Per-layer timing breakdown
-./bin/infer --model $OUTPUT --prompt "Hello" --tokens 20 --timing
+cd moe_infer_rs
+cargo run --release -- --model ../data/models--mlx-community--Qwen3.5-35B-A3B-4bit --serve 8080
 ```
 
-## Project Structure
-
-```
-src/
-  main.m                # Entry point: CLI parsing, inference loop (~620 lines)
-  util.h                # System includes, timing, bf16, globals, cache telemetry
-  tensors.h             # Tensor manifest, JSON parsing, weight file mmap/loading
-  vocab.h               # Vocabulary loading, token decoding, prompt tokens, BPE tokenizer
-  cpu_kernels.h         # CPU dequant matvec, RMS norm, SwiGLU, softmax, top-K, conv1d
-  metal_setup.h         # Metal device/queue/pipeline setup, buffer allocation
-  gpu_ops.h             # GPU batched matvec, expert forward, RoPE, encode/dispatch
-  attention.h           # KV cache, linear attn state, full & linear attention (CPU+GPU)
-  moe_forward.h         # MoE routing + expert computation + shared expert
-  embeddings.h          # Embedding lookup, lm_head forward
-  expert_io.h           # Parallel pread I/O pool, LRU cache, malloc cache, prefetch
-  layer_forward.h       # Layer weight cache, deferred expert state, fused_layer_forward
-  server.h              # Frequency analysis, HTTP server, SSE streaming, chat mode
-  shaders.metal         # Metal compute kernels (dequant, norms, attention, combine)
-  model_config.h        # Model dimensions (generated)
-  config.h              # Experiment knobs (generated)
-  optimization.h        # Optimization feature flags (generated)
-  flag.h                # Single include hub for all config headers
-  tokenizer.h           # C BPE tokenizer
-helpers/
-  gen_model_config.py     # Generate model_config.h from HF config.json
-  export_tokenizer.py     # Generate vocab.bin and tokenizer.bin from HF model
-  extract_weights.py      # Non-expert weights → data/model_weights.bin
-  repack_experts_4bit.py  # MLX 4-bit experts → packed_experts/
-  repack_experts_2bit.py  # 4-bit → 2-bit requantization
-  gen_config.py           # Generate config.h with experiment values
-  gen_optimizations.py    # Generate optimization.h with feature flags
-  chat.py                # Interactive chat client (connect to infer --serve)
-autotune.py            # Sweep experiment configs, find optimal 4-bit setup
-Makefile               # Build system
-data/                  # Weights, vocab, tokenizer (generated, gitignored)
-bin/                   # Build output (gitignored)
-```
-
-## Experiment System
-
-All experiment knobs are **compile-time** — no runtime overhead from conditionals.
-
-`src/config.h` (generated by `helpers/gen_config.py`):
-
-| Define | Values | Description |
-|--------|--------|-------------|
-| `NUM_ACTIVE_EXPERTS` | 2, 4, 8 | Active experts per layer |
-| `EXPERT_CACHE_MODE` | 0, 1 | 0 = OS page cache, 1 = malloc cache |
-| `EXPERT_CACHE_ENTRIES` | 0..N | Malloc cache entries (mode 1 only) |
-| `USE_GPU_LINEAR` | 0, 1 | 1 = fused GPU delta-net, 0 = CPU BLAS |
-| `USE_EXPERT_PREDICTION` | 0, 1 | Temporal expert prediction |
-| `MALLOC_WEIGHTS` | 0, 1 | 1 = malloc+read weights, 0 = mmap |
+## C Build (baseline)
 
 ```bash
-# Manual: set config, rebuild, run
-python helpers/gen_config.py --active_experts 4
-make && ./bin/infer --prompt "Hello" --tokens 20
-
-# Autotune: sweep configs, find the best 4-bit setup
-python autotune.py
+cd moe_infer_c
+python3 patch_bench.py
+clang -O2 -Wall -fobjc-arc -framework Metal -framework Foundation \
+      -framework Accelerate bench.m -lpthread -lcompression -o bench
+./bench --prompt "bench" --tokens 500 --k 8
 ```
 
-## Optimization Flags
+## Python API
 
-All optimizations are gated by `#if USE_*` flags in `src/optimization.h` (generated by `helpers/gen_optimizations.py`). Each flag toggles independently — set to 1 to enable, 0 to disable. `#else` branches contain verbatim original code so disabling all flags produces the unoptimized baseline.
+```python
+from moe_infer import Context, Cache
+import numpy as np
 
-| Flag | Description |
-|------|-------------|
-| `USE_KV_CACHE_BF16` | Halve KV cache memory bandwidth (float→bf16) |
-| `USE_FUSED_RMS_NORM` | Single-dispatch fused RMS norm kernel |
-| `USE_EVENT_PIPELINE` | Non-blocking GPU completion via MTLSharedEvent |
-| `USE_CPU_DEQUANT_FMA` | FMA-optimized CPU dequant fallback |
-| `USE_HEAP_TOPK` | O(dim × log K) min-heap vs O(dim × K) sort |
+ctx = Context()
 
-```bash
-# All off (default)
-python helpers/gen_optimizations.py
+# Load model (pipeline_mode: "CpuOnly", "Gpu", "Fused2", "Fused3")
+ctx.load_model("/path/to/model", pipeline_mode="Fused3")
 
-# Enable specific flags
-python helpers/gen_optimizations.py --kv-bf16 --heap-topk
+# Create cache (holds KV cache + linear attention states)
+cache = ctx.new_cache()
 
-# Enable all
-python helpers/gen_optimizations.py --all
+# Forward pass: input_ids is the FULL conversation
+# Only new tokens (cache.pos onwards) are processed
+input_ids = np.array([1, 2, 3, ...], dtype=np.int64)
+logits = ctx.forward(input_ids, cache)  # shape: [n_tokens, vocab_size]
+
+# Generate with sampling
+new_ids = ctx.generate(input_ids, cache,
+    max_tokens=256,
+    temperature=0.7, top_k=50, top_p=0.9,
+    eos_token_ids=np.array([248046, 248044], dtype=np.int64))
+
+# Streaming generate — returns list of (token_id, logits) tuples
+results = ctx.stream_generate(input_ids, cache, max_tokens=256)
+
+# Telemetry from last call
+info = ctx.telemetry()
+# {"prefill_ms": 123.4, "total_ms": 567.8, "tokens_generated": 50, "tokens_per_sec": 88.0}
+
+# Reset for new conversation
+cache.reset()
+
+# Cleanup
+ctx.unload_model()
 ```
 
 ## Architecture
@@ -171,24 +128,52 @@ python helpers/gen_optimizations.py --all
 
 ### Key Techniques
 
-1. **SSD Expert Streaming** — Expert weights (37GB 4-bit) read from NVMe SSD on demand via parallel `pread()`. Only K active experts per layer are loaded (~1.77MB each). The OS page cache handles caching — no custom cache needed.
+1. **SSD Expert Streaming** — Expert weights (~19GB 4-bit) read from SSD on demand via parallel `pread()`. Only K active experts per layer are loaded (~1.77MB each).
 
-2. **FMA-Optimized Dequant Kernel** — Rearranges `(nibble * scale + bias) * x` to `fma(nibble, scale*x, bias*x)`, letting the GPU fused multiply-add unit do dequant+multiply in one instruction. 12% faster than naive formulation.
+2. **Metal Compute Shaders** — 4-bit dequantized matvec, fused SwiGLU, RMS norm, batched attention, GPU RoPE, MoE combine + residual.
 
-3. **Metal Compute Shaders** — 4-bit dequantized matvec, fused SwiGLU, RMS norm, batched attention, GPU RoPE, MoE combine + residual.
+3. **Fused GPU Pipeline** — CMD1 (qkv/z/b/a + conv1d + SSM for linear attention), CMD2 (o_proj + residual + norm + gate), CMD3 (expert dispatch). Three sequential Metal dispatches per layer.
 
-4. **Accelerate BLAS for Linear Attention** — GatedDeltaNet recurrence uses `cblas_sgemv` for the 64-head state matrix update. 64% faster than scalar code.
+4. **FMA-Optimized Dequant** — Rearranges `(nibble * scale + bias) * x` to `fma(nibble, scale*x, bias*x)`, using GPU fused multiply-add in one instruction.
 
-5. **Trust the OS** — The OS page cache achieves ~71% hit rate naturally. Every custom caching approach (Metal LRU, malloc cache) was slower due to GPU memory pressure.
+## Project Structure
 
-## What We Did (35B Port)
+```
+moe_infer_c/          Original C vendor code (performance baseline)
+  infer.m             ~7000 line inference engine
+  bench.m             Generated benchmark binary
+  shaders.metal       Metal compute shaders
+  patch_bench.py      Generate bench.m from infer.m
 
-| Change | Result |
-|--------|--------|
-| Model-agnostic architecture | All dimensions from `model_config.h` (generated from HF `config.json`). Same engine runs 397B or 35B with zero code changes. |
-| Compile-time experiment system | Mandatory `config.h` with `#define` (no `#ifndef` guards). `gen_config.py` generates it, `autotune.py` sweeps it. No runtime branching overhead. |
-| Unified `--model` flag | Single CLI flag for all data paths. `--weights`, `--manifest`, `--vocab` removed. |
-| Malloc+read weight loading | Compile-time `MALLOC_WEIGHTS` option. Page-aligned allocation with `posix_memalign` → zero-copy Metal buffer. Always enabled in autotune. |
-| Python chat client | Replaced `chat.m` + `linenoise` (1500+ lines C) with `helpers/chat.py` (~100 lines). Connects via HTTP/SSE. |
-| Project cleanup | Deleted ~9000 lines, 21 files (`main.m`, `chat.m`, `linenoise`, `progress.py`, `train_predictor.py`, `CLAUDE.md`, etc.). |
-| Autotune script | `autotune.py` sweeps compile-time configs (GPU linear, expert prediction, malloc weights), builds, benchmarks, reports optimal setup. |
+moe_infer_rs/         Rust port
+  src/
+    main.rs           CLI + HTTP server entry point
+    bin/bench.rs      Pure Rust benchmark
+    gpu_forward.rs    Fused layer forward, linear/full attention, MoE routing
+    metal_context.rs  Metal init, pipeline creation, GPU weight buffer
+    kernels.rs        GPU kernel dispatch wrappers
+    expert.rs         Expert forward (CPU dequant matvec)
+    moe.rs            MoE routing + expert dispatch
+    full_forward.rs   Full model forward pass
+    weights.rs        Weight file mmap + tensor lookup
+    config.rs         JSON model config loading
+    quant.rs          bf16→f32, CPU dequant matvec, SwiGLU
+    tokenizer.rs      BPE tokenizer
+    server.rs         HTTP server + SSE streaming
+    python_bindings.rs PyO3 bindings (Context, Cache)
+    timer.rs          Wall-clock timing
+    lib.rs            Module declarations + re-exports
+  shaders/
+    shaders.metal     Metal compute shaders (embedded at compile time)
+  Cargo.toml
+
+helpers/
+  extract_weights.py       Non-expert weights → model_weights.bin
+  repack_experts_4bit.py   MLX 4-bit experts → packed_experts/
+  repack_experts_2bit.py   4-bit → 2-bit requantization
+  gen_model_config.py      Generate model_config.json from HF config.json
+  export_tokenizer.py      Generate vocab.bin and tokenizer.bin (C path)
+
+example.py            Python example using PyO3 bindings
+pyproject.toml        Maturin build configuration
+```

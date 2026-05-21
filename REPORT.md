@@ -25,11 +25,8 @@ The original vendor C code lives in `moe_infer_c/` (patched for the 35B model) a
 
 ## Gaps vs C Code
 
-### 1. bench.rs doesn't use the fused GPU path
-`gpu_forward.rs` has `linear_attention_forward()` and `moe_layer_forward()` with the fused CMD1/CMD2/CMD3 architecture. But `src/bin/bench.rs` has inline copies of CPU attention functions that dispatch individual GPU matvecs per projection (one command buffer per matmul). Wiring the fused path would:
-- Reduce prefill time (fewer command buffer commits)
-- Fix output divergence (C and Rust produce different token sequences)
-- Potentially increase generation speed
+### 1. Fused3 pipeline implemented ✓
+`gpu_forward.rs` has `linear_attention_forward()` and `moe_layer_forward()` with fused CMD1/CMD2/CMD3 architecture matching the C engine. The `PipelineMode::Fused3` flag enables this path. `bench.rs` wired to use `Fused3`.
 
 ### 2. No CMD3 async expert dispatch
 In C, CMD3 dispatches all K experts and commits without waiting — results are collected in the *next* layer. In Rust, experts are dispatched synchronously. The `DeferredExperts` struct is a placeholder. To implement:
@@ -40,11 +37,15 @@ In C, CMD3 dispatches all K experts and commits without waiting — results are 
 ### 3. No GPU-side combine (`moe_combine_residual`)
 The kernel exists in shaders and the pipeline is created, but expert outputs are accumulated on CPU. Using GPU-side combine eliminates CPU↔GPU round-trips.
 
-### 4. No `PipelineMode` enum
-The forward functions always try GPU paths and fall back to CPU. There's no way to force CPU-only mode for debugging/comparison. An explicit `PipelineMode` enum (CpuOnly, Gpu, Fused) would allow:
-- CPU-only benchmark to measure pure CPU speed
-- Direct comparison of fused vs unfused GPU paths
-- Easier debugging (CPU path is deterministic, GPU may have driver variance)
+### 4. PipelineMode enum added ✓
+`PipelineMode` enum (CpuOnly, Gpu, Fused2, Fused3) added to `gpu_forward.rs`. All forward functions accept `mode: PipelineMode`. `Fused3` matches the C engine architecture.
+
+### 5. PyO3 Python bindings added ✓
+Rust inference engine exposed via PyO3 + Maturin:
+- `Context` class: `load_model(path, pipeline_mode)`, `unload_model()`, `new_cache()`, `forward()`, `generate()`, `stream_generate()`
+- `Cache` class: `pos` getter, `reset()`
+- Build: `cd moe_infer_rs && maturin develop --release --features python-bindings`
+- Example: `example.py` demonstrates prefill + generation + multi-turn
 
 ## Output Divergence
 
