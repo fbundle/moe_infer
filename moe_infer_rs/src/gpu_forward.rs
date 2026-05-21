@@ -255,12 +255,12 @@ pub struct FullAttnCmd2State {
 
 /// GPU/CPU state from linear attention CMD1 for Fused3 (matching C engine exactly).
 ///
-/// C does gated_norm on CPU after CMD1, then out_proj + residual + norm + gate
-/// in CMD2. This struct carries the gated attention output and pre-attention
-/// hidden state (h_mid) into moe_layer_forward's CMD2.
+/// C does gated_rms_norm on GPU in CMD1 (encoder L5 → batch_out[6]), then
+/// out_proj + residual + norm + gate in CMD2. This struct carries the GPU
+/// gated attention output and pre-attention hidden state into moe_layer_forward's CMD2.
 pub struct LinearAttnFused3State {
-    pub gated_out: Vec<f32>,       // gated_norm output (total_value floats, CPU)
-    pub h_mid: Vec<f32>,           // pre-attention hidden (hidden_dim floats)
+    pub gated_buf: Buffer,        // GPU buffer with gated_rms_norm output (total_value floats)
+    pub h_mid: Vec<f32>,          // pre-attention hidden (hidden_dim floats)
     pub total_value: usize,
     pub o_prefix: String,
     pub post_norm_name: String,
@@ -753,7 +753,7 @@ pub fn linear_attention_forward(
         && ctx.unwrap().buf_conv_output.is_some()
         && linear_idx < ctx.unwrap().buf_conv_state.len()
         && linear_idx < ctx.unwrap().buf_delta_state.len()
-        && ctx.unwrap().batch_out.len() >= 4;
+        && ctx.unwrap().batch_out.len() >= 8;
 
     if use_fused3_gpu {
         let c = ctx.unwrap();
@@ -839,42 +839,24 @@ pub fn linear_attention_forward(
             enc.end_encoding();
         }
 
-        // NO encoders 6-8 (gated_norm, out_proj, residual) — those go in CMD2
+        // Encoder 6: gated_rms_norm → batch_out[6] (matches C's CMD1 encoder L5)
+        {
+            let gnw_ptr = wf.get_tensor_ptr(&format!("{}.norm.weight", prefix));
+            let enc = cmd_buf.new_compute_command_encoder();
+            if let Some(gnw_p) = gnw_ptr {
+                let gnw_off = (gnw_p as usize - gw.base as usize) as u64;
+                kernels::encode_gated_rms_norm(c, &enc,
+                    c.buf_delta_output.as_ref().unwrap(),
+                    &c.batch_out[1],
+                    &gw.buf, gnw_off,
+                    &c.batch_out[6],
+                    num_v_heads as u32, value_dim as u32);
+            }
+            enc.end_encoding();
+        }
 
         cmd_buf.commit();
         cmd_buf.wait_until_completed();
-
-        // Read back SSM output and z for CPU gated_norm (matching C's CPU-side _precise_swiglu)
-        let mut ssm_out = vec![0.0f32; total_value];
-        let mut z_cpu = vec![0.0f32; total_value];
-        unsafe {
-            std::ptr::copy_nonoverlapping(
-                c.buf_delta_output.as_ref().unwrap().contents() as *const f32,
-                ssm_out.as_mut_ptr(), total_value);
-            std::ptr::copy_nonoverlapping(
-                c.batch_out[1].contents() as *const f32,
-                z_cpu.as_mut_ptr(), total_value);
-        }
-
-        // CPU gated_norm: sigmoid(z) * rms_norm(ssm_out)
-        let gnw = wf.get_tensor_u16(&format!("{}.norm.weight", prefix));
-        let gnw_f32: Vec<f32> = gnw.map_or(vec![1.0f32; value_dim], |w| w.iter().map(|&v| bf16_to_f32(v)).collect());
-        for hv in 0..num_v_heads {
-            let v_start = hv * value_dim;
-            let v_end = v_start + value_dim;
-            // rms_norm
-            let sum_sq: f32 = ssm_out[v_start..v_end].iter().map(|&x| x * x).sum();
-            let inv_rms = 1.0 / (sum_sq / value_dim as f32 + RMS_NORM_EPS).sqrt();
-            for i in 0..value_dim {
-                ssm_out[v_start + i] = ssm_out[v_start + i] * inv_rms * gnw_f32[i];
-            }
-            // silu gate: silu(z) * rms_norm(x) = z * sigmoid(z) * rms_norm(x)
-            for i in 0..value_dim {
-                let z_val = z_cpu[hv * value_dim + i];
-                let gate_i = z_val / (1.0 + (-z_val).exp());  // silu(z) = z * sigmoid(z)
-                ssm_out[v_start + i] *= gate_i;
-            }
-        }
 
         // Update CPU conv_state for consistency
         let state_off = (CONV_KERNEL_SIZE - 2) * qkv_dim;
@@ -882,7 +864,7 @@ pub fn linear_attention_forward(
         state.conv_state[state_off..state_off + qkv_dim].fill(0.0);
 
         return Some(LinearAttnFused3State {
-            gated_out: ssm_out,
+            gated_buf: c.batch_out[6].clone(),
             h_mid: residual,  // pre-attention hidden (saved before norm)
             total_value,
             o_prefix: format!("{}.out_proj", prefix),
@@ -1360,11 +1342,10 @@ pub fn moe_layer_forward(
         let gw = gpu_wf.unwrap();
         let la = lin_attn.unwrap();
 
-        // Upload gated_out and h_mid to GPU
-        let gated_buf = metal_buf_shared(&c.device, la.total_value * 4);
+        // Gated buffer already on GPU from CMD1 L5 — no upload needed (matches C: batch_out[6])
+        let gated_buf = &la.gated_buf;
         let hmid_buf = metal_buf_shared(&c.device, hidden_dim * 4);
         unsafe {
-            std::ptr::copy_nonoverlapping(la.gated_out.as_ptr(), gated_buf.contents() as *mut f32, la.total_value);
             std::ptr::copy_nonoverlapping(la.h_mid.as_ptr(), hmid_buf.contents() as *mut f32, hidden_dim);
         }
 
@@ -1380,8 +1361,8 @@ pub fn moe_layer_forward(
         let cmd_buf = c.queue.new_command_buffer();
         let enc = cmd_buf.new_compute_command_encoder();
 
-        // Step 1: out_proj (gated_out → hidden_dim)
-        gw.encode_matvec_into(wf, c, &enc, &la.o_prefix, &gated_buf, 0, &o_proj_buf, 0, hidden_dim, la.total_value);
+        // Step 1: out_proj (gated_out → hidden_dim) — reads directly from GPU buffer
+        gw.encode_matvec_into(wf, c, &enc, &la.o_prefix, gated_buf, 0, &o_proj_buf, 0, hidden_dim, la.total_value);
 
         // Step 2: residual_add (o_proj_out + h_mid → temp_buf)
         {

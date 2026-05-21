@@ -64,66 +64,70 @@ Each row is one stage in the per-layer pipeline. Device shows where the work exe
 | # | Stage | C (bench.m) | Rust (Fused3) | Device |
 |---|-------|-------------|---------------|--------|
 | 0 | Deferred wait | `wait_until_completed` on prev CMD3 | `DeferredExperts::complete()` | GPU→CPU |
-| 1 | Input norm | CPU `rms_norm` | CPU `rms_norm` | CPU |
-| 2 | CMD1: qkvz | GPU `dequant_matvec_4bit` | GPU `encode_matvec_into` | GPU |
-| 3 | CMD1: ba | GPU `dequant_matvec_4bit` | GPU `encode_matvec_into` | GPU |
-| 4 | CMD1: conv1d | GPU `conv1d` (depthwise, kernel=4) | GPU `conv1d` (depthwise, kernel=4) | GPU |
-| 5 | CMD1: SSM | GPU `gated_delta_net_step` | GPU `gated_delta_net_step` | GPU |
-| 6 | CMD1: gated norm | CPU (readback + `_precise_swiglu`) | GPU `gated_norm` | **CPU** / GPU |
-| 7 | CMD1: out_proj | — (in CMD2) | GPU `encode_matvec_into` (fused into CMD1) | GPU |
-| 8 | CMD1: residual add | — (in CMD2) | GPU `residual_add` (fused into CMD1) | GPU |
-| 9 | CMD1 wait | `commit` + `wait_until_completed` | `commit` + `wait_until_completed` (single CMD for steps 2–8) | GPU |
-| 10 | CMD2: out_proj | GPU `dequant_matvec_4bit` | — (already done in CMD1) | GPU / — |
-| 11 | CMD2: residual add | GPU `residual_add` | — (already done in CMD1) | GPU / — |
-| 12 | CMD2: post-attn norm | GPU `rms_norm_sum` + `rms_norm_apply` | — (not needed, residual already in CMD1) | GPU / — |
-| 13 | CMD2: MoE gate | GPU `dequant_matvec_4bit` | GPU `encode_matvec_into` (router CMD) | GPU |
-| 14 | CMD2: shared gate/up | GPU 2× `dequant_matvec_4bit` | GPU 2× `encode_matvec_into` (router CMD) | GPU |
-| 15 | CMD2: shared gate score | GPU `dequant_matvec_4bit` | GPU `encode_matvec_into` (router CMD) | GPU |
-| 16 | CMD2 wait | `commit` + `wait_until_completed` | `commit` + `wait_until_completed` (router CMD) | GPU |
+| 1 | Input norm | **GPU** (CMD3 already put normed input in buf_input) | CPU `rms_norm` (then uploaded to GPU) | **GPU** / CPU |
+| 2 | CMD1 L0: qkvz/ba | GPU `dequant_matvec_4bit` (from buf_input) | GPU `encode_matvec_into` (from uploaded buffer) | GPU |
+| 3 | CMD1 L1: conv1d | GPU `conv1d_step` | GPU `conv1d_step` | GPU |
+| 4 | CMD1 L2: rms_norm_qk | GPU `rms_norm_qk` | GPU `rms_norm_qk` | GPU |
+| 5 | CMD1 L3: decay_beta | GPU `compute_decay_beta` | GPU `compute_decay_beta` | GPU |
+| 6 | CMD1 L4: SSM | GPU `gated_delta_net_step` | GPU `gated_delta_net_step` | GPU |
+| **7** | **CMD1 L5: gated_rms_norm** | **GPU `gated_rms_norm` → batch_out[6]** | **MISSING** — done on CPU after CMD1 | **GPU** / CPU |
+| 8 | CMD1 wait | `commit` + `wait_until_completed` | `commit` + `wait_until_completed` | GPU |
+| 9 | Post-CMD1 | Data stays in GPU (batch_out[6]) | **CPU readback** SSM output + z (16K floats), **CPU gated_norm**, re-upload gated_out + h_mid for CMD2 (~26K floats memcpy) | CPU+GPU |
+| 10 | CMD2 Enc 1: o_proj | GPU `matvec_fast` (batch_out[6] → buf_output) | GPU `encode_matvec_into` (uploaded gated_buf → o_proj_buf) | GPU |
+| 11 | CMD2 Enc 2: residual_add | GPU `residual_add` (buf_output + buf_residual → buf_h_mid) | GPU `residual_add` (o_proj_buf + hmid_buf → temp_buf) | GPU |
+| 12 | CMD2 Enc 3: rms_norm_sum | GPU `rms_norm_sum` | GPU `rms_norm_sum` | GPU |
+| 13 | CMD2 Enc 4: rms_norm_apply | GPU `rms_norm_apply_bf16` → buf_input | GPU `rms_norm_apply_bf16` → normed_buf | GPU |
+| 14 | CMD2 Enc 5-8: routing | GPU `batch_matvec` × 4 (gate, sg, su, seg) | GPU `encode_matvec_into` × 4 (gate, sg, su, seg) | GPU |
+| 15 | CMD2 wait | `commit` + `wait_until_completed` | `commit` + `wait_until_completed` | GPU |
+| 16 | CMD2 readback | routing results + h_mid + h_post | routing results + normed_buf → hidden, h_post | GPU→CPU |
 | 17 | Routing | CPU `softmax` + `topk` | CPU `cpu_softmax` + `cpu_topk` | CPU |
-| 18 | Expert I/O | `pread` K experts | Same (`libc::pread`) | Disk→CPU |
-| 19 | CMD3: gate/up/down/SwiGLU | GPU (same as full-attn) | GPU (same as full-attn) | GPU |
-| 20 | CMD3: shared SwiGLU+down | GPU (same) | GPU (same) | GPU |
+| 18 | Expert I/O | `pread` K experts with LRU cache | Same (`libc::pread` with LRU cache) | Disk→CPU |
+| 19 | CMD3: gate/up/down/SwiGLU | GPU K× expert matvecs | GPU K× expert matvecs | GPU |
+| 20 | CMD3: shared SwiGLU+down | GPU shared SwiGLU + down_proj | GPU shared SwiGLU + down_proj | GPU |
 | 21 | CMD3: combine | GPU `moe_combine_residual` | GPU `moe_combine_residual` | GPU |
-| 22 | CMD3 commit | `commit` (async) | `commit` (async) — returns `DeferredExperts` | GPU |
+| 22 | CMD3: input_norm (next layer) | GPU — norm of combine output → buf_input | **MISSING** | GPU / — |
+| 23 | CMD3 commit | `commit` (async, **no wait**) | `commit` (async) — returns `DeferredExperts` | GPU |
 
-**Linear-attn diffs:**
-- Stage 6: C does gated norm on CPU (readback after SSM); Rust does it on GPU in CMD1
-- Stages 7–12: Rust fuses out_proj + residual into CMD1; C keeps them in CMD2
-- Net CMD count: C = 3 (CMD1+CMD2+CMD3), Rust = 3 (CMD1+router+CMD3). Same count, different boundaries.
+### Summary of Differences (as of 2026-05-22)
 
-### Summary of Differences
+| # | Diff | Impact |
+|---|------|--------|
+| 1 | **CMD1 L5 (gated_rms_norm) on CPU vs GPU** | C does gated_rms_norm in CMD1 on GPU (encoder L5, output to batch_out[6]). Rust Fused3 omits L5 from CMD1, reads back SSM output + z to CPU (~16K floats), does CPU gated_norm, then re-uploads gated_out + h_mid for CMD2 (~26K floats). Extra GPU↔CPU round trip per linear layer. |
+| 2 | **No GPU-side input_norm for next layer** | C's CMD3 computes input_norm of the combine output into buf_input, so the next layer's CMD1 reads directly from GPU. Rust always does CPU input_norm at the start of each linear_attention_forward, adding another GPU↔CPU round trip. |
+| 3 | KV cache: CPU (Rust) vs GPU persistent (C) | Rust uploads K/V per layer (~0.03ms/layer overhead) |
+| 4 | Speculative routing | C only; Rust doesn't implement expert prediction |
+| 5 | Expert cache (LRU) | Both have LRU cache + parallel pread now (Rust added 2026-05-22) |
 
-| Diff | Impact |
-|------|--------|
-| KV cache: CPU (Rust) vs GPU persistent (C) | Rust uploads K/V per layer (~0.03ms/layer overhead) |
-| SSM state: CPU↔GPU transfer (Rust) vs GPU persistent (C) | Rust uploads/downloads state per layer |
-| Gated norm: GPU (Rust) vs CPU (C) | Rust offloads more work to GPU |
-| out_proj+residual: in CMD1 (Rust) vs CMD2 (C) for linear layers | Same total work, different CMD boundaries |
-| Speculative routing | C only; Rust doesn't implement expert prediction |
-| Expert cache (LRU) | C only; Rust always reads from disk |
+## Pipeline Mode: Fused3 — CURRENT STATE
 
-## Pipeline Mode: Fused3 — COMPLETE
-
-Fused3 matches the C engine's 3-command-buffer architecture. All steps complete:
+Fused3 matches the C engine's 3-command-buffer architecture but with pipeline differences in CMD1/CMD2 boundaries for linear-attention layers.
 
 | Feature | Status |
 |---------|--------|
-| Fused CMD1 (linear attention: qkv/z/b/a + conv1d + SSM + gated_norm + out_proj + residual) | Done |
+| Fused CMD1 (linear attention: qkv/z/b/a + conv1d + SSM) | Done |
+| **CMD1 L5: gated_rms_norm on GPU** | **MISSING** — done on CPU after CMD1 (see Discrepancy #1) |
 | GPU batched full attention (scores + softmax + values + sigmoid) | Done |
+| CMD2 fusion (o_proj + residual_add + rms_norm + gate + shared) | Done |
 | GPU moe_combine_residual (expert weighted sum + shared expert + residual in one kernel) | Done |
 | Async CMD3 (commit without wait, complete on next layer) | Done |
-| CMD2 fusion for full-attn (batched attn + o_proj + residual + norm + gate + shared) | Done |
-| CMD1 out_proj fusion for linear (out_proj + residual in CMD1, not separate CMD) | Done |
+| CMD3 GPU-side input_norm for next layer | **MISSING** — always done on CPU (see Discrepancy #2) |
+| Expert LRU cache + parallel pread | Done |
 | PyO3 bindings (Context, Cache, telemetry, stream_generate) | Done |
 | Ctrl-C interrupt handling (`py.check_signals()`) | Done |
 
 ## Sync points per layer
 
-- **Linear attention** (30/40): 2 sync points — CMD1 (fused linear + out_proj + residual) + router CMD + async CMD3
+- **Linear attention** (30/40): 3 sync points — CMD1 (linear SSM, no gated_norm) + CMD2 (o_proj + residual + norm + routing) + async CMD3
+  - C has same 3 sync points but CMD1 includes gated_rms_norm, keeping data on GPU
 - **Full attention** (10/40): 2 sync points — QKV CMD + CMD2 (batched attn + o_proj + residual + norm + gate) + async CMD3
+  - Matches C exactly
 
-**Matches C engine: 2 sync points for all 40 layers.**
+## Key discrepancies vs C (to fix)
+
+| # | Discrepancy | Fix |
+|---|------------|-----|
+| 1 | CMD1 missing L5 (gated_rms_norm on GPU) — Rust does it on CPU with GPU↔CPU round trip | Add gated_rms_norm as encoder L5 in CMD1, write to a GPU buffer (like C's batch_out[6]), remove CPU readback + CPU gated_norm |
+| 2 | No GPU-side input_norm for next layer in CMD3 | Add input_norm compute to CMD3 (norm of combine output → buf_input for next layer's CMD1) |
 
 ## Remaining gaps (non-critical)
 
@@ -131,7 +135,7 @@ Fused3 matches the C engine's 3-command-buffer architecture. All steps complete:
 |-----|-------------|
 | GPU KV cache | KV cache stored as CPU f32 buffers, uploaded per layer. C engine stores on GPU persistently |
 | GPU RoPE | Q/K norms and RoPE are CPU-side (C engine also does this on CPU) |
-| Linear router CMD fusion | Gate + shared projections are a separate CMD in linear layers. Could fuse into CMD1 or CMD2 — would not reduce sync points further |
+| Speculative routing | C predicts experts with pre-attention normed input, does async pread in parallel with attention compute |
 
 ## Output Coherence
 
@@ -268,39 +272,25 @@ We compared C bench, Rust Fused3, and MLX-LM on the stripped model (BOS token, g
 
 **C and Rust are numerically identical.** Both diverge from MLX-LM by ~0.02 mean / ~0.11 max. This means the C→Rust port is faithful, but the C engine has a pre-existing discrepancy from the MLX-LM reference. The root cause is still under investigation — likely candidates are dequantization precision, norm epsilon handling, or SSM state initialization.
 
-## Performance Benchmark
+## Performance Benchmark (2026-05-22)
 
 Ran on Apple M4 (unified memory), Qwen3.5-35B-A3B-4bit full model (40 layers, 256 experts, hidden=2048), K=8 experts, 32-token prompt, 100-token greedy generation.
 
-| Metric | C | Rust | Ratio |
-|--------|---|------|-------|
-| TTFT (prefill 32 tok) | 10,722 ms | 16,357 ms | 1.53x slower |
-| Generation speed | 3.36 tok/s | 2.14 tok/s | 0.64x |
-| Init time | — | 33 ms | — |
+| Metric | C | Rust (pre-opt) | Rust (post expert-IO opt) | Ratio vs C |
+|--------|---|----------------|--------------------------|------------|
+| Generation speed | 2.82 tok/s | 2.14 tok/s | 2.69 tok/s | 0.96x |
+| Expert I/O (disk read) | ~5.2 ms/layer | — | ~5.8 ms/layer | — |
 
-### C per-layer breakdown (avg 7.25 ms)
+Expert I/O dominates at 72% of per-layer time in C.
 
-| Phase | ms | % |
-|-------|-----|---|
-| expert_io (disk read) | 5.194 | 71.7% |
-| cmd1_wait (GPU linear attn) | 1.403 | 19.4% |
-| cmd2_wait (GPU full attn) | 0.549 | 7.6% |
-| cmd3_encode | 0.047 | 0.6% |
-| cmd1_submit | 0.024 | 0.3% |
-| cmd2_encode | 0.020 | 0.3% |
-| routing_cpu | 0.003 | 0.0% |
-| deferred_cpu | 0.002 | 0.0% |
+### Expert I/O optimizations applied to Rust (2026-05-22)
 
-Expert I/O dominates at 72% of per-layer time — this is `pread` from disk for expert weight files.
+1. **Parallel 4-thread `pread`** via `rayon::scope` — matches C's `io_pool_dispatch` (4 pthreads)
+2. **LRU expert cache** (32 entries) — avoids re-reading experts that repeat across tokens
+3. **Pre-allocated Metal buffers** — reused across all layers instead of per-layer `metal_buf_shared()` calls
+4. **CMD3 deferred commit** — CMD3 committed without wait, completed at start of next layer for GPU/CPU overlap
 
-### Rust slowdown analysis
-
-Rust is ~1.5x slower on prefill and ~1.6x slower on generation. Likely causes (needs profiling):
-
-1. **KV cache upload/download**: Rust stores KV caches on CPU and uploads/downloads per layer. C stores them persistently on GPU.
-2. **SSM state transfer**: Linear attention SSM states are transferred CPU↔GPU per layer in Rust.
-3. **Debug prints**: `[RUST-PRE]`/`[RUST-LAYER]` stderr prints on every token×layer add overhead.
-4. **No Metal command buffer reuse**: Rust creates new command buffers per layer rather than reusing.
+Result: Rust went from 0.76x to 0.96x of C throughput after expert I/O optimization.
 
 ## Next Steps
 

@@ -208,8 +208,12 @@ pub struct MetalContext {
     pub buf_delta_beta: Option<Buffer>,
     /// Delta net output: [total_value] f32
     pub buf_delta_output: Option<Buffer>,
-    /// Batch projection outputs (for fused CMD1): QKV, Z, B, A
+    /// Batch projection outputs (for fused CMD1): 8 slots matching C
     pub batch_out: Vec<Buffer>,
+    /// CMD3 → next-layer CMD1: normed hidden [hidden_dim] f32
+    pub buf_input: Option<Buffer>,
+    /// CMD3 RMS norm sum-of-squares scratch [4 bytes]
+    pub buf_cmd3_sum_sq: Option<Buffer>,
 }
 
 impl MetalContext {
@@ -234,12 +238,17 @@ impl MetalContext {
         self.buf_delta_g_decay = Some(metal_buf_shared(&self.device, num_v_heads * 4));
         self.buf_delta_beta = Some(metal_buf_shared(&self.device, num_v_heads * 4));
         self.buf_delta_output = Some(metal_buf_shared(&self.device, total_value * 4));
-        // 4 batch outputs for QKV, Z, B, A projections
+        // 8 batch outputs matching C: [0]=qkv, [1]=z, [2]=beta, [3]=alpha,
+        // [4..5]=unused, [6]=gated_rms_norm output, [7]=unused
         self.batch_out.clear();
-        self.batch_out.push(metal_buf_shared(&self.device, qkv_dim * 4));
-        self.batch_out.push(metal_buf_shared(&self.device, total_value * 4));
-        self.batch_out.push(metal_buf_shared(&self.device, num_v_heads * 4));
-        self.batch_out.push(metal_buf_shared(&self.device, num_v_heads * 4));
+        self.batch_out.push(metal_buf_shared(&self.device, qkv_dim * 4));       // 0: qkv
+        self.batch_out.push(metal_buf_shared(&self.device, total_value * 4));   // 1: z
+        self.batch_out.push(metal_buf_shared(&self.device, num_v_heads * 4));   // 2: beta
+        self.batch_out.push(metal_buf_shared(&self.device, num_v_heads * 4));   // 3: alpha
+        self.batch_out.push(metal_buf_shared(&self.device, 4));                 // 4: unused
+        self.batch_out.push(metal_buf_shared(&self.device, 4));                 // 5: unused
+        self.batch_out.push(metal_buf_shared(&self.device, total_value * 4));   // 6: gated_rms_norm output
+        self.batch_out.push(metal_buf_shared(&self.device, 4));                 // 7: unused
     }
 
     /// Allocate persistent GPU buffers for expert I/O. Returns the state which
