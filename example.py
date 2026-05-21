@@ -17,6 +17,15 @@ MAX_TOKENS = 100
 EOS_IDS = [248046, 248044]
 
 
+def print_telemetry(t, label=""):
+    """Print performance metrics from a telemetry dict."""
+    prefix = f"[{label}] " if label else ""
+    print(f"[telemetry] {prefix}prefill: {t['prefill_ms']:.0f} ms, "
+          f"total: {t['total_ms']:.0f} ms, "
+          f"tokens: {t['tokens_generated']}, "
+          f"speed: {t['tokens_per_sec']:.1f} tok/s")
+
+
 def main():
     # Load tokenizer from HF hub (has tokenizer_config.json with chat template)
     print(f"[example] Loading tokenizer from {HF_MODEL_PATH}")
@@ -40,8 +49,7 @@ def main():
     print(f"[example] Forward (prefill)...")
     ids_arr = np.array(input_ids, dtype=np.int64)
     logits = ctx.forward(ids_arr, cache)
-    t = ctx.telemetry()
-    print(f"[example] Prefill: {t['prefill_ms']:.0f} ms, logits shape={logits.shape}")
+    print_telemetry(ctx.telemetry(), "prefill")
 
     # First token
     first_token = int(np.argmax(logits[-1]))
@@ -54,9 +62,7 @@ def main():
                            temperature=0.0,  # greedy
                            top_k=1,
                            eos_token_ids=np.array(EOS_IDS, dtype=np.int64))
-    t = ctx.telemetry()
-    print(f"[example] Generated {t['tokens_generated']} tokens in {t['total_ms']:.0f} ms "
-          f"({t['tokens_per_sec']:.1f} tok/s)")
+    print_telemetry(ctx.telemetry(), "generate")
 
     # Decode
     output = tok.decode(new_ids.tolist())
@@ -79,6 +85,7 @@ def main():
                              temperature=0.7,  # creative
                              top_k=40, top_p=0.9,
                              eos_token_ids=np.array(EOS_IDS, dtype=np.int64))
+    print_telemetry(ctx.telemetry(), "multi-turn")
     print(f"[example] Follow-up reply: {tok.decode(new_reply.tolist())}")
 
     # Cleanup
