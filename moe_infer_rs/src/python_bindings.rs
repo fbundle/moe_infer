@@ -158,10 +158,15 @@ fn lm_head(
 
 fn process_token(m: &ModelState, hidden: &mut [f32], pos: usize,
     kv: &mut [Option<FullAttnCache>], lin: &mut [Option<LinearAttnState>],
-) {
+    py: Python<'_>,
+) -> PyResult<()> {
     let mut deferred: Option<DeferredExperts> = None;
     let mode = m.pipeline_mode;
     for layer in 0..m.config.num_layers {
+        // Check for Ctrl-C every 4 layers (each layer ~5-10ms)
+        if layer % 4 == 0 {
+            py.check_signals()?;
+        }
         let is_full = (layer + 1) % FULL_ATTN_INTERVAL == 0;
         if is_full {
             if let Some(ref mut kv) = kv[layer] {
@@ -186,6 +191,7 @@ fn process_token(m: &ModelState, hidden: &mut [f32], pos: usize,
     if let Some(ref mut def) = deferred {
         def.complete(hidden, m.config.hidden_dim);
     }
+    Ok(())
 }
 
 // ─── Sampling ───────────────────────────────────────────────────────────────
@@ -369,7 +375,7 @@ impl Context {
         let mut hidden = vec![0.0f32; hd];
         for (ti, _) in new_tokens.iter().enumerate() {
             hidden.copy_from_slice(&embed[ti * hd..(ti + 1) * hd]);
-            process_token(m, &mut hidden, cache.pos, &mut cache.kv, &mut cache.lin);
+            process_token(m, &mut hidden, cache.pos, &mut cache.kv, &mut cache.lin, py)?;
             cache.pos += 1;
             final_norm(&m.wf, &mut hidden, hd);
             lm_head(&m.wf, &hidden, &mut logits[(start + ti) * vs..(start + ti + 1) * vs], &m.gpu_wf, &m.ctx);
@@ -418,7 +424,7 @@ impl Context {
             if eos.contains(&next) { break; }
             output.push(next as i64);
             embed_lookup(&m.wf, next, &mut hidden, hd);
-            process_token(m, &mut hidden, cache.pos, &mut cache.kv, &mut cache.lin);
+            process_token(m, &mut hidden, cache.pos, &mut cache.kv, &mut cache.lin, py)?;
             cache.pos += 1;
             final_norm(&m.wf, &mut hidden, hd);
             logits.fill(0.0);
@@ -469,7 +475,7 @@ impl Context {
         for _ in 1..max_tokens {
             if eos.contains(&next) { break; }
             embed_lookup(&m.wf, next, &mut hidden, hd);
-            process_token(m, &mut hidden, cache.pos, &mut cache.kv, &mut cache.lin);
+            process_token(m, &mut hidden, cache.pos, &mut cache.kv, &mut cache.lin, py)?;
             cache.pos += 1;
             final_norm(&m.wf, &mut hidden, hd);
             logits.fill(0.0);
