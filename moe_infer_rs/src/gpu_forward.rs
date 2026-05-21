@@ -272,6 +272,7 @@ pub fn full_attention_forward(
     config: &ModelConfig,
     gpu_wf: Option<&GpuWeightCtx>,
     ctx: Option<&MetalContext>,
+    mode: PipelineMode,
 ) -> Option<FullAttnCmd2State> {
     let hidden_dim = config.hidden_dim;
     let num_attn_heads = config.num_attn_heads;
@@ -335,18 +336,18 @@ pub fn full_attention_forward(
     let kn_name = format!("model.layers.{}.self_attn.k_norm.weight", layer_idx);
     if let Some(qnw) = wf.get_tensor_u16(&qn_name) {
         for h in 0..num_attn_heads {
-            let qh = &mut q[h * head_dim..];
+            let qh = &mut q[h * head_dim..(h + 1) * head_dim];
             let sum_sq: f32 = qh.iter().map(|&x| x * x).sum();
             let inv_rms = 1.0 / (sum_sq / head_dim as f32 + RMS_NORM_EPS).sqrt();
-            for i in 0..qh.len().min(qnw.len()) { qh[i] = qh[i] * inv_rms * bf16_to_f32(qnw[i]); }
+            for i in 0..head_dim.min(qnw.len()) { qh[i] = qh[i] * inv_rms * bf16_to_f32(qnw[i]); }
         }
     }
     if let Some(knw) = wf.get_tensor_u16(&kn_name) {
         for h in 0..num_kv_heads {
-            let kh = &mut k[h * head_dim..];
+            let kh = &mut k[h * head_dim..(h + 1) * head_dim];
             let sum_sq: f32 = kh.iter().map(|&x| x * x).sum();
             let inv_rms = 1.0 / (sum_sq / head_dim as f32 + RMS_NORM_EPS).sqrt();
-            for i in 0..kh.len().min(knw.len()) { kh[i] = kh[i] * inv_rms * bf16_to_f32(knw[i]); }
+            for i in 0..head_dim.min(knw.len()) { kh[i] = kh[i] * inv_rms * bf16_to_f32(knw[i]); }
         }
     }
 
@@ -367,7 +368,8 @@ pub fn full_attention_forward(
     // o_proj output (filled by GPU fused path or CPU fallback below)
     let mut o_out = vec![0.0f32; hidden_dim];
 
-    let use_gpu_attn = ctx.is_some()
+    let use_gpu_attn = mode != PipelineMode::CpuOnly
+        && ctx.is_some()
         && gpu_wf.is_some()
         && ctx.unwrap().attn_scores_batched.is_some()
         && ctx.unwrap().attn_softmax_batched.is_some()
@@ -410,35 +412,43 @@ pub fn full_attention_forward(
         let mut attn_out = vec![0.0f32; q_dim];
         for h in 0..num_attn_heads {
             let kv_h = h / heads_per_kv;
-            let qh = &q[h * head_dim..];
+            let qh = &q[h * head_dim..(h + 1) * head_dim];
             let mut scores = vec![0.0f32; seq_len];
             for p in 0..seq_len {
-                let kp = &kv.k_cache[p * kv_dim + kv_h * head_dim..];
+                let kp = &kv.k_cache[p * kv_dim + kv_h * head_dim..p * kv_dim + (kv_h + 1) * head_dim];
                 scores[p] = qh.iter().zip(kp.iter()).map(|(&a, &b)| a * b).sum::<f32>() * scale;
             }
             let max_val = scores.iter().fold(f32::NEG_INFINITY, |a, &b| a.max(b));
             let sum: f32 = scores.iter().map(|&s| (s - max_val).exp()).sum();
             let inv_sum = 1.0 / sum;
-            let oh = &mut attn_out[h * head_dim..];
+            let oh = &mut attn_out[h * head_dim..(h + 1) * head_dim];
             for p in 0..seq_len {
                 let weight = (scores[p] - max_val).exp() * inv_sum;
-                let vp = &kv.v_cache[p * kv_dim + kv_h * head_dim..];
+                let vp = &kv.v_cache[p * kv_dim + kv_h * head_dim..p * kv_dim + (kv_h + 1) * head_dim];
                 for d in 0..head_dim { oh[d] += weight * vp[d]; }
             }
         }
         for i in 0..q_dim { attn_out[i] *= 1.0f32 / (1.0f32 + (-q_gate[i]).exp()); }
 
-        // o_proj (separate CMD in CPU fallback path)
+        // o_proj
         let o_prefix = format!("model.layers.{}.self_attn.o_proj", layer_idx);
-        if let (Some(gw), Some(c)) = (gpu_wf, ctx) {
-            let attn_buf = metal_buf_shared(&c.device, q_dim * 4);
-            unsafe { let dst = attn_buf.contents() as *mut f32; std::ptr::copy_nonoverlapping(attn_out.as_ptr(), dst, q_dim); }
-            let buf = metal_buf_shared(&c.device, hidden_dim * 4);
-            let cm = c.queue.new_command_buffer();
-            let enc = cm.new_compute_command_encoder();
-            gw.encode_matvec_into(wf, c, &enc, &o_prefix, &attn_buf, 0, &buf, 0, hidden_dim, q_dim);
-            enc.end_encoding(); cm.commit(); cm.wait_until_completed();
-            unsafe { std::ptr::copy_nonoverlapping(buf.contents() as *const f32, o_out.as_mut_ptr(), hidden_dim); }
+        if mode != PipelineMode::CpuOnly {
+            if let (Some(gw), Some(c)) = (gpu_wf, ctx) {
+                let attn_buf = metal_buf_shared(&c.device, q_dim * 4);
+                unsafe { let dst = attn_buf.contents() as *mut f32; std::ptr::copy_nonoverlapping(attn_out.as_ptr(), dst, q_dim); }
+                let buf = metal_buf_shared(&c.device, hidden_dim * 4);
+                let cm = c.queue.new_command_buffer();
+                let enc = cm.new_compute_command_encoder();
+                gw.encode_matvec_into(wf, c, &enc, &o_prefix, &attn_buf, 0, &buf, 0, hidden_dim, q_dim);
+                enc.end_encoding(); cm.commit(); cm.wait_until_completed();
+                unsafe { std::ptr::copy_nonoverlapping(buf.contents() as *const f32, o_out.as_mut_ptr(), hidden_dim); }
+            }
+        } else {
+            if let (Some(ow), Some(os), Some(ob)) = (
+                wf.get_tensor_u32(&format!("{}.weight", o_prefix)),
+                wf.get_tensor_u16(&format!("{}.scales", o_prefix)),
+                wf.get_tensor_u16(&format!("{}.biases", o_prefix)),
+            ) { cpu_dequant_matvec_4bit(ow, os, ob, &attn_out, &mut o_out, hidden_dim, q_dim, GROUP_SIZE); }
         }
     }
 
@@ -552,6 +562,8 @@ pub fn linear_attention_forward(
     let value_dim = total_value / num_v_heads;
     let inv_scale = 1.0 / (key_dim as f32).sqrt();
     let k_heads_per_v = num_v_heads / num_k_heads;
+
+    let debug_this_layer = layer_idx == 0;
 
     let mut gated_out = vec![0.0f32; total_value];
 
@@ -722,6 +734,14 @@ pub fn linear_attention_forward(
     }
     else {
         // ── Non-fused or CPU path ──
+        if debug_this_layer {
+            let rms_normed: f32 = (normed.iter().map(|&x| x*x).sum::<f32>() / normed.len() as f32).sqrt();
+            eprintln!("[RUST-CPU-L0] normed_rms={:.6} normed_first5=[{:.8},{:.8},{:.8},{:.8},{:.8}]", rms_normed, normed[0], normed[1], normed[2], normed[3], normed[4]);
+            let rms_hidden: f32 = (hidden.iter().map(|&x| x*x).sum::<f32>() / hidden.len() as f32).sqrt();
+            eprintln!("[RUST-CPU-L0] hidden_in_rms={:.6} hidden_in_first5=[{:.8},{:.8},{:.8},{:.8},{:.8}]", rms_hidden, hidden[0], hidden[1], hidden[2], hidden[3], hidden[4]);
+            // Dump full hidden array as comma-separated values for Python consumption
+            eprintln!("[RUST-CPU-L0-HIDDEN] {}", hidden.iter().map(|x| format!("{:.8}", x)).collect::<Vec<_>>().join(","));
+        }
         // CPU: attention projections
         if let (Some(qw), Some(qs), Some(qb)) = (
             wf.get_tensor_u32(&format!("{}.in_proj_qkv.weight", prefix)),
@@ -822,6 +842,21 @@ pub fn linear_attention_forward(
             unsafe { std::ptr::copy_nonoverlapping(ssm_gpu.contents() as *const f32, state.ssm_state.as_mut_ptr(), ssm_size); }
         } else {
         // RMS norm q and k (bare, no weights) then scale
+        if debug_this_layer {
+            let rms_qkv: f32 = (qkv.iter().map(|&x| x*x).sum::<f32>() / qkv.len() as f32).sqrt();
+            let rms_z: f32 = (z.iter().map(|&x| x*x).sum::<f32>() / z.len() as f32).sqrt();
+            let rms_b: f32 = (beta.iter().map(|&x| x*x).sum::<f32>() / beta.len() as f32).sqrt();
+            let rms_a: f32 = (alpha.iter().map(|&x| x*x).sum::<f32>() / alpha.len() as f32).sqrt();
+            eprintln!("[RUST-CPU-L0] qkv_rms={:.6} z_rms={:.6} beta_rms={:.6} alpha_rms={:.6}", rms_qkv, rms_z, rms_b, rms_a);
+            eprintln!("[RUST-CPU-L0] qkv_first5=[{:.8},{:.8},{:.8},{:.8},{:.8}]", qkv[0], qkv[1], qkv[2], qkv[3], qkv[4]);
+            eprintln!("[RUST-CPU-L0] z_first5=[{:.8},{:.8},{:.8},{:.8},{:.8}]", z[0], z[1], z[2], z[3], z[4]);
+            let rms_conv: f32 = (conv_out.iter().map(|&x| x*x).sum::<f32>() / conv_out.len() as f32).sqrt();
+            eprintln!("[RUST-CPU-L0] conv_out_rms={:.6} conv_first5=[{:.8},{:.8},{:.8},{:.8},{:.8}]", rms_conv, conv_out[0], conv_out[1], conv_out[2], conv_out[3], conv_out[4]);
+            let rms_q: f32 = (lin_q.iter().map(|&x| x*x).sum::<f32>() / lin_q.len() as f32).sqrt();
+            let rms_k: f32 = (lin_k.iter().map(|&x| x*x).sum::<f32>() / lin_k.len() as f32).sqrt();
+            let rms_v: f32 = (lin_v.iter().map(|&x| x*x).sum::<f32>() / lin_v.len() as f32).sqrt();
+            eprintln!("[RUST-CPU-L0] lin_q_rms={:.6} lin_k_rms={:.6} lin_v_rms={:.6}", rms_q, rms_k, rms_v);
+        }
         let mut q_normed = vec![0.0f32; total_key];
         let mut k_normed = vec![0.0f32; total_key];
         for h in 0..num_k_heads {
@@ -836,6 +871,13 @@ pub fn linear_attention_forward(
             let kh_out = &mut k_normed[h * key_dim..(h + 1) * key_dim];
             cpu_rms_norm_bare(kh, kh_out, key_dim, 1e-6);
             for d in kh_out.iter_mut() { *d *= inv_scale; }
+        }
+
+        if debug_this_layer {
+            let rms_qn: f32 = (q_normed.iter().map(|&x| x*x).sum::<f32>() / q_normed.len() as f32).sqrt();
+            let rms_kn: f32 = (k_normed.iter().map(|&x| x*x).sum::<f32>() / k_normed.len() as f32).sqrt();
+            eprintln!("[RUST-CPU-L0] q_normed_rms={:.6} qn_first5=[{:.8},{:.8},{:.8},{:.8},{:.8}]", rms_qn, q_normed[0], q_normed[1], q_normed[2], q_normed[3], q_normed[4]);
+            eprintln!("[RUST-CPU-L0] k_normed_rms={:.6} kn_first5=[{:.8},{:.8},{:.8},{:.8},{:.8}]", rms_kn, k_normed[0], k_normed[1], k_normed[2], k_normed[3], k_normed[4]);
         }
 
         let a_log = wf.get_tensor_f32(&format!("{}.A_log", prefix));
@@ -873,6 +915,10 @@ pub fn linear_attention_forward(
         }
 
         // RMSNormGated
+        if debug_this_layer {
+            let rms_out: f32 = (out_values.iter().map(|&x| x*x).sum::<f32>() / out_values.len() as f32).sqrt();
+            eprintln!("[RUST-CPU-L0] ssm_out_rms={:.6} ssm_out_first5=[{:.8},{:.8},{:.8},{:.8},{:.8}]", rms_out, out_values[0], out_values[1], out_values[2], out_values[3], out_values[4]);
+        }
         if let Some(gnw) = wf.get_tensor_u16(&format!("{}.norm.weight", prefix)) {
             for vh in 0..num_v_heads {
                 let oh = &out_values[vh * value_dim..(vh + 1) * value_dim];
@@ -882,6 +928,10 @@ pub fn linear_attention_forward(
             }
         } else {
             gated_out.copy_from_slice(&out_values);
+        }
+        if debug_this_layer {
+            let rms_gated: f32 = (gated_out.iter().map(|&x| x*x).sum::<f32>() / gated_out.len() as f32).sqrt();
+            eprintln!("[RUST-CPU-L0] gated_out_rms={:.6} gated_first5=[{:.8},{:.8},{:.8},{:.8},{:.8}]", rms_gated, gated_out[0], gated_out[1], gated_out[2], gated_out[3], gated_out[4]);
         }
     }
     }
@@ -900,8 +950,16 @@ pub fn linear_attention_forward(
         cpu_dequant_matvec_4bit(ow, os, ob, &gated_out, &mut attn_out, hidden_dim, total_value, GROUP_SIZE);
     }
     // Residual add
+    if debug_this_layer {
+        let rms_attn: f32 = (attn_out.iter().map(|&x| x*x).sum::<f32>() / attn_out.len() as f32).sqrt();
+        eprintln!("[RUST-CPU-L0] attn_out_rms={:.6} attn_first5=[{:.8},{:.8},{:.8},{:.8},{:.8}]", rms_attn, attn_out[0], attn_out[1], attn_out[2], attn_out[3], attn_out[4]);
+    }
     for i in 0..hidden_dim {
         hidden[i] = residual[i] + attn_out[i];
+    }
+    if debug_this_layer {
+        let rms_out: f32 = (hidden.iter().map(|&x| x*x).sum::<f32>() / hidden.len() as f32).sqrt();
+        eprintln!("[RUST-CPU-L0] hidden_out_rms={:.6} hidden_out_first5=[{:.8},{:.8},{:.8},{:.8},{:.8}]", rms_out, hidden[0], hidden[1], hidden[2], hidden[3], hidden[4]);
     }
 }
 

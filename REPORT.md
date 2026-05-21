@@ -55,6 +55,70 @@ Fused3 matches the C engine's 3-command-buffer architecture. All steps complete:
 
 The Rust engine produces coherent, sensible output verified against the same prompt. The CMD2 combine bug (attention contribution lost in full-attn CMD2 path) has been fixed — `temp_buf` (h_mid + attn_out) is now passed through as `hmid_gpu` to the moe_combine_residual kernel.
 
+## Recent Fix: CpuOnly full-attention layer MoE bug (2026-05-21)
+
+**Bug**: In CpuOnly mode, `full_attention_forward` used the GPU attention path (since Metal pipelines were initialized and available) and returned `FullAttnCmd2State` without adding the attention output to `hidden`. Then `moe_layer_forward` in CpuOnly entered the non-fused path (`use_gpu = false`), which saved `h_mid = hidden` (pre-attention) and used it as the residual in CMD3's `moe_combine_residual`. The attention output was completely lost, causing CpuOnly logits to diverge from Fused3 logits by up to 4.88 (max absolute diff).
+
+**Root cause** in `gpu_forward.rs`:
+- `full_attention_forward` had no `mode` parameter, so it couldn't distinguish CpuOnly from GPU modes.
+- In CpuOnly mode, `use_gpu_attn` was `true` because Metal was available, causing the GPU path (early return with buffers) to be taken instead of the CPU fallback (which adds `o_out` to `hidden` via residual at line 446).
+- The non-fused MoE path used `h_mid = hidden` without attention output, causing the divergence.
+
+**Fix** (3 changes in `gpu_forward.rs`, 1 in `python_bindings.rs`):
+1. Added `mode: PipelineMode` parameter to `full_attention_forward`
+2. Guard `use_gpu_attn` with `mode != PipelineMode::CpuOnly`
+3. Guard GPU o_proj in CPU fallback with `mode != PipelineMode::CpuOnly`, adding CPU dequant fallback
+4. Pass `mode` from the caller in `python_bindings.rs`
+
+**Verification**: CpuOnly vs Fused3 logits now match within 1e-5 (was 4.88 max diff). 100% of 248,320 vocabulary elements match within 1e-4.
+
+## Verification Methodology
+
+### Quick verification: CpuOnly vs Fused3 on stripped model
+
+```bash
+# 1. Build and install the Rust engine
+cd moe_infer_rs
+maturin build --release --features python-bindings
+python -m pip install --force-reinstall target/wheels/moe_infer-0.1.0-*.whl
+
+# 2. Run comparison (CpuOnly vs Fused3, 1 token, stripped 4-layer model)
+python -c "
+import numpy as np
+from moe_infer import Context, Cache
+
+MODEL_DIR = 'hub/models--mlx-community--Qwen3.5-35B-A3B-4bit-stripped'
+
+results = {}
+for mode in ['CpuOnly', 'Fused3']:
+    ctx = Context()
+    ctx.load_model(MODEL_DIR, pipeline_mode=mode)
+    cache = ctx.new_cache()
+    logits = np.array(ctx.forward(np.array([248045], dtype=np.int64), cache)[-1], dtype=np.float32)
+    results[mode] = logits
+    ctx.unload_model()
+
+diff = np.abs(results['CpuOnly'] - results['Fused3'])
+print(f'max_diff={diff.max():.8f}')
+print(f'matching within 1e-3: {(diff < 1e-3).sum()}/{len(diff)}')
+assert diff.max() < 1e-3, 'VERIFICATION FAILED'
+print('PASS')
+"
+```
+
+### Full verification: C vs Rust on full model
+
+```bash
+# Requires: C bench compiled with --verify-logits patch, full 35B model
+python verify.py
+# Compares C GPU (Fused3) logits vs Rust GPU (Fused3) logits on 100-token sequence
+# Success criterion: max_diff < 1e-3
+```
+
+### CPU path correctness verification
+
+Layer-0 linear attention (GatedDeltaNet) CPU path was verified to match a Python CPU reference implementation within 5e-6 across all intermediate steps (norm, qkv/z/b/a projections, conv1d, q/k RMS norms, SSM state update, gated norm, out_proj, residual add). The reference script is at `helpers/compare_cpu_ref.py`.
+
 ## Python API
 
 ```python
@@ -73,6 +137,88 @@ results = ctx.stream_generate(input_ids, cache, max_tokens=256)
 info = ctx.telemetry()
 # {"ttft_ms": ..., "tokens_per_sec": ..., "tokens_generated": ...}
 ```
+
+## Model Stripping (`helpers/strip_model.py`)
+
+For fast-iteration verification, we created a stripped version of the Qwen3.5-35B-A3B-4bit model with 4 layers and 4 experts (down from 40 and 256).
+
+### How it works
+
+`helpers/strip_model.py` reads the full MLX safetensors model and writes a smaller one:
+
+1. **Config**: Updates `config.json` — sets `num_hidden_layers=4`, `num_experts=4`, truncates `layer_types` to 4 entries
+2. **Layers kept**: Layers 0–3 (preserves the 1-full-attn-per-4-layers pattern — layer 3 is full attention)
+3. **Expert slicing**: For tensors under `mlp.gate.*`, `mlp.switch_mlp.*`, or `mlp.experts.*`, the first dimension (num_experts) is sliced from 256 → 4. All 4 expert weight sets are retained per layer
+4. **Non-expert weights**: All layers-0–3 weights (attention, norms, shared experts, etc.) are kept verbatim
+5. **Output**: Single `model.safetensors` file (680 MB → ~16 MB per expert, ~650 MB total)
+
+```bash
+python helpers/strip_model.py \
+    --input hub/models--mlx-community--Qwen3.5-35B-A3B-4bit \
+    --output hub/models--mlx-community--Qwen3.5-35B-A3B-4bit-stripped \
+    --num-layers 4 --num-experts 4
+```
+
+### Stripped model layout
+
+```
+stripped/
+├── config.json                    # 4 layers, 4 experts
+├── model.safetensors              # MLX-LM format (single file)
+├── model.safetensors.index.json
+├── model_weights.bin              # C-engine format (generated by helpers/dump_mlx_intermediates.py)
+├── model_weights.json             # Tensor manifest (offsets into .bin)
+├── packed_experts/                # Per-layer expert files (layer_00.bin .. layer_03.bin)
+├── tokenizer.json
+├── tokenizer_config.json
+└── vocab.json
+```
+
+### 3-Way Verification on Stripped Model
+
+We compared C bench, Rust Fused3, and MLX-LM on the stripped model (BOS token, greedy):
+
+| Pair | Max Diff | Within 1e-3 |
+|------|----------|-------------|
+| C vs Rust | 0.000005 | 100% |
+| C vs MLX-LM | 0.109 | 3.36% |
+| Rust vs MLX-LM | 0.109 | 3.36% |
+
+**C and Rust are numerically identical.** Both diverge from MLX-LM by ~0.02 mean / ~0.11 max. This means the C→Rust port is faithful, but the C engine has a pre-existing discrepancy from the MLX-LM reference. The root cause is still under investigation — likely candidates are dequantization precision, norm epsilon handling, or SSM state initialization.
+
+## Performance Benchmark
+
+Ran on Apple M4 (unified memory), Qwen3.5-35B-A3B-4bit full model (40 layers, 256 experts, hidden=2048), K=8 experts, 32-token prompt, 100-token greedy generation.
+
+| Metric | C | Rust | Ratio |
+|--------|---|------|-------|
+| TTFT (prefill 32 tok) | 10,722 ms | 16,357 ms | 1.53x slower |
+| Generation speed | 3.36 tok/s | 2.14 tok/s | 0.64x |
+| Init time | — | 33 ms | — |
+
+### C per-layer breakdown (avg 7.25 ms)
+
+| Phase | ms | % |
+|-------|-----|---|
+| expert_io (disk read) | 5.194 | 71.7% |
+| cmd1_wait (GPU linear attn) | 1.403 | 19.4% |
+| cmd2_wait (GPU full attn) | 0.549 | 7.6% |
+| cmd3_encode | 0.047 | 0.6% |
+| cmd1_submit | 0.024 | 0.3% |
+| cmd2_encode | 0.020 | 0.3% |
+| routing_cpu | 0.003 | 0.0% |
+| deferred_cpu | 0.002 | 0.0% |
+
+Expert I/O dominates at 72% of per-layer time — this is `pread` from disk for expert weight files.
+
+### Rust slowdown analysis
+
+Rust is ~1.5x slower on prefill and ~1.6x slower on generation. Likely causes (needs profiling):
+
+1. **KV cache upload/download**: Rust stores KV caches on CPU and uploads/downloads per layer. C stores them persistently on GPU.
+2. **SSM state transfer**: Linear attention SSM states are transferred CPU↔GPU per layer in Rust.
+3. **Debug prints**: `[RUST-PRE]`/`[RUST-LAYER]` stderr prints on every token×layer add overhead.
+4. **No Metal command buffer reuse**: Rust creates new command buffers per layer rather than reusing.
 
 ## Next Steps
 

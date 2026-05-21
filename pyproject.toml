@@ -4,6 +4,7 @@ version = "0.1.0"
 requires-python = ">=3.10"
 dependencies = [
     "huggingface-hub>=1.15.0",
+    "mlx-lm>=0.31.3",
     "openai>=2.37.0",
     "torch>=2.12.0",
     "tqdm>=4.67.3",

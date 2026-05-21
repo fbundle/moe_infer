@@ -167,15 +167,28 @@ fn process_token(m: &ModelState, hidden: &mut [f32], pos: usize,
         if layer % 4 == 0 {
             py.check_signals()?;
         }
+        // Print BEFORE finalize (matches C's [C-LAYER] measurement point at line 4006)
+        {
+            let rms_pre: f32 = (hidden.iter().map(|&x| x*x).sum::<f32>() / hidden.len() as f32).sqrt();
+            let prev_layer = if layer > 0 { (layer - 1) as i32 } else { -1i32 };
+            eprintln!("[RUST-PRE] prev_layer={} hidden_rms={:.6} hidden[..5]=[{:.6},{:.6},{:.6},{:.6},{:.6}]",
+                prev_layer, rms_pre, hidden[0], hidden[1], hidden[2], hidden[3], hidden[4]);
+        }
         // Complete previous layer's async MoE → writes previous layer's output to hidden
         if let Some(ref mut def) = deferred.take() {
             def.complete(hidden, m.config.hidden_dim);
+        }
+        {
+            let prev_layer = if layer > 0 { (layer - 1) as i32 } else { -1i32 };
+            let rms: f32 = (hidden.iter().map(|&x| x*x).sum::<f32>() / hidden.len() as f32).sqrt();
+            eprintln!("[RUST-LAYER] prev_layer={} hidden_rms={:.6} hidden[..5]=[{:.6},{:.6},{:.6},{:.6},{:.6}]",
+                prev_layer, rms, hidden[0], hidden[1], hidden[2], hidden[3], hidden[4]);
         }
         let is_full = (layer + 1) % FULL_ATTN_INTERVAL == 0;
         let mut attn_state: Option<FullAttnCmd2State> = None;
         if is_full {
             if let Some(ref mut kv) = kv[layer] {
-                attn_state = full_attention_forward(&m.wf, layer, hidden, kv, pos, &m.config, Some(&m.gpu_wf), Some(&m.ctx));
+                attn_state = full_attention_forward(&m.wf, layer, hidden, kv, pos, &m.config, Some(&m.gpu_wf), Some(&m.ctx), mode);
             }
         } else if let Some(ref mut s) = lin[layer] {
             let li = layer - (layer + 1) / FULL_ATTN_INTERVAL;
