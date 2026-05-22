@@ -4,10 +4,19 @@
 /// CMD2: out_proj + residual_add + rms_norm + gate + shared (1 fused encoder)
 /// CMD3: experts + combine + GPU-side input_norm (async, deferred commit)
 use metal::Buffer;
-use crate::kernels;
+use crate::metal_kernels;
 use crate::metal_context::{metal_buf_shared, GpuWeightCtx, MetalContext};
 use crate::weights::WeightFile;
-use crate::pipeline_common::{LinearAttnFusedWoodsState, LinearAttnState, CONV_KERNEL_SIZE};
+use crate::pipeline_common::{LinearAttnState, CONV_KERNEL_SIZE};
+
+/// GPU/CPU state from linear attention CMD1 for FusedWoods.
+pub struct LinearAttnFusedWoodsState {
+    pub gated_buf: Buffer,
+    pub h_mid: Vec<f32>,
+    pub total_value: usize,
+    pub o_prefix: String,
+    pub post_norm_name: String,
+}
 
 /// Run FusedWoods CMD1: attention projections → conv1d → SSM → gated_rms_norm.
 ///
@@ -70,7 +79,7 @@ pub fn fusedwoods_cmd1(
     if let Some(conv_w_ptr) = wf.get_tensor_ptr(&format!("{}.conv1d.weight", prefix)) {
         let conv_w_off = (conv_w_ptr as usize - gw.base as usize) as u64;
         let enc = cmd_buf.new_compute_command_encoder();
-        kernels::encode_conv1d_step(c, &enc,
+        metal_kernels::encode_conv1d_step(c, &enc,
             &c.buf_conv_state[linear_idx],
             &c.batch_out[0],
             &gw.buf, conv_w_off,
@@ -82,7 +91,7 @@ pub fn fusedwoods_cmd1(
     // Encoder 3: rms_norm_qk
     {
         let enc = cmd_buf.new_compute_command_encoder();
-        kernels::encode_rms_norm_qk(c, &enc,
+        metal_kernels::encode_rms_norm_qk(c, &enc,
             c.buf_conv_output.as_ref().unwrap(), 0,
             c.buf_conv_output.as_ref().unwrap(), (total_key * 4) as u64,
             num_k_heads as u32, key_dim as u32, inv_scale);
@@ -96,7 +105,7 @@ pub fn fusedwoods_cmd1(
         let a_log_off = a_log_ptr.map_or(0, |p| (p as usize - gw.base as usize) as u64);
         let dt_bias_off = dt_bias_ptr.map_or(0, |p| (p as usize - gw.base as usize) as u64);
         let enc = cmd_buf.new_compute_command_encoder();
-        kernels::encode_compute_decay_beta(c, &enc,
+        metal_kernels::encode_compute_decay_beta(c, &enc,
             &c.batch_out[3],
             &c.batch_out[2],
             if a_log_ptr.is_some() { &gw.buf } else { &c.batch_out[3] }, a_log_off,
@@ -114,7 +123,7 @@ pub fn fusedwoods_cmd1(
         let v_off = (2 * total_key * 4) as u64;
         let conv_out = c.buf_conv_output.as_ref().unwrap();
         let enc = cmd_buf.new_compute_command_encoder();
-        kernels::encode_gated_delta_net_step(c, &enc,
+        metal_kernels::encode_gated_delta_net_step(c, &enc,
             &c.buf_delta_state[linear_idx],
             conv_out, q_off,
             conv_out, k_off,
@@ -132,7 +141,7 @@ pub fn fusedwoods_cmd1(
         let enc = cmd_buf.new_compute_command_encoder();
         if let Some(gnw_p) = gnw_ptr {
             let gnw_off = (gnw_p as usize - gw.base as usize) as u64;
-            kernels::encode_gated_rms_norm(c, &enc,
+            metal_kernels::encode_gated_rms_norm(c, &enc,
                 c.buf_delta_output.as_ref().unwrap(),
                 &c.batch_out[1],
                 &gw.buf, gnw_off,

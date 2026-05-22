@@ -5,8 +5,66 @@ use metal::{Buffer, CommandBuffer};
 
 use crate::config::ModelConfig;
 use crate::metal_context::{ExpertIOState, GpuWeightCtx, MetalContext};
-use crate::quant::bf16_to_f32;
 use crate::weights::WeightFile;
+
+// ─── bf16 / f32 conversion ───────────────────────────────────────────────
+
+/// Convert bf16 (uint16) to f32.
+pub fn bf16_to_f32(bf16: u16) -> f32 {
+    f32::from_bits((bf16 as u32) << 16)
+}
+
+/// CPU reference: 4-bit dequantized matrix-vector multiply.
+pub fn cpu_dequant_matvec_4bit(
+    w_packed: &[u32],
+    scales: &[u16],
+    biases: &[u16],
+    x: &[f32],
+    out: &mut [f32],
+    out_dim: usize,
+    in_dim: usize,
+    group_size: usize,
+) {
+    let num_groups = in_dim / group_size;
+    let packed_per_group = group_size / 8;
+    let packed_cols = in_dim / 8;
+
+    for row in 0..out_dim {
+        let mut acc = 0.0f32;
+        let w_row = &w_packed[row * packed_cols..];
+        let s_row = &scales[row * num_groups..];
+        let b_row = &biases[row * num_groups..];
+
+        for g in 0..num_groups {
+            let scale = bf16_to_f32(s_row[g]);
+            let bias = bf16_to_f32(b_row[g]);
+
+            let base_packed = g * packed_per_group;
+            let base_x = g * group_size;
+
+            for p in 0..packed_per_group {
+                let packed = w_row[base_packed + p];
+                let x_base = base_x + p * 8;
+
+                for n in 0..8 {
+                    let nibble = (packed >> (n * 4)) & 0xF;
+                    let w_val = (nibble as f32) * scale + bias;
+                    acc += w_val * x[x_base + n];
+                }
+            }
+        }
+        out[row] = acc;
+    }
+}
+
+/// CPU reference: RMS normalization.
+pub fn cpu_rms_norm(x: &[f32], weight: &[f32], out: &mut [f32], dim: usize, eps: f32) {
+    let sum_sq: f32 = x.iter().map(|v| v * v).sum();
+    let rms = (sum_sq / dim as f32 + eps).sqrt().recip();
+    for i in 0..dim {
+        out[i] = x[i] * rms * weight[i];
+    }
+}
 
 // ─── Constants ───────────────────────────────────────────────────────────
 
@@ -14,8 +72,6 @@ pub(crate) const MAX_SEQ: usize = 4096;
 pub const RMS_NORM_EPS: f32 = 1e-6;
 pub const FULL_ATTN_INTERVAL: usize = 4;
 pub const GROUP_SIZE: usize = 64;
-pub const LINEAR_KEY_DIM: usize = 128;
-pub const LINEAR_VALUE_DIM: usize = 128;
 pub const CONV_KERNEL_SIZE: usize = 4;
 
 // ─── Pipeline mode ───────────────────────────────────────────────────────
@@ -208,16 +264,6 @@ pub struct FullAttnCmd2State {
     pub scale: f32,
     pub q_dim: u32,
     pub o_prefix: String,
-}
-
-// ─── GPU/CPU state from linear attention CMD1 for FusedWoods ─────────────────
-
-pub struct LinearAttnFusedWoodsState {
-    pub gated_buf: Buffer,
-    pub h_mid: Vec<f32>,
-    pub total_value: usize,
-    pub o_prefix: String,
-    pub post_norm_name: String,
 }
 
 // ─── Deferred expert results (CMD3 async dispatch) ───────────────────────

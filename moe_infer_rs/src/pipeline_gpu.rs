@@ -5,15 +5,16 @@ use std::ffi::c_void;
 use metal::{Buffer, MTLSize};
 use crate::config::ModelConfig;
 use crate::error::MoEError;
-use crate::kernels;
+use crate::metal_kernels;
 use crate::metal_context::{metal_buf_shared, ExpertIOState, GpuWeightCtx, MetalContext, MAX_K};
 use crate::pipeline_common::{
-    cpu_conv1d_step, cpu_normalize_weights, cpu_rms_norm_bare, cpu_rms_norm_gated,
-    cpu_sigmoid, cpu_silu, cpu_softmax, cpu_topk,
-    DeferredExperts, FullAttnCache, FullAttnCmd2State, LinearAttnFusedWoodsState, LinearAttnState,
+    bf16_to_f32, cpu_conv1d_step, cpu_dequant_matvec_4bit, cpu_normalize_weights,
+    cpu_rms_norm, cpu_rms_norm_bare, cpu_rms_norm_gated, cpu_sigmoid,
+    cpu_softmax, cpu_topk,
+    DeferredExperts, FullAttnCache, FullAttnCmd2State, LinearAttnState,
     PipelineMode, CONV_KERNEL_SIZE, GROUP_SIZE, MAX_SEQ, RMS_NORM_EPS,
 };
-use crate::quant::{bf16_to_f32, cpu_dequant_matvec_4bit, cpu_rms_norm};
+use crate::pipeline_fusedwoods::LinearAttnFusedWoodsState;
 use crate::weights::WeightFile;
 
 // ─── RoPE ─────────────────────────────────────────────────────────────────
@@ -300,20 +301,12 @@ pub fn linear_attention_forward(
         normed.copy_from_slice(hidden);
     }
 
-    // Batch projections: QKV, Z, B, A
-    let mut qkv = vec![0.0f32; qkv_dim];
-    let mut z = vec![0.0f32; total_value];
-    let mut beta = vec![0.0f32; num_v_heads];
-    let mut alpha = vec![0.0f32; num_v_heads];
-
     let prefix = format!("model.layers.{}.linear_attn", layer_idx);
 
     let key_dim = total_key / num_k_heads;
     let value_dim = total_value / num_v_heads;
     let inv_scale = 1.0 / (key_dim as f32).sqrt();
     let k_heads_per_v = num_v_heads / num_k_heads;
-
-    let mut gated_out = vec![0.0f32; total_value];
 
     // ── Fused GPU path (CMD1): attention projections + conv1d + SSM in ONE command buffer ──
     let gpu_compatible = key_dim == 128 && value_dim == 128 && use_gpu;
@@ -361,7 +354,7 @@ pub fn linear_attention_forward(
         if let Some(conv_w_ptr) = wf.get_tensor_ptr(&format!("{}.conv1d.weight", prefix)) {
             let conv_w_off = (conv_w_ptr as usize - gw.base as usize) as u64;
             let enc = cmd_buf.new_compute_command_encoder();
-            kernels::encode_conv1d_step(c, &enc,
+            metal_kernels::encode_conv1d_step(c, &enc,
                 &c.buf_conv_state[linear_idx],      // persistent conv state
                 &c.batch_out[0],                     // input = QKV projection
                 &gw.buf, conv_w_off,                 // weights from wf_buf with offset
@@ -373,7 +366,7 @@ pub fn linear_attention_forward(
         // ── Encoder 3: rms_norm_qk (reads q/k from buf_conv_output at offsets) ──
         {
             let enc = cmd_buf.new_compute_command_encoder();
-            kernels::encode_rms_norm_qk(c, &enc,
+            metal_kernels::encode_rms_norm_qk(c, &enc,
                 c.buf_conv_output.as_ref().unwrap(), 0,                             // q at offset 0
                 c.buf_conv_output.as_ref().unwrap(), (total_key * 4) as u64,         // k at offset total_key*f32
                 num_k_heads as u32, key_dim as u32, inv_scale);
@@ -387,7 +380,7 @@ pub fn linear_attention_forward(
             let a_log_off = a_log_ptr.map_or(0, |p| (p as usize - gw.base as usize) as u64);
             let dt_bias_off = dt_bias_ptr.map_or(0, |p| (p as usize - gw.base as usize) as u64);
             let enc = cmd_buf.new_compute_command_encoder();
-            kernels::encode_compute_decay_beta(c, &enc,
+            metal_kernels::encode_compute_decay_beta(c, &enc,
                 &c.batch_out[3],                             // alpha
                 &c.batch_out[2],                             // beta
                 if a_log_ptr.is_some() { &gw.buf } else { &c.batch_out[3] }, a_log_off,   // A_log (or dummy)
@@ -405,7 +398,7 @@ pub fn linear_attention_forward(
             let v_off = (2 * total_key * 4) as u64;
             let conv_out = c.buf_conv_output.as_ref().unwrap();
             let enc = cmd_buf.new_compute_command_encoder();
-            kernels::encode_gated_delta_net_step(c, &enc,
+            metal_kernels::encode_gated_delta_net_step(c, &enc,
                 &c.buf_delta_state[linear_idx],   // persistent SSM state
                 conv_out, q_off,                   // q at offset 0
                 conv_out, k_off,                   // k at offset total_key*4
@@ -424,7 +417,7 @@ pub fn linear_attention_forward(
             let enc = cmd_buf.new_compute_command_encoder();
             if let Some(gnw_p) = gnw_ptr {
                 let gnw_off = (gnw_p as usize - gw.base as usize) as u64;
-                kernels::encode_gated_rms_norm(c, &enc,
+                metal_kernels::encode_gated_rms_norm(c, &enc,
                     c.buf_delta_output.as_ref().unwrap(),
                     &c.batch_out[1],                // z
                     &gw.buf, gnw_off,               // norm weight from wf_buf
@@ -467,9 +460,6 @@ pub fn linear_attention_forward(
         unsafe {
             std::ptr::copy_nonoverlapping(hidden_out.contents() as *const f32,
                 hidden.as_mut_ptr(), hidden_dim);
-            // Also keep gated_out for potential fallback use
-            std::ptr::copy_nonoverlapping(gated_gpu.contents() as *const f32,
-                gated_out.as_mut_ptr(), total_value);
         }
 
         // Update CPU conv_state for non-fused fallback / debugging
@@ -527,7 +517,7 @@ pub fn linear_attention_forward(
         if let Some(conv_w_ptr) = wf.get_tensor_ptr(&format!("{}.conv1d.weight", prefix)) {
             let conv_w_off = (conv_w_ptr as usize - gw.base as usize) as u64;
             let enc = cmd_buf.new_compute_command_encoder();
-            kernels::encode_conv1d_step(c, &enc,
+            metal_kernels::encode_conv1d_step(c, &enc,
                 &c.buf_conv_state[linear_idx],
                 &c.batch_out[0],
                 &gw.buf, conv_w_off,
@@ -539,7 +529,7 @@ pub fn linear_attention_forward(
         // Encoder 3: rms_norm_qk
         {
             let enc = cmd_buf.new_compute_command_encoder();
-            kernels::encode_rms_norm_qk(c, &enc,
+            metal_kernels::encode_rms_norm_qk(c, &enc,
                 c.buf_conv_output.as_ref().unwrap(), 0,
                 c.buf_conv_output.as_ref().unwrap(), (total_key * 4) as u64,
                 num_k_heads as u32, key_dim as u32, inv_scale);
@@ -553,7 +543,7 @@ pub fn linear_attention_forward(
             let a_log_off = a_log_ptr.map_or(0, |p| (p as usize - gw.base as usize) as u64);
             let dt_bias_off = dt_bias_ptr.map_or(0, |p| (p as usize - gw.base as usize) as u64);
             let enc = cmd_buf.new_compute_command_encoder();
-            kernels::encode_compute_decay_beta(c, &enc,
+            metal_kernels::encode_compute_decay_beta(c, &enc,
                 &c.batch_out[3],
                 &c.batch_out[2],
                 if a_log_ptr.is_some() { &gw.buf } else { &c.batch_out[3] }, a_log_off,
@@ -571,7 +561,7 @@ pub fn linear_attention_forward(
             let v_off = (2 * total_key * 4) as u64;
             let conv_out = c.buf_conv_output.as_ref().unwrap();
             let enc = cmd_buf.new_compute_command_encoder();
-            kernels::encode_gated_delta_net_step(c, &enc,
+            metal_kernels::encode_gated_delta_net_step(c, &enc,
                 &c.buf_delta_state[linear_idx],
                 conv_out, q_off,
                 conv_out, k_off,
@@ -589,7 +579,7 @@ pub fn linear_attention_forward(
             let enc = cmd_buf.new_compute_command_encoder();
             if let Some(gnw_p) = gnw_ptr {
                 let gnw_off = (gnw_p as usize - gw.base as usize) as u64;
-                kernels::encode_gated_rms_norm(c, &enc,
+                metal_kernels::encode_gated_rms_norm(c, &enc,
                     c.buf_delta_output.as_ref().unwrap(),
                     &c.batch_out[1],
                     &gw.buf, gnw_off,
@@ -616,107 +606,112 @@ pub fn linear_attention_forward(
         });
     }
 
-    {
-        // ── Non-fused or CPU path ──
-        // CPU: attention projections
-        if let (Some(qw), Some(qs), Some(qb)) = (
-            wf.get_tensor_u32(&format!("{}.in_proj_qkv.weight", prefix)),
-            wf.get_tensor_u16(&format!("{}.in_proj_qkv.scales", prefix)),
-            wf.get_tensor_u16(&format!("{}.in_proj_qkv.biases", prefix)),
-        ) { cpu_dequant_matvec_4bit(qw, qs, qb, &normed, &mut qkv, qkv_dim, hidden_dim, GROUP_SIZE); }
-        if let (Some(zw), Some(zs), Some(zb)) = (
-            wf.get_tensor_u32(&format!("{}.in_proj_z.weight", prefix)),
-            wf.get_tensor_u16(&format!("{}.in_proj_z.scales", prefix)),
-            wf.get_tensor_u16(&format!("{}.in_proj_z.biases", prefix)),
-        ) { cpu_dequant_matvec_4bit(zw, zs, zb, &normed, &mut z, total_value, hidden_dim, GROUP_SIZE); }
-        if let (Some(bw), Some(bs), Some(bb)) = (
-            wf.get_tensor_u32(&format!("{}.in_proj_b.weight", prefix)),
-            wf.get_tensor_u16(&format!("{}.in_proj_b.scales", prefix)),
-            wf.get_tensor_u16(&format!("{}.in_proj_b.biases", prefix)),
-        ) { cpu_dequant_matvec_4bit(bw, bs, bb, &normed, &mut beta, num_v_heads, hidden_dim, GROUP_SIZE); }
-        if let (Some(aw), Some(ass), Some(ab)) = (
-            wf.get_tensor_u32(&format!("{}.in_proj_a.weight", prefix)),
-            wf.get_tensor_u16(&format!("{}.in_proj_a.scales", prefix)),
-            wf.get_tensor_u16(&format!("{}.in_proj_a.biases", prefix)),
-        ) { cpu_dequant_matvec_4bit(aw, ass, ab, &normed, &mut alpha, num_v_heads, hidden_dim, GROUP_SIZE); }
+    // ── Non-fused or CPU path ──
+    // CPU: attention projections
+    let mut qkv = vec![0.0f32; qkv_dim];
+    let mut z = vec![0.0f32; total_value];
+    let mut beta = vec![0.0f32; num_v_heads];
+    let mut alpha = vec![0.0f32; num_v_heads];
 
-        // Conv1d step (CPU)
-        let mut conv_out = vec![0.0f32; qkv_dim];
-        if let Some(conv_w) = wf.get_tensor_u16(&format!("{}.conv1d.weight", prefix)) {
-            cpu_conv1d_step(&state.conv_state, &qkv, conv_w, &mut conv_out, qkv_dim, CONV_KERNEL_SIZE);
-        } else {
-            conv_out.copy_from_slice(&qkv);
+    if let (Some(qw), Some(qs), Some(qb)) = (
+        wf.get_tensor_u32(&format!("{}.in_proj_qkv.weight", prefix)),
+        wf.get_tensor_u16(&format!("{}.in_proj_qkv.scales", prefix)),
+        wf.get_tensor_u16(&format!("{}.in_proj_qkv.biases", prefix)),
+    ) { cpu_dequant_matvec_4bit(qw, qs, qb, &normed, &mut qkv, qkv_dim, hidden_dim, GROUP_SIZE); }
+    if let (Some(zw), Some(zs), Some(zb)) = (
+        wf.get_tensor_u32(&format!("{}.in_proj_z.weight", prefix)),
+        wf.get_tensor_u16(&format!("{}.in_proj_z.scales", prefix)),
+        wf.get_tensor_u16(&format!("{}.in_proj_z.biases", prefix)),
+    ) { cpu_dequant_matvec_4bit(zw, zs, zb, &normed, &mut z, total_value, hidden_dim, GROUP_SIZE); }
+    if let (Some(bw), Some(bs), Some(bb)) = (
+        wf.get_tensor_u32(&format!("{}.in_proj_b.weight", prefix)),
+        wf.get_tensor_u16(&format!("{}.in_proj_b.scales", prefix)),
+        wf.get_tensor_u16(&format!("{}.in_proj_b.biases", prefix)),
+    ) { cpu_dequant_matvec_4bit(bw, bs, bb, &normed, &mut beta, num_v_heads, hidden_dim, GROUP_SIZE); }
+    if let (Some(aw), Some(ass), Some(ab)) = (
+        wf.get_tensor_u32(&format!("{}.in_proj_a.weight", prefix)),
+        wf.get_tensor_u16(&format!("{}.in_proj_a.scales", prefix)),
+        wf.get_tensor_u16(&format!("{}.in_proj_a.biases", prefix)),
+    ) { cpu_dequant_matvec_4bit(aw, ass, ab, &normed, &mut alpha, num_v_heads, hidden_dim, GROUP_SIZE); }
+
+    // Conv1d step (CPU)
+    let mut conv_out = vec![0.0f32; qkv_dim];
+    if let Some(conv_w) = wf.get_tensor_u16(&format!("{}.conv1d.weight", prefix)) {
+        cpu_conv1d_step(&state.conv_state, &qkv, conv_w, &mut conv_out, qkv_dim, CONV_KERNEL_SIZE);
+    } else {
+        conv_out.copy_from_slice(&qkv);
+    }
+    let state_off = (CONV_KERNEL_SIZE - 2) * qkv_dim;
+    state.conv_state.copy_within(qkv_dim.., 0);
+    state.conv_state[state_off..state_off + qkv_dim].copy_from_slice(&qkv);
+    let lin_q = conv_out[..total_key].to_vec();
+    let lin_k = conv_out[total_key..2 * total_key].to_vec();
+    let lin_v = conv_out[2 * total_key..].to_vec();
+
+    // Try non-fused GPU SSM (or CPU fallback)
+    let mut gated_out = vec![0.0f32; total_value];
+    let gpu_ssm_ok = gpu_compatible && ctx.is_some();
+    if gpu_ssm_ok {
+        let c = ctx.unwrap();
+        let ssm_size = num_v_heads * value_dim * key_dim;
+        let ssm_gpu = state.ssm_state_gpu.get_or_insert_with(|| {
+            metal_buf_shared(&c.device, ssm_size * 4)
+        });
+        unsafe { let dst = ssm_gpu.contents() as *mut f32; std::ptr::copy_nonoverlapping(state.ssm_state.as_ptr(), dst, ssm_size); }
+
+        let q_gpu = metal_buf_shared(&c.device, total_key * 4);
+        let k_gpu = metal_buf_shared(&c.device, total_key * 4);
+        let v_gpu = metal_buf_shared(&c.device, total_value * 4);
+        let z_gpu = metal_buf_shared(&c.device, total_value * 4);
+        let alpha_gpu = metal_buf_shared(&c.device, num_v_heads * 4);
+        let beta_gpu = metal_buf_shared(&c.device, num_v_heads * 4);
+        let out_gpu = metal_buf_shared(&c.device, total_value * 4);
+        unsafe {
+            std::ptr::copy_nonoverlapping(lin_q.as_ptr(), q_gpu.contents() as *mut f32, total_key);
+            std::ptr::copy_nonoverlapping(lin_k.as_ptr(), k_gpu.contents() as *mut f32, total_key);
+            std::ptr::copy_nonoverlapping(lin_v.as_ptr(), v_gpu.contents() as *mut f32, total_value);
+            std::ptr::copy_nonoverlapping(z.as_ptr(), z_gpu.contents() as *mut f32, total_value);
+            std::ptr::copy_nonoverlapping(alpha.as_ptr(), alpha_gpu.contents() as *mut f32, num_v_heads);
+            std::ptr::copy_nonoverlapping(beta.as_ptr(), beta_gpu.contents() as *mut f32, num_v_heads);
         }
-        let state_off = (CONV_KERNEL_SIZE - 2) * qkv_dim;
-        state.conv_state.copy_within(qkv_dim.., 0);
-        state.conv_state[state_off..state_off + qkv_dim].copy_from_slice(&qkv);
-        let lin_q = conv_out[..total_key].to_vec();
-        let lin_k = conv_out[total_key..2 * total_key].to_vec();
-        let lin_v = conv_out[2 * total_key..].to_vec();
+        let a_log_ptr = wf.get_tensor_ptr(&format!("{}.A_log", prefix));
+        let dt_bias_ptr = wf.get_tensor_ptr(&format!("{}.dt_bias", prefix));
+        let a_log_gpu = metal_buf_shared(&c.device, num_v_heads * 4);
+        let dt_bias_gpu = metal_buf_shared(&c.device, num_v_heads * 2);
+        if let Some(p) = a_log_ptr {
+            unsafe { std::ptr::copy_nonoverlapping(p as *const f32, a_log_gpu.contents() as *mut f32, num_v_heads); }
+        }
+        if let Some(p) = dt_bias_ptr {
+            unsafe { std::ptr::copy_nonoverlapping(p as *const u16, dt_bias_gpu.contents() as *mut u16, num_v_heads); }
+        }
+        let g_decay_gpu = metal_buf_shared(&c.device, num_v_heads * 4);
+        let beta_gate_gpu = metal_buf_shared(&c.device, num_v_heads * 4);
+        let gated_gpu2 = metal_buf_shared(&c.device, total_value * 4);
+        let gnw_ptr = wf.get_tensor_u16(&format!("{}.norm.weight", prefix));
+        let gnw_gpu = gnw_ptr.map(|gnw| {
+            let buf = metal_buf_shared(&c.device, gnw.len() * 2);
+            unsafe { std::ptr::copy_nonoverlapping(gnw.as_ptr(), buf.contents() as *mut u16, gnw.len()); }
+            buf
+        });
 
-        // Try non-fused GPU SSM (or CPU fallback)
-        let gpu_ssm_ok = gpu_compatible && ctx.is_some();
-        if gpu_ssm_ok {
-            let c = ctx.unwrap();
-            let ssm_size = num_v_heads * value_dim * key_dim;
-            let ssm_gpu = state.ssm_state_gpu.get_or_insert_with(|| {
-                metal_buf_shared(&c.device, ssm_size * 4)
-            });
-            unsafe { let dst = ssm_gpu.contents() as *mut f32; std::ptr::copy_nonoverlapping(state.ssm_state.as_ptr(), dst, ssm_size); }
-
-            let q_gpu = metal_buf_shared(&c.device, total_key * 4);
-            let k_gpu = metal_buf_shared(&c.device, total_key * 4);
-            let v_gpu = metal_buf_shared(&c.device, total_value * 4);
-            let z_gpu = metal_buf_shared(&c.device, total_value * 4);
-            let alpha_gpu = metal_buf_shared(&c.device, num_v_heads * 4);
-            let beta_gpu = metal_buf_shared(&c.device, num_v_heads * 4);
-            let out_gpu = metal_buf_shared(&c.device, total_value * 4);
-            unsafe {
-                std::ptr::copy_nonoverlapping(lin_q.as_ptr(), q_gpu.contents() as *mut f32, total_key);
-                std::ptr::copy_nonoverlapping(lin_k.as_ptr(), k_gpu.contents() as *mut f32, total_key);
-                std::ptr::copy_nonoverlapping(lin_v.as_ptr(), v_gpu.contents() as *mut f32, total_value);
-                std::ptr::copy_nonoverlapping(z.as_ptr(), z_gpu.contents() as *mut f32, total_value);
-                std::ptr::copy_nonoverlapping(alpha.as_ptr(), alpha_gpu.contents() as *mut f32, num_v_heads);
-                std::ptr::copy_nonoverlapping(beta.as_ptr(), beta_gpu.contents() as *mut f32, num_v_heads);
-            }
-            let a_log_ptr = wf.get_tensor_ptr(&format!("{}.A_log", prefix));
-            let dt_bias_ptr = wf.get_tensor_ptr(&format!("{}.dt_bias", prefix));
-            let a_log_gpu = metal_buf_shared(&c.device, num_v_heads * 4);
-            let dt_bias_gpu = metal_buf_shared(&c.device, num_v_heads * 2);
-            if let Some(p) = a_log_ptr {
-                unsafe { std::ptr::copy_nonoverlapping(p as *const f32, a_log_gpu.contents() as *mut f32, num_v_heads); }
-            }
-            if let Some(p) = dt_bias_ptr {
-                unsafe { std::ptr::copy_nonoverlapping(p as *const u16, dt_bias_gpu.contents() as *mut u16, num_v_heads); }
-            }
-            let g_decay_gpu = metal_buf_shared(&c.device, num_v_heads * 4);
-            let beta_gate_gpu = metal_buf_shared(&c.device, num_v_heads * 4);
-            let gated_gpu2 = metal_buf_shared(&c.device, total_value * 4);
-            let gnw_ptr = wf.get_tensor_u16(&format!("{}.norm.weight", prefix));
-            let gnw_gpu = gnw_ptr.map(|gnw| {
-                let buf = metal_buf_shared(&c.device, gnw.len() * 2);
-                unsafe { std::ptr::copy_nonoverlapping(gnw.as_ptr(), buf.contents() as *mut u16, gnw.len()); }
-                buf
-            });
-
-            let cmd_buf = c.queue.new_command_buffer();
-            let enc = cmd_buf.new_compute_command_encoder();
-            kernels::encode_rms_norm_qk(c, &enc, &q_gpu, 0, &k_gpu, 0, num_k_heads as u32, key_dim as u32, inv_scale);
-            kernels::encode_compute_decay_beta(c, &enc, &alpha_gpu, &beta_gpu, &a_log_gpu, 0, &dt_bias_gpu, 0, &g_decay_gpu, &beta_gate_gpu, num_v_heads as u32);
-            kernels::encode_gated_delta_net_step(c, &enc, ssm_gpu, &q_gpu, 0, &k_gpu, 0, &v_gpu, 0, &g_decay_gpu, &beta_gate_gpu, &out_gpu, num_v_heads as u32, k_heads_per_v as u32, key_dim as u32, value_dim as u32);
-            if let Some(ref gnw_buf) = gnw_gpu {
-                kernels::encode_gated_rms_norm(c, &enc, &out_gpu, &z_gpu, gnw_buf, 0, &gated_gpu2, num_v_heads as u32, value_dim as u32);
-            }
-            enc.end_encoding();
-            cmd_buf.commit();
-            cmd_buf.wait_until_completed();
-            if gnw_gpu.is_some() {
-                unsafe { std::ptr::copy_nonoverlapping(gated_gpu2.contents() as *const f32, gated_out.as_mut_ptr(), total_value); }
-            } else {
-                unsafe { std::ptr::copy_nonoverlapping(out_gpu.contents() as *const f32, gated_out.as_mut_ptr(), total_value); }
-            }
-            unsafe { std::ptr::copy_nonoverlapping(ssm_gpu.contents() as *const f32, state.ssm_state.as_mut_ptr(), ssm_size); }
+        let cmd_buf = c.queue.new_command_buffer();
+        let enc = cmd_buf.new_compute_command_encoder();
+        metal_kernels::encode_rms_norm_qk(c, &enc, &q_gpu, 0, &k_gpu, 0, num_k_heads as u32, key_dim as u32, inv_scale);
+        metal_kernels::encode_compute_decay_beta(c, &enc, &alpha_gpu, &beta_gpu, &a_log_gpu, 0, &dt_bias_gpu, 0, &g_decay_gpu, &beta_gate_gpu, num_v_heads as u32);
+        metal_kernels::encode_gated_delta_net_step(c, &enc, ssm_gpu, &q_gpu, 0, &k_gpu, 0, &v_gpu, 0, &g_decay_gpu, &beta_gate_gpu, &out_gpu, num_v_heads as u32, k_heads_per_v as u32, key_dim as u32, value_dim as u32);
+        if let Some(ref gnw_buf) = gnw_gpu {
+            metal_kernels::encode_gated_rms_norm(c, &enc, &out_gpu, &z_gpu, gnw_buf, 0, &gated_gpu2, num_v_heads as u32, value_dim as u32);
+        }
+        enc.end_encoding();
+        cmd_buf.commit();
+        cmd_buf.wait_until_completed();
+        if gnw_gpu.is_some() {
+            unsafe { std::ptr::copy_nonoverlapping(gated_gpu2.contents() as *const f32, gated_out.as_mut_ptr(), total_value); }
         } else {
+            unsafe { std::ptr::copy_nonoverlapping(out_gpu.contents() as *const f32, gated_out.as_mut_ptr(), total_value); }
+        }
+        unsafe { std::ptr::copy_nonoverlapping(ssm_gpu.contents() as *const f32, state.ssm_state.as_mut_ptr(), ssm_size); }
+    } else {
         let mut q_normed = vec![0.0f32; total_key];
         let mut k_normed = vec![0.0f32; total_key];
         for h in 0..num_k_heads {
@@ -778,7 +773,6 @@ pub fn linear_attention_forward(
         } else {
             gated_out.copy_from_slice(&out_values);
         }
-    }
     }
 
     // Output projection
@@ -1218,7 +1212,6 @@ pub fn moe_layer_forward(
 
         // ── Phase 1: Parallel pread (cache hits skip I/O) ──
         let mut valid = [false; MAX_K];
-        let has_io = expert_io.is_some();
         let mut fallback_expert_bufs: Vec<Buffer> = Vec::new();
 
         // Mutable phase: check cache, insert misses, parallel pread
@@ -1340,23 +1333,23 @@ pub fn moe_layer_forward(
                 } else {
                     continue;
                 };
-                kernels::encode_matvec_offset(ctx, &enc,
+                metal_kernels::encode_matvec_offset(ctx, &enc,
                     expert_buf, layout.gate_w_off as u64,
                     expert_buf, layout.gate_s_off as u64,
                     expert_buf, layout.gate_b_off as u64,
                     &x_buf, 0, &gate_out, 0,
                     inter_u32, hidden_u32, gs_u32, 3);
 
-                kernels::encode_matvec_offset(ctx, &enc,
+                metal_kernels::encode_matvec_offset(ctx, &enc,
                     expert_buf, layout.up_w_off as u64,
                     expert_buf, layout.up_s_off as u64,
                     expert_buf, layout.up_b_off as u64,
                     &x_buf, 0, &up_out, 0,
                     inter_u32, hidden_u32, gs_u32, 3);
 
-                kernels::encode_swiglu(ctx, &enc, &gate_out, 0, &up_out, 0, &act_out, 0, inter_u32);
+                metal_kernels::encode_swiglu(ctx, &enc, &gate_out, 0, &up_out, 0, &act_out, 0, inter_u32);
 
-                kernels::encode_matvec_offset(ctx, &enc,
+                metal_kernels::encode_matvec_offset(ctx, &enc,
                     expert_buf, layout.down_w_off as u64,
                     expert_buf, layout.down_s_off as u64,
                     expert_buf, layout.down_b_off as u64,
@@ -1366,7 +1359,7 @@ pub fn moe_layer_forward(
 
             // Shared expert SwiGLU on GPU
             if let (Some(ref sg), Some(ref su)) = (sg_buf_gpu.as_ref(), su_buf_gpu.as_ref()) {
-                kernels::encode_swiglu(ctx, &enc, sg, 0, su, 0, &shared_act_gpu, 0, shared_inter as u32);
+                metal_kernels::encode_swiglu(ctx, &enc, sg, 0, su, 0, &shared_act_gpu, 0, shared_inter as u32);
             }
 
             gw.encode_matvec_into(wf, ctx, &enc,

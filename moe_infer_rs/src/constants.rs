@@ -16,8 +16,6 @@ pub const MAX_ACTIVE_EXPERTS: usize = 64;
 /// Number of output rows per threadgroup in the v3/v5 shaders.
 pub const ROWS_PER_TG: u32 = 8;
 
-/// Max experts in fused MoE path.
-pub const MAX_K_FUSED: usize = 16;
 
 /// Threadgroup size for optimized kernels.
 pub const TG_SIZE: u32 = 256;

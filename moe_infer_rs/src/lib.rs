@@ -2,17 +2,13 @@ pub mod config;
 pub mod constants;
 pub mod engine;
 pub mod error;
-pub mod expert;
-pub mod pipeline_full;
 pub mod pipeline_gpu;
-pub mod kernels;
+pub mod metal_kernels;
 pub mod metal_context;
-pub mod moe;
 pub mod pipeline_common;
 pub mod pipeline_cpu;
 pub mod pipeline_fusedwoods;
 pub mod pipeline_fusedexp;
-pub mod quant;
 pub mod timer;
 pub mod weights;
 
@@ -23,13 +19,11 @@ mod python_bindings;
 pub use config::{load_model_config, ExpertLayout, ModelConfig};
 pub use constants::*;
 pub use error::MoEError;
-pub use expert::{run_expert_forward, run_expert_forward_fast, ExpertTiming};
-pub use pipeline_full::{run_full_forward, FullForwardTiming};
+
 pub use pipeline_gpu::{moe_layer_forward, linear_attention_forward, full_attention_forward};
-pub use pipeline_common::{LinearAttnState, FullAttnCache, FullAttnCmd2State, DeferredExperts, PipelineMode, LinearAttnFusedWoodsState};
+pub use pipeline_common::{LinearAttnState, FullAttnCache, FullAttnCmd2State, DeferredExperts, PipelineMode, bf16_to_f32, cpu_dequant_matvec_4bit, cpu_rms_norm};
+pub use pipeline_fusedwoods::LinearAttnFusedWoodsState;
 pub use metal_context::{MetalContext, GpuWeightCtx, ExpertIOState, ExpertCache, metal_buf_shared};
-pub use moe::{run_moe_forward, run_moe_forward_fused, MoETiming};
-pub use quant::{bf16_to_f32, cpu_dequant_matvec_4bit, cpu_swiglu};
 pub use timer::now_ms;
 pub use weights::WeightFile;
 

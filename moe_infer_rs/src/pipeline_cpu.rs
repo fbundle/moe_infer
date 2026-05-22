@@ -7,7 +7,7 @@ use crate::pipeline_common::{
     cpu_conv1d_step, cpu_rms_norm_bare, cpu_rms_norm_gated, cpu_sigmoid,
     LinearAttnState, CONV_KERNEL_SIZE, GROUP_SIZE, RMS_NORM_EPS,
 };
-use crate::quant::{bf16_to_f32, cpu_dequant_matvec_4bit, cpu_rms_norm};
+use crate::pipeline_common::{bf16_to_f32, cpu_dequant_matvec_4bit};
 use crate::weights::WeightFile;
 
 /// Run CPU linear attention: dequant projections → conv1d → SSM → gated_norm → out_proj → residual.
@@ -128,11 +128,11 @@ pub fn cpu_linear_attention(
         // Single command buffer: all GPU kernels batched together
         let cmd_buf = c.queue.new_command_buffer();
         let enc = cmd_buf.new_compute_command_encoder();
-        crate::kernels::encode_rms_norm_qk(c, &enc, &q_gpu, 0, &k_gpu, 0, num_k_heads as u32, key_dim as u32, inv_scale);
-        crate::kernels::encode_compute_decay_beta(c, &enc, &alpha_gpu, &beta_gpu, &a_log_gpu, 0, &dt_bias_gpu, 0, &g_decay_gpu, &beta_gate_gpu, num_v_heads as u32);
-        crate::kernels::encode_gated_delta_net_step(c, &enc, ssm_gpu, &q_gpu, 0, &k_gpu, 0, &v_gpu, 0, &g_decay_gpu, &beta_gate_gpu, &out_gpu, num_v_heads as u32, k_heads_per_v as u32, key_dim as u32, value_dim as u32);
+        crate::metal_kernels::encode_rms_norm_qk(c, &enc, &q_gpu, 0, &k_gpu, 0, num_k_heads as u32, key_dim as u32, inv_scale);
+        crate::metal_kernels::encode_compute_decay_beta(c, &enc, &alpha_gpu, &beta_gpu, &a_log_gpu, 0, &dt_bias_gpu, 0, &g_decay_gpu, &beta_gate_gpu, num_v_heads as u32);
+        crate::metal_kernels::encode_gated_delta_net_step(c, &enc, ssm_gpu, &q_gpu, 0, &k_gpu, 0, &v_gpu, 0, &g_decay_gpu, &beta_gate_gpu, &out_gpu, num_v_heads as u32, k_heads_per_v as u32, key_dim as u32, value_dim as u32);
         if let Some(ref gnw_buf) = gnw_gpu {
-            crate::kernels::encode_gated_rms_norm(c, &enc, &out_gpu, &z_gpu, gnw_buf, 0, &gated_gpu2, num_v_heads as u32, value_dim as u32);
+            crate::metal_kernels::encode_gated_rms_norm(c, &enc, &out_gpu, &z_gpu, gnw_buf, 0, &gated_gpu2, num_v_heads as u32, value_dim as u32);
         }
         enc.end_encoding();
         cmd_buf.commit();

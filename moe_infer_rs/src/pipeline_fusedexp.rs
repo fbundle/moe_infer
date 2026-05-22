@@ -14,15 +14,14 @@ use std::os::fd::RawFd;
 
 use metal::{Buffer, ComputeCommandEncoderRef};
 
-use crate::kernels;
+use crate::metal_kernels;
 use crate::metal_context::{GpuWeightCtx, MetalContext, MAX_K};
 use crate::pipeline_common::{
-    cpu_normalize_weights, cpu_softmax, cpu_topk,
+    bf16_to_f32, cpu_normalize_weights, cpu_softmax, cpu_topk,
     DeferredExperts, ExecCtx, FullAttnCache, FullAttnCmd2State, LinearAttnState,
     SignalCheckFn, CONV_KERNEL_SIZE, FULL_ATTN_INTERVAL, RMS_NORM_EPS,
 };
 use crate::pipeline_gpu::{full_attention_forward, moe_layer_forward};
-use crate::quant::bf16_to_f32;
 use crate::weights::WeightFile;
 
 /// Encode post_expert for a previously-routed layer into a command encoder.
@@ -74,24 +73,24 @@ pub fn encode_post_expert(
         let expert_buf = &expert_data[ki];
         if expert_buf.length() == 0 { continue; }
 
-        kernels::encode_matvec_offset(ctx, enc,
+        metal_kernels::encode_matvec_offset(ctx, enc,
             expert_buf, layout.gate_w_off as u64,
             expert_buf, layout.gate_s_off as u64,
             expert_buf, layout.gate_b_off as u64,
             post_normed, 0, expert_scratch_gate, 0,
             inter_u32, hidden_u32, gs_u32, 3);
 
-        kernels::encode_matvec_offset(ctx, enc,
+        metal_kernels::encode_matvec_offset(ctx, enc,
             expert_buf, layout.up_w_off as u64,
             expert_buf, layout.up_s_off as u64,
             expert_buf, layout.up_b_off as u64,
             post_normed, 0, expert_scratch_up, 0,
             inter_u32, hidden_u32, gs_u32, 3);
 
-        kernels::encode_swiglu(ctx, enc, expert_scratch_gate, 0, expert_scratch_up, 0,
+        metal_kernels::encode_swiglu(ctx, enc, expert_scratch_gate, 0, expert_scratch_up, 0,
             expert_scratch_act, 0, inter_u32);
 
-        kernels::encode_matvec_offset(ctx, enc,
+        metal_kernels::encode_matvec_offset(ctx, enc,
             expert_buf, layout.down_w_off as u64,
             expert_buf, layout.down_s_off as u64,
             expert_buf, layout.down_b_off as u64,
@@ -103,7 +102,7 @@ pub fn encode_post_expert(
     {
         let sg = ctx.buf_shared_gate.as_ref().unwrap();
         let su = ctx.buf_shared_up.as_ref().unwrap();
-        kernels::encode_swiglu(ctx, enc, sg, 0, su, 0, shared_scratch, 0, shared_inter as u32);
+        metal_kernels::encode_swiglu(ctx, enc, sg, 0, su, 0, shared_scratch, 0, shared_inter as u32);
     }
 
     // ── Shared down_proj ──
@@ -224,7 +223,7 @@ pub fn encode_pre_expert(
     // ── conv1d_step ──
     if let Some(conv_w_ptr) = wf.get_tensor_ptr(&format!("{}.conv1d.weight", prefix)) {
         let conv_w_off = (conv_w_ptr as usize - gw.base as usize) as u64;
-        kernels::encode_conv1d_step(c, enc,
+        metal_kernels::encode_conv1d_step(c, enc,
             &c.buf_conv_state[linear_idx],
             &c.batch_out[0],
             &gw.buf, conv_w_off,
@@ -233,7 +232,7 @@ pub fn encode_pre_expert(
     }
 
     // ── rms_norm_qk ──
-    kernels::encode_rms_norm_qk(c, enc,
+    metal_kernels::encode_rms_norm_qk(c, enc,
         c.buf_conv_output.as_ref().unwrap(), 0,
         c.buf_conv_output.as_ref().unwrap(), (total_key * 4) as u64,
         num_k_heads as u32, key_dim as u32, inv_scale);
@@ -244,7 +243,7 @@ pub fn encode_pre_expert(
         let dt_bias_ptr = wf.get_tensor_ptr(&format!("{}.dt_bias", prefix));
         let a_log_off = a_log_ptr.map_or(0, |p| (p as usize - gw.base as usize) as u64);
         let dt_bias_off = dt_bias_ptr.map_or(0, |p| (p as usize - gw.base as usize) as u64);
-        kernels::encode_compute_decay_beta(c, enc,
+        metal_kernels::encode_compute_decay_beta(c, enc,
             &c.batch_out[3],
             &c.batch_out[2],
             if a_log_ptr.is_some() { &gw.buf } else { &c.batch_out[3] }, a_log_off,
@@ -260,7 +259,7 @@ pub fn encode_pre_expert(
         let k_off = (total_key * 4) as u64;
         let v_off = (2 * total_key * 4) as u64;
         let conv_out = c.buf_conv_output.as_ref().unwrap();
-        kernels::encode_gated_delta_net_step(c, enc,
+        metal_kernels::encode_gated_delta_net_step(c, enc,
             &c.buf_delta_state[linear_idx],
             conv_out, q_off,
             conv_out, k_off,
@@ -276,7 +275,7 @@ pub fn encode_pre_expert(
         let gnw_ptr = wf.get_tensor_ptr(&format!("{}.norm.weight", prefix));
         if let Some(gnw_p) = gnw_ptr {
             let gnw_off = (gnw_p as usize - gw.base as usize) as u64;
-            kernels::encode_gated_rms_norm(c, enc,
+            metal_kernels::encode_gated_rms_norm(c, enc,
                 c.buf_delta_output.as_ref().unwrap(),
                 &c.batch_out[1],
                 &gw.buf, gnw_off,

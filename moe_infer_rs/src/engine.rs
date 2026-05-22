@@ -12,12 +12,12 @@ use rand::Rng;
 use crate::config::{load_model_config, ModelConfig};
 use crate::metal_context::{metal_buf_shared, GpuWeightCtx, MetalContext};
 use crate::pipeline_common::{
-    DeferredExperts, ExecCtx, FullAttnCache, FullAttnCmd2State, LinearAttnFusedWoodsState,
+    bf16_to_f32, DeferredExperts, ExecCtx, FullAttnCache, FullAttnCmd2State,
     LinearAttnState, PipelineMode, SignalCheckFn, FULL_ATTN_INTERVAL, MAX_SEQ, RMS_NORM_EPS,
 };
+use crate::pipeline_fusedwoods::LinearAttnFusedWoodsState;
 use crate::pipeline_fusedexp::process_token_fusedexp_pipelined;
 use crate::pipeline_gpu::{full_attention_forward, linear_attention_forward, moe_layer_forward};
-use crate::quant::bf16_to_f32;
 use crate::weights::WeightFile;
 
 // ─── Model (data only) ──────────────────────────────────────────────────────
