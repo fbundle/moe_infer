@@ -205,7 +205,7 @@ impl Engine {
 
         let arr = PyArray2::<f32>::from_owned_array(py,
             numpy::ndarray::Array2::from_shape_vec((n, vs), logits).unwrap());
-        Ok(arr.into_py(py))
+        Ok(arr.into_pyobject(py).unwrap().into_any().into())
     }
 
     #[pyo3(signature = (input_ids, cache, max_tokens=256, temperature=0.0,
@@ -239,7 +239,7 @@ impl Engine {
         ).map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e))?;
         self.telemetry = telemetry;
 
-        Ok(PyArray1::<i64>::from_vec(py, tokens).into_py(py))
+        Ok(PyArray1::<i64>::from_vec(py, tokens).into_pyobject(py).unwrap().into_any().into())
     }
 
     #[pyo3(signature = (input_ids, cache, max_tokens=256, temperature=0.0,
@@ -295,7 +295,7 @@ impl Engine {
             is_fused_woods,
         };
 
-        Ok(iter.into_py(py))
+        Ok(iter.into_pyobject(py).unwrap().into_any().into())
     }
 
     fn telemetry(&self, py: Python<'_>) -> PyResult<PyObject> {
@@ -311,7 +311,7 @@ impl Engine {
             } else { 0.0 }
         } else { 0.0 };
         dict.set_item("tokens_per_sec", tps)?;
-        Ok(dict.into_py(py))
+        Ok(dict.into_pyobject(py).unwrap().into_any().into())
     }
 
     fn __repr__(&self) -> String {
@@ -354,7 +354,7 @@ impl StreamGenIterator {
         }
 
         let token = self.next_token as i64;
-        let logits_obj = PyArray1::<f32>::from_vec(py, self.logits.clone()).into_py(py);
+        let logits_obj = PyArray1::<f32>::from_vec(py, self.logits.clone()).into_pyobject(py).unwrap().into_any().into();
         self.tokens_generated += 1;
 
         if self.remaining == 0 || self.eos.contains(&self.next_token) {

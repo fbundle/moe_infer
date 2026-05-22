@@ -6,7 +6,7 @@ use crate::metal_context::{metal_buf_shared, WeightBuffer, MetalContext};
 use crate::model::config::ModelConfig;
 use crate::model::weights::WeightFile;
 
-use crate::math::{bf16_to_f32, dequant_matvec_4bit, rms_norm};
+use crate::math::{apply_rope, bf16_to_f32, dequant_matvec_4bit, rms_norm};
 
 // ─── GPU state passed from full-attention forward to MoE for CMD2 fusion ──
 
@@ -27,40 +27,6 @@ pub struct FullAttnCmd2State {
     pub scale: f32,
     pub q_dim: u32,
     pub o_prefix: String,
-}
-
-// ─── RoPE ─────────────────────────────────────────────────────────────────
-
-fn apply_rope(
-    q: &mut [f32], k: &mut [f32], pos: usize,
-    num_q_heads: usize, num_kv_heads: usize,
-    head_dim: usize, rotary_dim: usize, rope_theta: f64,
-) {
-    // NeoX-style (traditional=False): pairs (i, i + rotary_dim/2)
-    let pos_f = pos as f32;
-    let half = rotary_dim / 2;
-    for h in 0..num_q_heads {
-        let qh = &mut q[h * head_dim..];
-        for i in 0..half {
-            let theta = pos_f as f64 * rope_theta.powf(-2.0 * (i as f64) / rotary_dim as f64);
-            let cos = theta.cos() as f32;
-            let sin = theta.sin() as f32;
-            let (q0, q1) = (qh[i], qh[i + half]);
-            qh[i] = q0 * cos - q1 * sin;
-            qh[i + half] = q0 * sin + q1 * cos;
-        }
-    }
-    for h in 0..num_kv_heads {
-        let kh = &mut k[h * head_dim..];
-        for i in 0..half {
-            let theta = pos_f as f64 * rope_theta.powf(-2.0 * (i as f64) / rotary_dim as f64);
-            let cos = theta.cos() as f32;
-            let sin = theta.sin() as f32;
-            let (k0, k1) = (kh[i], kh[i + half]);
-            kh[i] = k0 * cos - k1 * sin;
-            kh[i + half] = k0 * sin + k1 * cos;
-        }
-    }
 }
 
 // ─── Full attention forward ───────────────────────────────────────────────
