@@ -77,6 +77,7 @@ pub struct Telemetry {
     pub prefill_ms: f64,
     pub total_ms: f64,
     pub tokens_generated: usize,
+    pub engine: BTreeMap<String, TelemetryValue>,
 }
 
 // ─── Sampling ──────────────────────────────────────────────────────────────
@@ -153,7 +154,6 @@ pub struct Engine {
     expert_gpu_buffer: Option<ExpertBuffer>,
     mode: String,
     pub telemetry: Telemetry,
-    engine_telemetry: BTreeMap<String, TelemetryValue>,
 }
 
 impl EngineTrait for Engine {
@@ -167,7 +167,7 @@ impl EngineTrait for Engine {
             "Cpu" | "CpuOnly" => {
                 let mut engine = EngineCPU { model: &self.model };
                 let logits = engine.forward(input_ids, cache, check_signal);
-                self.engine_telemetry = engine.telemetry();
+                self.telemetry.engine = engine.telemetry();
                 logits
             }
             "FusedExp" => {
@@ -179,7 +179,7 @@ impl EngineTrait for Engine {
                     timing: BTreeMap::new(),
                 };
                 let logits = engine.forward(input_ids, cache, check_signal);
-                self.engine_telemetry = engine.telemetry();
+                self.telemetry.engine = engine.telemetry();
                 logits
             }
             "FusedWoods" => {
@@ -190,7 +190,7 @@ impl EngineTrait for Engine {
                     expert_gpu_buffer: self.expert_gpu_buffer.as_mut(),
                 };
                 let logits = engine.forward(input_ids, cache, check_signal);
-                self.engine_telemetry = engine.telemetry();
+                self.telemetry.engine = engine.telemetry();
                 logits
             }
             _ => return Err(format!("Unknown pipeline mode: {}", self.mode)),
@@ -244,8 +244,7 @@ impl Engine {
             gpu_wf,
             expert_gpu_buffer,
             mode: pipeline_mode.to_string(),
-            telemetry: Telemetry { prefill_ms: 0.0, total_ms: 0.0, tokens_generated: 0 },
-            engine_telemetry: BTreeMap::new(),
+            telemetry: Telemetry { prefill_ms: 0.0, total_ms: 0.0, tokens_generated: 0, engine: BTreeMap::new() },
         })
     }
 
@@ -292,7 +291,7 @@ impl Engine {
         let logits_last = &ls[ls.len() - vs..];
 
         self.telemetry = Telemetry { prefill_ms: gen_t0.elapsed().as_secs_f64() * 1000.0,
-            total_ms: 0.0, tokens_generated: 0 };
+            total_ms: 0.0, tokens_generated: 0, engine: BTreeMap::new() };
 
         let first_token = pick_token(logits_last, temperature, top_k, top_p, min_p);
 
@@ -323,7 +322,7 @@ impl Engine {
             } else { 0.0 }
         } else { 0.0 };
         dict.set_item("tokens_per_sec", tps)?;
-        for (k, v) in &self.engine_telemetry {
+        for (k, v) in &self.telemetry.engine {
             match v {
                 TelemetryValue::Scalar(val) => { dict.set_item(k, *val)?; }
                 TelemetryValue::List(vals) => {

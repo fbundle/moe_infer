@@ -12,7 +12,6 @@
 /// ```
 use std::collections::BTreeMap;
 use std::ffi::c_void;
-use std::os::fd::RawFd;
 use std::time::Instant;
 
 use metal::{Buffer, CommandBuffer, ComputeCommandEncoderRef, MTLSize};
@@ -23,6 +22,7 @@ use crate::constants::{CONV_KERNEL_SIZE, FULL_ATTN_INTERVAL, GROUP_SIZE, MAX_SEQ
 use crate::cache::{Cache, LinearAttnState};
 use crate::engine::Engine;
 use crate::model::Model;
+use crate::model::expert::ExpertFile;
 use crate::engine::{SignalCheckFn, TelemetryValue};
 use crate::model::config::{ExpertLayout, ModelConfig};
 use crate::model::weights::WeightFile;
@@ -245,7 +245,7 @@ impl<'a> ExecCtx<'a> {
         };
 
         moe_layer_forward(
-            wf, layer, hidden, self.model.expert_fds[layer],
+            wf, layer, hidden, &self.model.expert_files[layer],
             self.ctx, self.gpu_wf, config,
             Some(attn), self.expert_gpu_buffer.as_deref_mut(),
             &mut self.timing,
@@ -265,7 +265,6 @@ impl<'a> ExecCtx<'a> {
         let moe_inter = self.model.config.moe_intermediate;
         let shared_inter = self.model.config.shared_intermediate;
         let k = self.model.config.num_experts_per_tok;
-        let expert_size = self.model.config.expert_size_4bit;
         let layout = &self.model.config.expert_layout_4bit;
         let qkv_dim = self.model.config.linear_conv_dim;
         let total_key = self.model.config.linear_total_key;
@@ -316,8 +315,8 @@ impl<'a> ExecCtx<'a> {
 
         let (_, mut prev_weights, mut prev_gate_score) = route_and_pread(
             self.ctx, self.expert_gpu_buffer.as_mut().unwrap(),
-            first_layer, self.model.expert_fds[first_layer],
-            num_experts, k, expert_size,
+            first_layer, &self.model.expert_files[first_layer],
+            num_experts, k,
             &mut self.timing,
         );
 
@@ -359,8 +358,8 @@ impl<'a> ExecCtx<'a> {
 
             let (_, weights, gate_score) = route_and_pread(
                 self.ctx, self.expert_gpu_buffer.as_mut().unwrap(),
-                curr_layer, self.model.expert_fds[curr_layer],
-                num_experts, k, expert_size,
+                curr_layer, &self.model.expert_files[curr_layer],
+                num_experts, k,
                 &mut self.timing,
             );
             prev_weights = weights;
@@ -416,7 +415,7 @@ fn moe_layer_forward(
     wf: &WeightFile,
     layer_idx: usize,
     hidden: &mut [f32],
-    packed_fd: RawFd,
+    expert_file: &ExpertFile,
     ctx: &MetalContext,
     gpu_wf: &WeightBuffer,
     config: &ModelConfig,
@@ -690,20 +689,13 @@ fn moe_layer_forward(
 
         if miss_count > 0 {
             let t_io = Instant::now();
-            let mut pread_tasks: Vec<(RawFd, usize, usize, i64)> = Vec::with_capacity(miss_count);
             for m in 0..miss_count {
                 let ki = miss_k_slot[m];
                 let eidx = miss_ei[m];
-                let ptr = io.expert_data[ki].contents() as usize;
-                pread_tasks.push((packed_fd, ptr, expert_size, (eidx as i64) * (expert_size as i64)));
+                let ptr = io.expert_data[ki].contents() as *mut u8;
+                let dst = unsafe { std::slice::from_raw_parts_mut(ptr, expert_size) };
+                expert_file.read_expert(eidx, dst).unwrap();
             }
-            rayon::scope(|s| {
-                for (fd, dst, sz, off) in pread_tasks {
-                    s.spawn(move |_| {
-                        unsafe { libc::pread(fd, dst as *mut c_void, sz, off); }
-                    });
-                }
-            });
             let dt = t_io.elapsed().as_secs_f64() * 1000.0;
             timing_add(timing, "engine.expert_io_ms", dt);
         }
@@ -715,12 +707,14 @@ fn moe_layer_forward(
         for ki in 0..actual_k {
             let eidx = expert_indices[ki];
             let buf = metal_buf_shared(&ctx.device, expert_size);
-            let nread = unsafe {
-                let ptr = buf.contents() as *mut u8;
-                let slice = std::slice::from_raw_parts_mut(ptr, expert_size);
-                libc::pread(packed_fd, slice.as_mut_ptr() as *mut c_void, expert_size, (eidx as i64) * (expert_size as i64))
-            };
-            if nread == expert_size as isize { valid[ki] = true; }
+            let mut dst = vec![0u8; expert_size];
+            if expert_file.read_expert(eidx, &mut dst).is_ok() {
+                unsafe {
+                    let ptr = buf.contents() as *mut u8;
+                    std::ptr::copy_nonoverlapping(dst.as_ptr(), ptr, expert_size);
+                }
+                valid[ki] = true;
+            }
             fallback_expert_bufs.push(buf);
         }
         let dt = t_io.elapsed().as_secs_f64() * 1000.0;
@@ -905,11 +899,7 @@ fn moe_layer_forward(
     let mut eout = vec![0.0f32; hidden_dim];
 
     for (&eidx, &ew) in expert_indices.iter().zip(expert_weights.iter()) {
-        let expert_offset = (eidx as i64) * (expert_size as i64);
-        let nread = unsafe {
-            libc::pread(packed_fd, expert_data.as_mut_ptr() as *mut c_void, expert_size, expert_offset)
-        };
-        if nread != expert_size as isize { continue; }
+        if expert_file.read_expert(eidx, &mut expert_data).is_err() { continue; }
 
         let gw = unsafe { std::slice::from_raw_parts(expert_data.as_ptr().add(layout.gate_w_off) as *const u32, layout.gate_w_size / 4) };
         let gs = unsafe { std::slice::from_raw_parts(expert_data.as_ptr().add(layout.gate_s_off) as *const u16, layout.gate_s_size / 2) };
@@ -973,10 +963,9 @@ fn route_and_pread(
     ctx: &MetalContext,
     expert_gpu_buffer: &mut ExpertBuffer,
     layer_idx: usize,
-    layer_fd: RawFd,
+    expert_file: &ExpertFile,
     num_experts: usize,
     k: usize,
-    expert_size: usize,
     timing: &mut BTreeMap<String, TelemetryValue>,
 ) -> (Vec<usize>, Vec<f32>, f32) {
     let gate_buf = ctx.buf_gate_scores.as_ref().unwrap();
@@ -1016,21 +1005,14 @@ fn route_and_pread(
     }
     if miss_count > 0 {
         let t_io = Instant::now();
-        let mut pread_tasks: Vec<(RawFd, usize, usize, i64)> = Vec::with_capacity(miss_count);
+        let expert_size = expert_file.expert_size();
         for m in 0..miss_count {
             let ki = miss_k_slot[m];
             let eidx = miss_ei[m];
-            let ptr = expert_gpu_buffer.expert_data[ki].contents() as usize;
-            pread_tasks.push((
-                layer_fd, ptr, expert_size, (eidx as i64) * (expert_size as i64)));
+            let ptr = expert_gpu_buffer.expert_data[ki].contents() as *mut u8;
+            let dst = unsafe { std::slice::from_raw_parts_mut(ptr, expert_size) };
+            expert_file.read_expert(eidx, dst).unwrap();
         }
-        rayon::scope(|s| {
-            for (fd, dst, sz, off) in pread_tasks {
-                s.spawn(move |_| {
-                    unsafe { libc::pread(fd, dst as *mut c_void, sz, off); }
-                });
-            }
-        });
         let dt = t_io.elapsed().as_secs_f64() * 1000.0;
         timing_add(timing, "engine.expert_io_ms", dt);
     }

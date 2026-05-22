@@ -11,6 +11,7 @@ import os
 import time
 from pathlib import Path
 
+import helpers.compress_experts_lz4 as compress_experts_lz4
 import helpers.extract_weights as extract_weights
 import helpers.repack_experts_4bit as repack_experts_4bit
 
@@ -26,12 +27,12 @@ def main():
         help="Path to HuggingFace model directory",
     )
     parser.add_argument(
-        "--output", type=str, default=None,
+        "--output", type=str, default="data",
         help="Output directory",
     )
     parser.add_argument(
         "--step", type=str, default=None,
-        choices=["tokenizer", "config", "weights", "experts"],
+        choices=["tokenizer", "config", "weights", "experts", "lz4"],
         help="Run a single step (default: all)",
     )
     args = parser.parse_args()
@@ -46,7 +47,7 @@ def main():
     print(f"  Output: {output_dir}")
     print()
 
-    steps = ["config", "weights", "experts"]
+    steps = ["config", "weights", "experts", "lz4"]
     if args.step:
         steps = [args.step]
 
@@ -69,6 +70,9 @@ def main():
         elif step == "experts":
             packed_dir = os.path.join(output_dir, "packed_experts")
             repack_experts_4bit.run(model_dir, packed_dir)
+
+        elif step == "lz4":
+            compress_experts_lz4.run(output_dir)
 
         print()
 

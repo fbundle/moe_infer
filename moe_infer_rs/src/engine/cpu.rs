@@ -386,14 +386,10 @@ impl<'a> ExecCtx<'a> {
 
         {
             let layout = &self.model.config.expert_layout_4bit;
-            let packed_fd = self.model.expert_fds[layer_idx];
+            let expert_file = &self.model.expert_files[layer_idx];
 
             for (&eidx, &ew) in expert_indices.iter().zip(expert_weights.iter()) {
-                let off = (eidx as i64) * (expert_size as i64);
-                let nread = unsafe {
-                    libc::pread(packed_fd, expert_data.as_mut_ptr() as *mut std::ffi::c_void, expert_size, off)
-                };
-                if nread != expert_size as isize { continue; }
+                if expert_file.read_expert(eidx, &mut expert_data).is_err() { continue; }
 
                 let gw = &expert_data[layout.gate_w_off..];
                 let gs = &expert_data[layout.gate_s_off..];

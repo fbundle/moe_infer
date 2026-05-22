@@ -4,7 +4,6 @@
 /// CMD2: out_proj + residual_add + rms_norm + gate + shared (1 fused encoder)
 /// CMD3: experts + combine + GPU-side input_norm (async, deferred commit)
 use std::ffi::c_void;
-use std::os::fd::RawFd;
 
 use metal::{Buffer, CommandBuffer, MTLSize};
 
@@ -15,6 +14,7 @@ use crate::metal_kernels;
 use crate::metal_context::{metal_buf_shared, ExpertBuffer, WeightBuffer, MetalContext, MAX_K};
 use crate::model::Model;
 use crate::model::config::ModelConfig;
+use crate::model::expert::ExpertFile;
 use crate::model::weights::WeightFile;
 use crate::engine::SignalCheckFn;
 use crate::math::{
@@ -816,7 +816,7 @@ fn moe_layer_forward(
     wf: &WeightFile,
     layer_idx: usize,
     hidden: &mut [f32],
-    packed_fd: RawFd,
+    expert_file: &ExpertFile,
     ctx: Option<&MetalContext>,
     gpu_wf: Option<&WeightBuffer>,
     config: &ModelConfig,
@@ -1208,20 +1208,13 @@ fn moe_layer_forward(
             }
 
             if miss_count > 0 {
-                let mut pread_tasks: Vec<(RawFd, usize, usize, i64)> = Vec::with_capacity(miss_count);
                 for m in 0..miss_count {
                     let ki = miss_k_slot[m];
                     let eidx = miss_ei[m];
-                    let ptr = io.expert_data[ki].contents() as usize;
-                    pread_tasks.push((packed_fd, ptr, expert_size, (eidx as i64) * (expert_size as i64)));
+                    let ptr = io.expert_data[ki].contents() as *mut u8;
+                    let dst = unsafe { std::slice::from_raw_parts_mut(ptr, expert_size) };
+                    expert_file.read_expert(eidx, dst).unwrap();
                 }
-                rayon::scope(|s| {
-                    for (fd, dst, sz, off) in pread_tasks {
-                        s.spawn(move |_| {
-                            unsafe { libc::pread(fd, dst as *mut std::ffi::c_void, sz, off); }
-                        });
-                    }
-                });
             }
             for m in 0..miss_count {
                 valid[miss_k_slot[m]] = true;
@@ -1230,12 +1223,12 @@ fn moe_layer_forward(
             for ki in 0..actual_k {
                 let eidx = expert_indices[ki];
                 let buf = metal_buf_shared(&ctx.device, expert_size);
-                let nread = unsafe {
-                    let ptr = buf.contents() as *mut u8;
-                    let slice = std::slice::from_raw_parts_mut(ptr, expert_size);
-                    libc::pread(packed_fd, slice.as_mut_ptr() as *mut std::ffi::c_void, expert_size, (eidx as i64) * (expert_size as i64))
-                };
-                if nread == expert_size as isize {
+                let mut dst = vec![0u8; expert_size];
+                if expert_file.read_expert(eidx, &mut dst).is_ok() {
+                    unsafe {
+                        let ptr = buf.contents() as *mut u8;
+                        std::ptr::copy_nonoverlapping(dst.as_ptr(), ptr, expert_size);
+                    }
                     valid[ki] = true;
                 }
                 fallback_expert_bufs.push(buf);
@@ -1422,18 +1415,7 @@ fn moe_layer_forward(
         let mut eout = vec![0.0f32; hidden_dim];
 
         for (&eidx, &ew) in expert_indices.iter().zip(expert_weights.iter()) {
-            let expert_offset = (eidx as i64) * (expert_size as i64);
-            let nread = unsafe {
-                libc::pread(
-                    packed_fd,
-                    expert_data.as_mut_ptr() as *mut std::ffi::c_void,
-                    expert_size,
-                    expert_offset,
-                )
-            };
-            if nread != expert_size as isize {
-                continue;
-            }
+            if expert_file.read_expert(eidx, &mut expert_data).is_err() { continue; }
 
             let gw = unsafe { std::slice::from_raw_parts(expert_data.as_ptr().add(layout.gate_w_off) as *const u32, layout.gate_w_size / 4) };
             let gs = unsafe { std::slice::from_raw_parts(expert_data.as_ptr().add(layout.gate_s_off) as *const u16, layout.gate_s_size / 2) };
@@ -1532,7 +1514,7 @@ struct ExecCtxGpu<'a> {
     ctx: &'a MetalContext,
     gpu_wf: &'a WeightBuffer,
     config: &'a ModelConfig,
-    expert_fds: &'a [RawFd],
+    expert_files: &'a [ExpertFile],
     expert_gpu_buffer: Option<&'a mut ExpertBuffer>,
 }
 
@@ -1604,7 +1586,7 @@ fn process_token_inner(
             }
         }
         let r = moe_layer_forward(
-            exec.wf, layer, hidden, exec.expert_fds[layer],
+            exec.wf, layer, hidden, &exec.expert_files[layer],
             Some(exec.ctx), Some(exec.gpu_wf), exec.config,
             attn_state, lin_state,
             exec.expert_gpu_buffer.as_mut().map(|x| &mut **x),
@@ -1637,7 +1619,7 @@ impl<'a> EngineFusedWoods<'a> {
             ctx: self.ctx,
             gpu_wf: self.gpu_wf,
             config: &self.model.config,
-            expert_fds: &self.model.expert_fds,
+            expert_files: &self.model.expert_files,
             expert_gpu_buffer: self.expert_gpu_buffer.as_deref_mut(),
         }
     }
