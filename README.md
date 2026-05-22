@@ -37,8 +37,7 @@ python helpers/gen_model_config.py \
 ### 2. Build and install Python bindings
 
 ```bash
-cd moe_infer_rs
-maturin develop --release
+uv pip install moe_infer_rs
 ```
 
 ### 3. Run inference
