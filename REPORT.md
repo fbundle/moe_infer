@@ -234,7 +234,7 @@ Both also share the GPU-side input_norm optimization: CMD3 computes RMS norm of 
 
 5. **Full attention GPU gating**. C uses batched GPU attention only when `seq_len >= 32` — below 32 tokens, CPU attention is faster because GPU encoder overhead dominates. Rust unconditionally uses GPU attention if pipelines are available, which may be slower for very short sequences.
 
-6. **CPU BLAS acceleration**. C's CPU fallback uses Apple Accelerate (`cblas_sgemv`, `cblas_sger`, `cblas_sscal`) for the linear attention SSM state update. Rust's CPU path uses hand-written loops in `quant.rs`. Accelerate BLAS is highly optimized for Apple Silicon and can be 2-5× faster for the SSM matvec operations.
+6. **CPU BLAS acceleration**. C's CPU fallback uses Apple Accelerate (`cblas_sgemv`, `cblas_sger`, `cblas_sscal`) for the linear attention SSM state update. Rust's CPU path uses hand-written loops in `math_util.rs`. Accelerate BLAS is highly optimized for Apple Silicon and can be 2-5× faster for the SSM matvec operations.
 
 7. **Per-phase timing telemetry**. C has fine-grained per-phase timing (`cmd1_submit`, `cmd1_wait`, `cpu_attn`, `cmd2_encode`, `cmd2_wait`, `expert_io`, `cmd3_encode`, `deferred_wait`, `deferred_cpu`, `spec_route`, `pred_read`, `routing_io`). Rust's `ctx.telemetry()` only reports `prefill_ms`, `total_ms`, `tokens_generated`, `tokens_per_sec`. Adding per-phase timing would help identify where Rust is slower.
 

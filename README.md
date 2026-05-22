@@ -140,31 +140,36 @@ Expert I/O (SSD reads) dominates at ~72% of per-layer time.
 ## Project Structure
 
 ```
-moe_infer_rs/           Rust engine + Python bindings
+moe_infer_rs/              Rust engine + Python bindings
   src/
-    gpu_forward.rs      Layer forward: linear/full attention, MoE routing
-    pipeline_common.rs  Shared types, CPU helpers, DeferredExperts
-    pipeline_cpu.rs     Cpu pipeline mode
-    pipeline_fusedwoods.rs  FusedWoods pipeline mode (CMD1+CMD2+CMD3)
-    pipeline_fusedexp.rs FusedExp pipeline mode
-    python_bindings.rs  PyO3 bindings (Model, Engine, Cache)
-    metal_context.rs    Metal device init, pipeline creation
-    kernels.rs          GPU kernel dispatch
-    weights.rs          Mmap'd weight file + tensor lookup
-    config.rs           JSON model config
-    quant.rs            bf16↔f32, CPU dequant matvec, SwiGLU, RMS norm
-    lib.rs              Module declarations
+    engine.rs              Engine trait, ExecCtxGpu, SignalCheckFn
+    engine/
+      cpu.rs               CPU engine (self-contained, pure f32)
+      fusedexp.rs          FusedExp pipeline (self-contained)
+      fusedwoods.rs        FusedWoods pipeline (self-contained, recommended)
+    model/
+      mod.rs               Model struct
+      config.rs            JSON model config
+      weights.rs           Mmap'd weight file + tensor lookup
+    math_util.rs           Math utilities (rms_norm, softmax, sigmoid, dequant, RoPE, etc.)
+    metal_util/
+      context.rs           Metal device init, pipeline creation, GPU scratch buffers
+      kernels.rs           Metal kernel dispatch (matvec, SwiGLU, conv1d, SSM, attention)
+    cache.rs               KV cache, linear attention state
+    constants.rs           Model constants (GROUP_SIZE, MAX_SEQ, etc.)
+    python_bindings.rs     PyO3 bindings (Model, Engine, Cache)
+    lib.rs                 Module declarations
   shaders/
-    shaders.metal       Metal compute shaders (embedded at compile time)
+    shaders.metal          Metal compute shaders (embedded at compile time)
   Cargo.toml
 
-helpers/                Model conversion scripts
-  convert.py            One-step convert: config + weights + experts
-  extract_weights.py    Non-expert weights → model_weights.bin
-  repack_experts_4bit.py MLX experts → packed_experts/
-  gen_model_config.py   Config generation
+helpers/                   Model conversion scripts
+  convert.py               One-step convert: config + weights + experts
+  extract_weights.py       Non-expert weights → model_weights.bin
+  repack_experts_4bit.py   MLX experts → packed_experts/
+  gen_model_config.py      Config generation
 
-verify_nway.py          Multi-engine logit verification
+verify_nway.py             Multi-engine logit verification
 ```
 
 ## License
