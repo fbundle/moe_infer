@@ -5,7 +5,13 @@ import numpy as np
 from tqdm import tqdm
 
 ROOT = os.path.dirname(os.path.abspath(__file__))
-MLX_DIR = os.path.join(ROOT, "hub", "models--mlx-community--Qwen3.5-35B-A3B-4bit-stripped")
+
+MODEL_DIR = os.path.join(ROOT, "data", "models--mlx-community--Qwen3.5-35B-A3B-4bit-stripped")
+MLX_MODEL_DIR = os.path.join(ROOT, "hub", "models--mlx-community--Qwen3.5-35B-A3B-4bit-stripped")
+
+RUST_ENGINES = ["Cpu", "FusedWoods", "FusedExp"]
+ENGINES = RUST_ENGINES + ["C", "mlx-lm"]
+
 C_DIR = os.path.join(ROOT, "moe_infer_c")
 RS_DIR = os.path.join(ROOT, "moe_infer_rs")
 
@@ -16,11 +22,11 @@ TOKENS = [248045, 8678, 198, 2523, 513, 264, 10631, 17313, 13, 593,
 
 def run_rust(mode):
     """Run Rust engine with given pipeline mode, return last-position logits."""
-    from moe_infer import Model, Engine, Cache
+    from moe_infer import Model, Engine, Cache # type: ignore
 
     t0 = __import__('time').time()
 
-    model = Model(MLX_DIR)
+    model = Model(MODEL_DIR)
     engine = Engine(model, pipeline_mode=mode)
     cache = Cache(model)
 
@@ -63,9 +69,9 @@ def run_c():
     result = subprocess.run(
         [
             bench_bin,
-            "--model", MLX_DIR,
-            "--weights", os.path.join(MLX_DIR, "model_weights.bin"),
-            "--manifest", os.path.join(MLX_DIR, "model_weights.json"),
+            "--model", MODEL_DIR,
+            "--weights", os.path.join(MODEL_DIR, "model_weights.bin"),
+            "--manifest", os.path.join(MODEL_DIR, "model_weights.json"),
             "--prompt-tokens", tokens_path,
             "--verify",
             "--verify-output", logits_path,
@@ -107,7 +113,7 @@ def run_mlx():
     from mlx_lm import load
     from mlx_lm import tokenizer_utils
 
-    model_path = Path(MLX_DIR)
+    model_path = Path(MLX_MODEL_DIR)
     model, _ = load(str(model_path))
     tokenizer = tokenizer_utils.load(model_path)
 
@@ -243,10 +249,10 @@ def main():
     )
     print()
 
-    engines = ["Cpu", "Gpu", "FusedWoods", "FusedExp", "C", "mlx-lm"]
+    engines = ENGINES
 
     results = {}
-    for mode in tqdm(["Cpu", "Gpu", "FusedWoods", "FusedExp"],
+    for mode in tqdm(RUST_ENGINES,
                      desc="Rust pipelines", unit="mode"):
         results[mode] = run_rust(mode)
 
