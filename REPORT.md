@@ -4,6 +4,8 @@
 
 MoE-Infer is a high-performance inference engine for Mixture-of-Experts models on Apple Silicon. It streams expert weights from SSD on demand, uses hand-tuned Metal compute shaders for all GPU operations, and exposes Python bindings via PyO3. No Python ML frameworks at runtime — just Rust, Metal, and ~0.65 GB of mmap'd weights.
 
+Built on the 3-command-buffer GPU pipeline architecture designed by Dan Woods in the original C/Metal engine. The `FusedWoods` pipeline mode is named in his honor.
+
 **Supported models**: `mlx-community/Qwen3.5-35B-A3B-4bit`, `mlx-community/Qwen3.6-35B-A3B-4bit`
 
 **Hardware**: Apple Silicon (M1–M4) with unified memory. Tested on M4.
@@ -55,11 +57,11 @@ All matrix-vector multiplies run on GPU via Metal compute shaders:
 | `Cpu` | Pure CPU reference. All dequant matvecs, norms, attention, SSM on CPU. | N/A (sequential) |
 | `Gpu` | Individual GPU kernel dispatch per operation. No command buffer fusion. | 10+ |
 | `FusedExp` | Linear attention fused into CMD1. MoE experts dispatched individually. | 4–6 |
-| `Fused3` | Full C-engine architecture: CMD1 (linear attn) + CMD2 (full attn + o_proj + routing) + async CMD3 (experts + combine). | 2–3 |
+| `FusedWoods` | Full C-engine architecture: CMD1 (linear attn) + CMD2 (full attn + o_proj + routing) + async CMD3 (experts + combine). | 2–3 |
 
-`Fused3` is the recommended mode and matches the C engine's 3-command-buffer design.
+`FusedWoods` (named after Dan Woods, author of the original C inference engine) is the recommended mode and matches the C engine's 3-command-buffer design.
 
-### Fused3 Command Buffer Layout
+### FusedWoods Command Buffer Layout
 
 **Linear attention layers (30/40)**:
 - CMD1: QKV/Z/B/A projections → Conv1d → Q/K RMS norms → SSM → Gated RMS norm → out_proj → Residual add
@@ -77,7 +79,7 @@ Benchmarked on Apple M4, Qwen3.5-35B-A3B-4bit full model, K=8 experts, 32-token 
 
 | Metric | Value |
 |--------|-------|
-| Generation speed (Fused3) | 2.69 tok/s |
+| Generation speed (FusedWoods) | 2.69 tok/s |
 | Expert I/O (disk read) | ~5.8 ms/layer |
 | Expert I/O share of per-layer time | ~72% |
 | Weight file (mmap) | 0.65 GB |
@@ -94,15 +96,15 @@ All verification uses the stripped model (4 layers, 4 experts) to enable fast it
 **Algorithmic bugs found and fixed**:
 1. **RoPE element pairing** (2026-05-22): `apply_rope()` used traditional consecutive pairs (d, d+1) instead of NeoX-style pairs (i, i + dims/2) used by MLX's `nn.RoPE(traditional=False)`. Fix reduced logit max_diff from 0.835 to 0.113 (7.4× improvement).
 
-2. **CpuOnly full-attention MoE bug** (2026-05-21): In CpuOnly mode, the GPU attention path returned early without adding attention output to hidden, causing MoE to use pre-attention hidden as residual. Attention contribution was lost (max_diff 4.88 vs Fused3).
+2. **CpuOnly full-attention MoE bug** (2026-05-21): In CpuOnly mode, the GPU attention path returned early without adding attention output to hidden, causing MoE to use pre-attention hidden as residual. Attention contribution was lost (max_diff 4.88 vs FusedWoods).
 
 **Per-operation verification** (Layer 0, token 0): Every intermediate tensor in GatedDeltaNet compared between Rust f32 and MLX bf16. All operations match within bf16 precision limits (~0.4% relative). No remaining algorithmic bugs.
 
 **Current state**: After all fixes, max logit diff = 0.113, cos_sim = 0.99996. The residual divergence is entirely attributable to bf16 vs f32 precision differences across ~40 operations per token. Per-layer hidden state error is bounded at ~2e-3 and does not grow across layers. The lm_head projection (2048 → 248320) amplifies this to the observed 0.113 logit max_diff.
 
-### C vs Rust Fused3 (Stripped Model)
+### C vs Rust FusedWoods (Stripped Model)
 
-C and Rust Fused3 are numerically identical (max_diff < 1e-5, 100% within 1e-3). The C→Rust port is faithful.
+C and Rust FusedWoods are numerically identical (max_diff < 1e-5, 100% within 1e-3). The C→Rust port is faithful.
 
 ## Key Design Decisions
 

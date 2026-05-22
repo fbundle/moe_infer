@@ -4,6 +4,8 @@ High-performance inference engine for Mixture-of-Experts models on Apple Silicon
 
 Supports `mlx-community/Qwen3.5-35B-A3B-4bit` and `mlx-community/Qwen3.6-35B-A3B-4bit`.
 
+The `FusedWoods` pipeline mode is named after Dan Woods, author of the original C/Metal inference engine this project builds upon.
+
 ## Hardware Requirements
 
 - Mac with Apple Silicon (M1/M2/M3/M4)
@@ -47,7 +49,7 @@ import numpy as np
 
 ctx = Context()
 ctx.load_model("hub/models--mlx-community--Qwen3.5-35B-A3B-4bit",
-               pipeline_mode="Fused3")
+               pipeline_mode="FusedWoods")
 cache = ctx.new_cache()
 
 # Forward pass
@@ -73,7 +75,7 @@ from moe_infer import Context, Cache
 
 | Method | Description |
 |--------|-------------|
-| `ctx.load_model(path, pipeline_mode="Fused3")` | Load a model. Modes: `Cpu`, `Gpu`, `FusedExp`, `Fused3` |
+| `ctx.load_model(path, pipeline_mode="FusedWoods")` | Load a model. Modes: `Cpu`, `Gpu`, `FusedExp`, `FusedWoods` |
 | `ctx.unload_model()` | Free Metal resources and close expert files |
 | `ctx.new_cache()` | Create a new KV cache + linear attention state |
 | `ctx.forward(input_ids, cache)` | Forward pass, returns `[n_tokens, vocab_size]` float32 logits |
@@ -95,7 +97,7 @@ from moe_infer import Context, Cache
 | `Cpu` | Pure CPU reference. All operations on CPU. Slow but useful for debugging. |
 | `Gpu` | GPU kernels with individual dispatch. No command buffer fusion. |
 | `FusedExp` | Linear attention fused into one command buffer. MoE experts dispatched individually. |
-| `Fused3` | Full 3-command-buffer pipeline (CMD1 + CMD2 + async CMD3). **Recommended.** |
+| `FusedWoods` | Full 3-command-buffer pipeline (CMD1 + CMD2 + async CMD3). **Recommended.** |
 
 ### Sampling Parameters
 
@@ -152,7 +154,7 @@ Apple M4, Qwen3.5-35B-A3B-4bit (40 layers, 256 experts, K=8), 32-token prompt, 1
 
 | Mode | tok/s |
 |------|-------|
-| Fused3 | 2.69 |
+| FusedWoods | 2.69 |
 | FusedExp | 2.14 |
 | Gpu | 1.70 |
 | Cpu | 0.15 |
@@ -167,7 +169,7 @@ moe_infer_rs/           Rust engine + Python bindings
     gpu_forward.rs      Layer forward: linear/full attention, MoE routing
     pipeline_common.rs  Shared types, CPU helpers, DeferredExperts
     pipeline_cpu.rs     Cpu pipeline mode
-    pipeline_fused3.rs  Fused3 pipeline mode (CMD1+CMD2+CMD3)
+    pipeline_fusedwoods.rs  FusedWoods pipeline mode (CMD1+CMD2+CMD3)
     pipeline_fusedexp.rs FusedExp pipeline mode
     python_bindings.rs  PyO3 bindings (Context, Cache)
     metal_context.rs    Metal device init, pipeline creation
