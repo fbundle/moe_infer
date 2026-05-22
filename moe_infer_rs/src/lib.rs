@@ -3,8 +3,6 @@
 #[path = "math/linear_attention.rs"] mod math_linear_attention;
 #[path = "math/lm_head.rs"] mod math_lm_head;
 #[path = "math/moe.rs"] mod math_moe;
-#[path = "math/sample.rs"] mod math_sample;
-
 pub mod engine;
 pub mod model;
 
@@ -13,7 +11,6 @@ mod constants;
 mod error;
 #[path = "metal_util/kernels.rs"] mod metal_kernels;
 #[path = "metal_util/context.rs"] mod metal_context;
-mod generate;
 mod timer;
 
 #[cfg(feature = "python-bindings")]

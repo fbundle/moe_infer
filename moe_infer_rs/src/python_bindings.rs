@@ -5,27 +5,16 @@ use std::time::Instant;
 
 use numpy::{PyArray1, PyArray2, PyArrayMethods};
 use pyo3::prelude::*;
+use rand::Rng;
+
 use crate::cache::Cache as CoreCache;
 use crate::model::Model as CoreModel;
 use crate::engine::cpu::EngineCPU;
-use crate::engine::fusedexp::{process_token_fusedexp_pipelined, EngineFusedExp};
+use crate::engine::fusedexp::EngineFusedExp;
 use crate::engine::fusedwoods::EngineFusedWoods;
-use crate::generate::{SampleParams, Telemetry};
-use crate::engine::{Engine as EngineTrait, ExecCtxGpu, SignalCheckFn};
-use crate::math::{embed_lookup, final_norm};
-use crate::math_lm_head::gpu_lm_head;
-use crate::engine::fusedwoods::process_token_inner;
-use crate::math_sample::sample;
+use crate::engine::{Engine as EngineTrait, SignalCheckFn};
+use crate::math::softmax;
 use crate::metal_context::{ExpertBuffer, WeightBuffer, MetalContext};
-
-// ─── Engine name (selects which engine impl to use) ───────────────────────────
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum EngineName {
-    Cpu,
-    FusedExp,
-    FusedWoods,
-}
 
 // ─── Model (thin wrapper) ───────────────────────────────────────────────────
 
@@ -73,6 +62,78 @@ impl Cache {
     fn __repr__(&self) -> String { format!("Cache(pos={})", self.inner.pos) }
 }
 
+// ─── Telemetry ──────────────────────────────────────────────────────────────
+
+pub struct Telemetry {
+    pub prefill_ms: f64,
+    pub total_ms: f64,
+    pub tokens_generated: usize,
+}
+
+// ─── Sampling ──────────────────────────────────────────────────────────────
+
+pub fn sample(logits: &mut [f32], temperature: f32, top_k: usize, top_p: f32, min_p: f32) -> usize {
+    let n = logits.len();
+    if (temperature - 1.0).abs() > 1e-7 {
+        let inv = 1.0 / temperature.max(1e-8);
+        for v in logits.iter_mut() { *v *= inv; }
+    }
+    if temperature < 0.01 {
+        return logits.iter().enumerate()
+            .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap())
+            .map(|(i, _)| i).unwrap_or(0);
+    }
+    softmax(logits);
+
+    if top_k > 0 && top_k < n {
+        let mut v: Vec<f32> = logits.to_vec();
+        v.select_nth_unstable_by(top_k, |a, b| b.partial_cmp(a).unwrap());
+        let t = v[top_k - 1];
+        for x in logits.iter_mut() { if *x < t { *x = 0.0; } }
+    }
+    if top_p < 1.0 {
+        let mut s: Vec<f32> = logits.iter().copied().filter(|&x| x > 0.0).collect();
+        s.sort_unstable_by(|a, b| b.partial_cmp(a).unwrap());
+        let total: f32 = s.iter().sum();
+        let mut cum = 0.0;
+        let mut cut = 0.0;
+        for v in s {
+            cum += v;
+            if cum / total >= top_p { cut = v; break; }
+        }
+        for x in logits.iter_mut() { if *x < cut { *x = 0.0; } }
+    }
+    if min_p > 0.0 {
+        let max_p = logits.iter().fold(0.0f32, |a, &b| a.max(b));
+        let t = max_p * min_p;
+        for x in logits.iter_mut() { if *x < t { *x = 0.0; } }
+    }
+
+    let sum: f32 = logits.iter().sum();
+    if sum <= 0.0 { return 0; }
+    let inv = 1.0 / sum;
+    let r: f32 = rand::thread_rng().gen();
+    let mut cum = 0.0;
+    for (i, &v) in logits.iter().enumerate() {
+        cum += v * inv;
+        if r <= cum { return i; }
+    }
+    n - 1
+}
+
+fn pick_token(logits: &[f32], temperature: f32, top_k: usize, top_p: f32, min_p: f32) -> usize {
+    if temperature < 0.01 {
+        logits.iter()
+            .enumerate()
+            .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap())
+            .map(|(i, _)| i)
+            .unwrap_or(0)
+    } else {
+        let mut copy = logits.to_vec();
+        sample(&mut copy, temperature, top_k, top_p, min_p)
+    }
+}
+
 // ─── Engine (owns GPU resources, implements Engine trait) ──────────────────
 
 #[pyclass(unsendable)]
@@ -81,32 +142,8 @@ pub struct Engine {
     ctx: MetalContext,
     gpu_wf: WeightBuffer,
     expert_gpu_buffer: Option<ExpertBuffer>,
-    pipeline_mode: EngineName,
+    mode: String,
     pub telemetry: Telemetry,
-}
-
-fn pipeline_mode_from_str(s: &str) -> PyResult<EngineName> {
-    match s {
-        "Cpu" | "CpuOnly" => Ok(EngineName::Cpu),
-        "FusedExp" => Ok(EngineName::FusedExp),
-        "FusedWoods" => Ok(EngineName::FusedWoods),
-        _ => Err(pyo3::exceptions::PyValueError::new_err(format!(
-            "Unknown pipeline_mode: {}. Use Cpu|FusedExp|FusedWoods", s
-        ))),
-    }
-}
-
-impl Engine {
-    fn make_exec_ctx(&mut self) -> ExecCtxGpu<'_> {
-        ExecCtxGpu {
-            wf: &self.model.wf,
-            ctx: &self.ctx,
-            gpu_wf: &self.gpu_wf,
-            config: &self.model.config,
-            expert_fds: &self.model.expert_fds,
-            expert_gpu_buffer: self.expert_gpu_buffer.as_mut(),
-        }
-    }
 }
 
 impl EngineTrait for Engine {
@@ -116,13 +153,12 @@ impl EngineTrait for Engine {
         cache: &mut CoreCache,
         check_signal: SignalCheckFn<'_>,
     ) -> Result<Vec<f32>, String> {
-        let mode = self.pipeline_mode;
-        match mode {
-            EngineName::Cpu => {
+        match self.mode.as_str() {
+            "Cpu" | "CpuOnly" => {
                 let mut engine = EngineCPU { model: &self.model };
                 engine.forward(input_ids, cache, check_signal)
             }
-            EngineName::FusedExp => {
+            "FusedExp" => {
                 let mut engine = EngineFusedExp {
                     model: &self.model,
                     ctx: &self.ctx,
@@ -131,7 +167,7 @@ impl EngineTrait for Engine {
                 };
                 engine.forward(input_ids, cache, check_signal)
             }
-            EngineName::FusedWoods => {
+            "FusedWoods" => {
                 let mut engine = EngineFusedWoods {
                     model: &self.model,
                     ctx: &self.ctx,
@@ -140,6 +176,7 @@ impl EngineTrait for Engine {
                 };
                 engine.forward(input_ids, cache, check_signal)
             }
+            _ => Err(format!("Unknown pipeline mode: {}", self.mode)),
         }
     }
 }
@@ -149,7 +186,12 @@ impl Engine {
     #[new]
     #[pyo3(signature = (model, pipeline_mode="FusedExp"))]
     fn new(model: &Model, pipeline_mode: &str) -> PyResult<Self> {
-        let mode = pipeline_mode_from_str(pipeline_mode)?;
+        match pipeline_mode {
+            "Cpu" | "CpuOnly" | "FusedExp" | "FusedWoods" => {}
+            _ => return Err(pyo3::exceptions::PyValueError::new_err(format!(
+                "Unknown pipeline_mode: {}. Use Cpu|FusedExp|FusedWoods", pipeline_mode
+            ))),
+        }
         let config = &model.inner.config;
         let mut ctx = MetalContext::init()
             .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(format!("metal: {}", e)))?;
@@ -175,15 +217,15 @@ impl Engine {
         let gpu_wf = WeightBuffer::new(&ctx.device, &model.inner.wf);
 
         eprintln!(
-            "[engine] {} layers hidden={} experts={} mode={:?}",
-            config.num_layers, config.hidden_dim, config.num_experts, mode
+            "[engine] {} layers hidden={} experts={} mode={}",
+            config.num_layers, config.hidden_dim, config.num_experts, pipeline_mode
         );
         Ok(Engine {
             model: model.inner.clone(),
             ctx,
             gpu_wf,
             expert_gpu_buffer,
-            pipeline_mode: mode,
+            mode: pipeline_mode.to_string(),
             telemetry: Telemetry { prefill_ms: 0.0, total_ms: 0.0, tokens_generated: 0 },
         })
     }
@@ -210,40 +252,6 @@ impl Engine {
 
     #[pyo3(signature = (input_ids, cache, max_tokens=256, temperature=0.0,
                         top_k=0, top_p=1.0, min_p=0.0, eos_token_ids=None))]
-    fn generate(&mut self, py: Python<'_>, input_ids: &Bound<PyArray1<i64>>,
-        cache: &mut Cache,
-        max_tokens: usize, temperature: f32, top_k: usize, top_p: f32, min_p: f32,
-        eos_token_ids: Option<&Bound<PyArray1<i64>>>,
-    ) -> PyResult<PyObject> {
-        let ids = input_ids.readonly();
-        let ids = ids.as_slice()?;
-        let start = if cache.inner.pos < ids.len() { cache.inner.pos } else { 0 };
-        let new_ids = &ids[start..];
-        let eos: HashSet<usize> = match eos_token_ids {
-            Some(a) => a.readonly().to_vec()?.into_iter().map(|x| x as usize).collect(),
-            None => [248046usize, 248044].into(),
-        };
-
-        let params = SampleParams {
-            max_tokens, temperature, top_k, top_p, min_p, eos,
-        };
-
-        let mut telemetry = Telemetry { prefill_ms: 0.0, total_ms: 0.0, tokens_generated: 0 };
-        let (tokens, _logits_last) = crate::generate::generate(
-            self,
-            new_ids,
-            &mut cache.inner,
-            &params,
-            &mut || py.check_signals().is_err(),
-            &mut telemetry,
-        ).map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e))?;
-        self.telemetry = telemetry;
-
-        Ok(PyArray1::<i64>::from_vec(py, tokens).into_pyobject(py).unwrap().into_any().into())
-    }
-
-    #[pyo3(signature = (input_ids, cache, max_tokens=256, temperature=0.0,
-                        top_k=0, top_p=1.0, min_p=0.0, eos_token_ids=None))]
     fn stream_generate(&mut self, py: Python<'_>, input_ids: &Bound<PyArray1<i64>>,
         cache: &mut Cache,
         max_tokens: usize, temperature: f32, top_k: usize, top_p: f32, min_p: f32,
@@ -261,41 +269,26 @@ impl Engine {
         let ls = unsafe { la.as_slice() }.map_err(|e|
             pyo3::exceptions::PyRuntimeError::new_err(format!("{}", e)))?;
 
-        let hd = self.model.config.hidden_dim;
         let vs = self.model.config.vocab_size;
-        let mut logits = ls[ls.len() - vs..].to_vec();
+        let logits_last = &ls[ls.len() - vs..];
 
-        let next = if temperature < 0.01 {
-            logits.iter().enumerate()
-                .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap())
-                .map(|(i, _)| i).unwrap_or(0)
-        } else { sample(&mut logits, temperature, top_k, top_p, min_p) };
+        self.telemetry = Telemetry { prefill_ms: gen_t0.elapsed().as_secs_f64() * 1000.0,
+            total_ms: 0.0, tokens_generated: 0 };
 
-        let is_fused_exp = self.pipeline_mode == EngineName::FusedExp;
-        let is_fused_woods = self.pipeline_mode == EngineName::FusedWoods;
+        let first_token = pick_token(logits_last, temperature, top_k, top_p, min_p);
 
-        let iter = StreamGenIterator {
-            model_ptr: self as *mut Engine,
-            cache_ptr: cache as *mut Cache,
-            hd,
-            hidden: vec![0.0f32; hd],
-            logits,
-            next_token: next,
-            remaining: max_tokens.saturating_sub(1),
-            temperature,
-            top_k,
-            top_p,
-            min_p,
-            eos,
-            gen_t0,
-            tokens_generated: 0,
-            done: false,
+        Ok(StreamGenIterator {
+            engine_ptr: self as *mut Engine as *mut dyn EngineTrait,
+            cache_ptr: cache as *mut Cache as *mut CoreCache,
             telemetry_ptr: &mut self.telemetry as *mut Telemetry,
-            is_fused_exp,
-            is_fused_woods,
-        };
-
-        Ok(iter.into_pyobject(py).unwrap().into_any().into())
+            gen_t0,
+            next_token: first_token,
+            logits: logits_last.to_vec(),
+            remaining: max_tokens.saturating_sub(1),
+            done: false,
+            eos,
+            temperature, top_k, top_p, min_p,
+        }.into_pyobject(py).unwrap().into_any().into())
     }
 
     fn telemetry(&self, py: Python<'_>) -> PyResult<PyObject> {
@@ -324,24 +317,19 @@ impl Engine {
 
 #[pyclass(unsendable)]
 pub struct StreamGenIterator {
-    model_ptr: *mut Engine,
-    cache_ptr: *mut Cache,
-    hd: usize,
-    hidden: Vec<f32>,
-    logits: Vec<f32>,
+    engine_ptr: *mut dyn EngineTrait,
+    cache_ptr: *mut CoreCache,
+    telemetry_ptr: *mut Telemetry,
+    gen_t0: Instant,
     next_token: usize,
+    logits: Vec<f32>,
     remaining: usize,
+    done: bool,
+    eos: HashSet<usize>,
     temperature: f32,
     top_k: usize,
     top_p: f32,
     min_p: f32,
-    eos: HashSet<usize>,
-    gen_t0: Instant,
-    tokens_generated: usize,
-    done: bool,
-    telemetry_ptr: *mut Telemetry,
-    is_fused_exp: bool,
-    is_fused_woods: bool,
 }
 
 #[pymethods]
@@ -352,66 +340,35 @@ impl StreamGenIterator {
         if self.done {
             return Ok(None);
         }
-
         let token = self.next_token as i64;
-        let logits_obj = PyArray1::<f32>::from_vec(py, self.logits.clone()).into_pyobject(py).unwrap().into_any().into();
-        self.tokens_generated += 1;
+        let logits = std::mem::take(&mut self.logits);
+        unsafe { &mut *self.telemetry_ptr }.tokens_generated += 1;
 
         if self.remaining == 0 || self.eos.contains(&self.next_token) {
             self.done = true;
             let t = unsafe { &mut *self.telemetry_ptr };
             t.total_ms = self.gen_t0.elapsed().as_secs_f64() * 1000.0;
-            t.tokens_generated = self.tokens_generated;
-            return Ok(Some((token, logits_obj)));
+            let obj = PyArray1::<f32>::from_vec(py, logits)
+                .into_pyobject(py).unwrap().into_any().into();
+            return Ok(Some((token, obj)));
         }
 
         self.remaining -= 1;
-        let eng = unsafe { &mut *self.model_ptr };
+        let engine = unsafe { &mut *self.engine_ptr };
         let cache = unsafe { &mut *self.cache_ptr };
-
-        {
-            let model = &eng.model;
-            embed_lookup(&model.wf, self.next_token, &mut self.hidden, self.hd);
+        self.logits = engine
+            .forward(&[token], cache, &mut || py.check_signals().is_err())
+            .unwrap_or_else(|_| {
+                self.done = true;
+                vec![]
+            });
+        if !self.done {
+            self.next_token = pick_token(&self.logits, self.temperature,
+                self.top_k, self.top_p, self.min_p);
         }
 
-        {
-            let mut exec = eng.make_exec_ctx();
-            if self.is_fused_exp {
-                process_token_fusedexp_pipelined(
-                    &mut exec, &mut self.hidden,
-                    cache.inner.pos, &mut cache.inner.kv, &mut cache.inner.lin,
-                    &mut || py.check_signals().is_err(),
-                    false, &mut Vec::new(),
-                ).map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e))?;
-            } else {
-                process_token_inner(
-                    &mut exec, &mut self.hidden,
-                    cache.inner.pos, &mut cache.inner.kv, &mut cache.inner.lin,
-                    &mut || py.check_signals().is_err(),
-                    false, &mut Vec::new(),
-                    self.is_fused_woods,
-                ).map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e))?;
-            }
-        }
-        cache.inner.pos += 1;
-
-        {
-            let model = &eng.model;
-            final_norm(&model.wf, &mut self.hidden, self.hd);
-            self.logits.fill(0.0);
-            gpu_lm_head(&model.wf, &self.hidden, &mut self.logits,
-                &eng.gpu_wf, &eng.ctx);
-        }
-
-        self.next_token = if self.temperature < 0.01 {
-            self.logits.iter().enumerate()
-                .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap())
-                .map(|(i, _)| i).unwrap_or(0)
-        } else {
-            sample(&mut self.logits.clone(), self.temperature, self.top_k,
-                self.top_p, self.min_p)
-        };
-
-        Ok(Some((token, logits_obj)))
+        let obj = PyArray1::<f32>::from_vec(py, logits)
+            .into_pyobject(py).unwrap().into_any().into();
+        Ok(Some((token, obj)))
     }
 }
