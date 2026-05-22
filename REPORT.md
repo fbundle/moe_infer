@@ -42,6 +42,20 @@ Input → RMS Norm → Attention (linear or full) → Residual Add
 
 Expert weights (~19 GB 4-bit) live on SSD in per-layer files (`packed_experts/layer_NN.bin`). Only K=8 active experts are read per layer (~1.77 MB each) via parallel `pread()` across 4 threads, with an LRU cache (32 entries) to avoid re-reading repeated experts.
 
+#### Why `pread()` and not `mmap()`
+
+Non-expert weights (0.65 GB) use `mmap()` — they fit in memory and are accessed every layer, every token. Experts (19 GB, 30× larger) use `pread()` into pre-allocated Metal buffers. The reasoning:
+
+**1. DMA alignment (3.6× speedup).** Expert data buffers are allocated with `posix_memalign(..., 2MB)` and wrapped via `newBufferWithBytesNoCopy`. The DMA controller that handles `pread()` from Apple's SSD achieves 3.6× higher throughput with 2 MB alignment vs the 16 KB page alignment that `mmap()` guarantees. This is the single biggest factor.
+
+**2. One syscall, not 110 page faults.** A 1.77 MB expert spans ~110 pages (16 KB each on Apple Silicon). With `mmap()`, the first access to each page triggers a synchronous kernel trap: page fault → I/O dispatch → TLB fill. That's 110 individual round-trips through the kernel. With `pread()`, the kernel reads the entire blob in a single efficient I/O operation — one syscall, one I/O submission, one completion.
+
+**3. Double-buffering for prediction preads.** The C engine uses an A/B buffer pair (`buf_multi_expert_data` / `buf_multi_expert_data_B`). While the GPU processes expert A's results, prediction preads fill the B buffer for the next layer. `mmap()` can't provide independent buffer copies — it's a single mapping. The double-buffer scheme is essential for overlapping I/O with compute (see Expert Prediction in §C vs Rust FusedWoods).
+
+**4. Explicit eviction control.** The LRU cache (32 entries) decides which experts stay resident based on application-level routing patterns. With `mmap()` + memory pressure, the kernel's page reclaimer makes that decision instead — and it has no knowledge of MoE routing. Under the wrong access pattern, the kernel evicts the wrong pages and thrashing results. With `pread()`, eviction is deterministic and application-controlled.
+
+**5. Scale mismatch.** Non-expert weights (0.65 GB) are small enough to mmap once at startup and keep resident forever — the `newBufferWithBytesNoCopy` Metal buffer wrapping the mmap'd region is valid for the lifetime of the process. Experts (19 GB) can't be kept resident alongside KV caches, activations, and scratch buffers. `pread()` is the correct primitive for "read this blob, use it on GPU, discard it."
+
 ### Metal Compute Pipeline
 
 All matrix-vector multiplies run on GPU via Metal compute shaders:
