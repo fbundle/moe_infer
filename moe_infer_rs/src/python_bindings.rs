@@ -767,7 +767,9 @@ impl Context {
         let ids = input_ids.readonly();
         let ids = ids.as_slice()?;
         let n = ids.len();
-        let start = cache.pos;
+        // Clamp to handle incremental input (Python side may strip already-processed tokens).
+        // When ids contains only new tokens, cache.pos may be >= n after prior turns.
+        let start = if cache.pos < n { cache.pos } else { 0 };
         let new_tokens = &ids[start..];
         let n_new = new_tokens.len();
         let (hd, vs) = (m.config.hidden_dim, m.config.vocab_size);
@@ -813,7 +815,7 @@ impl Context {
         let ids = input_ids.readonly();
         let ids = ids.as_slice()?;
         let n = ids.len();
-        let start = cache.pos;
+        let start = if cache.pos < n { cache.pos } else { 0 };
         let new_tokens = &ids[start..];
         let n_new = new_tokens.len();
         let (hd, vs) = (m.config.hidden_dim, m.config.vocab_size);
@@ -833,7 +835,6 @@ impl Context {
         }
 
         let mut hidden = vec![0.0f32; hd];
-        // Per-layer hidden states for ALL tokens (n_new * num_layers * hd)
         let mut all_layer_outputs: Vec<Vec<f32>> = Vec::new();
 
         for (ti, _) in new_tokens.iter().enumerate() {

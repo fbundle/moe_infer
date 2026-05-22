@@ -1,7 +1,5 @@
 #!/usr/bin/env python3
 
-import os
-import sys
 from typing import Iterator
 import numpy as np
 from transformers import AutoTokenizer
