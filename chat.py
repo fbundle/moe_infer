@@ -5,6 +5,12 @@ import numpy as np
 from transformers import AutoTokenizer
 from moe_infer import Model, Engine, Cache  # type: ignore
 
+def get_qwen3_response(completion: str) -> str:
+    completion = completion.removesuffix("<|im_end|>")
+    completion = completion.split("</think>")[-1]
+    return completion
+    
+
 class Conversation:
     def __init__(self, tokenizer_path: str, model_path: str):
         self.tokenizer = AutoTokenizer.from_pretrained(tokenizer_path)
@@ -34,7 +40,9 @@ class Conversation:
             print(addon_completion, end="", flush=True)
             completion = new_completion
 
-        self.messages.append({"role": "assistant", "content": completion})
+        response = get_qwen3_response(completion)
+
+        self.messages.append({"role": "assistant", "content": response})
 
         return completion
 
