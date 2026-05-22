@@ -306,7 +306,7 @@ impl MetalContext {
 }
 
 /// Embed the shaders.metal source at compile time.
-const SHADER_SOURCE: &str = include_str!("../shaders/shaders.metal");
+const SHADER_SOURCE: &str = include_str!("shaders.metal");
 
 impl MetalContext {
     /// Initialize Metal: create device, queue, compile shaders, build all pipelines.
