@@ -27,7 +27,10 @@ class Conversation:
             "content": message,
         })
 
-        input_ids = np.array(self.tokenizer.apply_chat_template(self.messages, add_generation_prompt=True, enable_thinking=False).input_ids, dtype=np.int64)
+        input_ids = np.array(
+            self.tokenizer.apply_chat_template(self.messages, add_generation_prompt=True, enable_thinking=False).input_ids,
+            dtype=np.int64,
+        )[self.cache.pos:]
 
         completion = ""
         completion_ids = []
