@@ -4,7 +4,7 @@ use std::time::Instant;
 
 use crate::cache::Cache;
 use crate::engine::Engine;
-use crate::math::sample;
+use crate::math::sample::sample;
 
 // ─── Telemetry ──────────────────────────────────────────────────────────────
 

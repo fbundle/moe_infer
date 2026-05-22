@@ -6,7 +6,6 @@ pub enum MoEError {
     Io(std::io::Error),
     Config(String),
     Shader(String),
-    Thread(String),
 }
 
 impl fmt::Display for MoEError {
@@ -16,7 +15,6 @@ impl fmt::Display for MoEError {
             MoEError::Io(e) => write!(f, "I/O error: {}", e),
             MoEError::Config(s) => write!(f, "Config error: {}", s),
             MoEError::Shader(s) => write!(f, "Shader error: {}", s),
-            MoEError::Thread(s) => write!(f, "Thread error: {}", s),
         }
     }
 }

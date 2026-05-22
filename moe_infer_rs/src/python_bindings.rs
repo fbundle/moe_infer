@@ -5,29 +5,27 @@ use std::time::Instant;
 
 use numpy::{PyArray1, PyArray2, PyArrayMethods};
 use pyo3::prelude::*;
-use pyo3::types::PyList;
-
 use crate::cache::Cache as CoreCache;
 use crate::engine::Engine as EngineTrait;
 use crate::model::Model as CoreModel;
 use crate::engine_cpu::EngineCPU;
 use crate::engine_fusedexp::{process_token_fusedexp_pipelined, EngineFusedExp};
 use crate::engine_fusedwoods::EngineFusedWoods;
-use crate::engine_gpu::EngineGPU;
 use crate::generate::{SampleParams, Telemetry};
 use crate::math::{
-    process_token_inner,
-    embed_lookup, final_norm, gpu_lm_head, sample,
+    embed_lookup, final_norm,
     ExecCtxGpu, SignalCheckFn,
 };
-use crate::metal_context::{ExpertBuffer, GpuWeightCtx, MetalContext};
+use crate::math::lm_head::gpu_lm_head;
+use crate::engine_fusedwoods::process_token_inner;
+use crate::math::sample::sample;
+use crate::metal_context::{ExpertBuffer, WeightBuffer, MetalContext};
 
 // ─── Engine name (selects which engine impl to use) ───────────────────────────
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EngineName {
     Cpu,
-    Gpu,
     FusedExp,
     FusedWoods,
 }
@@ -84,7 +82,7 @@ impl Cache {
 pub struct Engine {
     model: Arc<CoreModel>,
     ctx: MetalContext,
-    gpu_wf: GpuWeightCtx,
+    gpu_wf: WeightBuffer,
     expert_gpu_buffer: Option<ExpertBuffer>,
     pipeline_mode: EngineName,
     pub telemetry: Telemetry,
@@ -93,11 +91,10 @@ pub struct Engine {
 fn pipeline_mode_from_str(s: &str) -> PyResult<EngineName> {
     match s {
         "Cpu" | "CpuOnly" => Ok(EngineName::Cpu),
-        "Gpu" => Ok(EngineName::Gpu),
         "FusedExp" => Ok(EngineName::FusedExp),
         "FusedWoods" => Ok(EngineName::FusedWoods),
         _ => Err(pyo3::exceptions::PyValueError::new_err(format!(
-            "Unknown pipeline_mode: {}. Use Cpu|Gpu|FusedExp|FusedWoods", s
+            "Unknown pipeline_mode: {}. Use Cpu|FusedExp|FusedWoods", s
         ))),
     }
 }
@@ -126,15 +123,6 @@ impl EngineTrait for Engine {
         match mode {
             EngineName::Cpu => {
                 let mut engine = EngineCPU { model: &self.model };
-                engine.forward(input_ids, cache, check_signal)
-            }
-            EngineName::Gpu => {
-                let mut engine = EngineGPU {
-                    model: &self.model,
-                    ctx: &self.ctx,
-                    gpu_wf: &self.gpu_wf,
-                    expert_gpu_buffer: self.expert_gpu_buffer.as_mut(),
-                };
                 engine.forward(input_ids, cache, check_signal)
             }
             EngineName::FusedExp => {
@@ -187,7 +175,7 @@ impl Engine {
             config.moe_intermediate,
             config.shared_intermediate,
         ));
-        let gpu_wf = GpuWeightCtx::new(&ctx.device, &model.inner.wf);
+        let gpu_wf = WeightBuffer::new(&ctx.device, &model.inner.wf);
 
         eprintln!(
             "[engine] {} layers hidden={} experts={} mode={:?}",
@@ -221,82 +209,6 @@ impl Engine {
         let arr = PyArray2::<f32>::from_owned_array(py,
             numpy::ndarray::Array2::from_shape_vec((n, vs), logits).unwrap());
         Ok(arr.into_py(py))
-    }
-
-    fn forward_debug(&mut self, py: Python<'_>, input_ids: &Bound<PyArray1<i64>>,
-        cache: &mut Cache,
-    ) -> PyResult<(PyObject, PyObject)> {
-        let t0 = Instant::now();
-        let ids = input_ids.readonly();
-        let ids = ids.as_slice()?;
-        let n = ids.len();
-        let hd = self.model.config.hidden_dim;
-        let vs = self.model.config.vocab_size;
-        let num_layers = self.model.config.num_layers;
-
-        let mut logits = vec![0.0f32; n * vs];
-        if n == 0 {
-            let arr = PyArray2::<f32>::from_owned_array(py,
-                numpy::ndarray::Array2::from_shape_vec((n, vs), logits).unwrap());
-            return Ok((arr.into_py(py), PyList::empty(py).into_py(py)));
-        }
-
-        let mut embed = vec![0.0f32; n * hd];
-        let wf_ref = &self.model.wf;
-        for (i, &id) in ids.iter().enumerate() {
-            embed_lookup(wf_ref, id as usize, &mut embed[i * hd..(i + 1) * hd], hd);
-        }
-
-        let is_fused_exp = self.pipeline_mode == EngineName::FusedExp;
-        let is_fused_woods = self.pipeline_mode == EngineName::FusedWoods;
-
-        let mut hidden = vec![0.0f32; hd];
-        let mut all_layer_outputs: Vec<Vec<f32>> = Vec::new();
-
-        for (ti, _) in ids.iter().enumerate() {
-            hidden.copy_from_slice(&embed[ti * hd..(ti + 1) * hd]);
-            let mut layer_outputs = Vec::new();
-            let mut exec = self.make_exec_ctx();
-            if is_fused_exp {
-                process_token_fusedexp_pipelined(
-                    &mut exec, &mut hidden,
-                    cache.inner.pos, &mut cache.inner.kv, &mut cache.inner.lin,
-                    &mut || py.check_signals().is_err(),
-                    true, &mut layer_outputs,
-                ).map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e))?;
-            } else {
-                process_token_inner(
-                    &mut exec, &mut hidden,
-                    cache.inner.pos, &mut cache.inner.kv, &mut cache.inner.lin,
-                    &mut || py.check_signals().is_err(),
-                    true, &mut layer_outputs,
-                    is_fused_woods,
-                ).map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e))?;
-            }
-            cache.inner.pos += 1;
-            all_layer_outputs.push(hidden.to_vec());
-            all_layer_outputs.extend(layer_outputs);
-            final_norm(exec.wf, &mut hidden, hd);
-            gpu_lm_head(exec.wf, &hidden,
-                &mut logits[ti * vs..(ti + 1) * vs],
-                exec.gpu_wf, exec.ctx);
-        }
-
-        self.telemetry.prefill_ms = t0.elapsed().as_secs_f64() * 1000.0;
-
-        let per_token_entries = 1 + num_layers;
-        let last_token_start = (n - 1) * per_token_entries;
-        let py_list = PyList::empty(py);
-        for li in 0..num_layers {
-            let layer_hidden = &all_layer_outputs[last_token_start + 1 + li];
-            let arr = PyArray1::<f32>::from_owned_array(py,
-                numpy::ndarray::Array1::from_vec(layer_hidden.clone()));
-            py_list.append(arr)?;
-        }
-
-        let arr = PyArray2::<f32>::from_owned_array(py,
-            numpy::ndarray::Array2::from_shape_vec((n, vs), logits).unwrap());
-        Ok((arr.into_py(py), py_list.into_py(py)))
     }
 
     #[pyo3(signature = (input_ids, cache, max_tokens=256, temperature=0.0,
@@ -369,7 +281,6 @@ impl Engine {
             model_ptr: self as *mut Engine,
             cache_ptr: cache as *mut Cache,
             hd,
-            vs,
             hidden: vec![0.0f32; hd],
             logits,
             next_token: next,
@@ -419,7 +330,6 @@ pub struct StreamGenIterator {
     model_ptr: *mut Engine,
     cache_ptr: *mut Cache,
     hd: usize,
-    vs: usize,
     hidden: Vec<f32>,
     logits: Vec<f32>,
     next_token: usize,

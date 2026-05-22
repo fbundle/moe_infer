@@ -5,7 +5,6 @@ mod cache;
 mod constants;
 #[path = "engine/engine.rs"] pub mod engine;
 #[path = "engine/engine_cpu.rs"] mod engine_cpu;
-#[path = "engine/engine_gpu.rs"] mod engine_gpu;
 #[path = "engine/engine_fusedexp.rs"] mod engine_fusedexp;
 #[path = "engine/engine_fusedwoods.rs"] mod engine_fusedwoods;
 mod error;

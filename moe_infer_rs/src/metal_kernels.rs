@@ -115,35 +115,6 @@ pub fn encode_swiglu(
 }
 
 // ---------------------------------------------------------------------------
-// Weighted sum
-// ---------------------------------------------------------------------------
-
-/// Encode weighted sum into an existing encoder.
-pub fn encode_weighted_sum(
-    ctx: &MetalContext,
-    encoder: &ComputeCommandEncoderRef,
-    stacked: &BufferRef,
-    weights: &BufferRef,
-    out: &BufferRef,
-    k: u32,
-    dim: u32,
-) {
-    encoder.set_compute_pipeline_state(&ctx.weighted_sum);
-    encoder.set_buffer(0, Some(stacked), 0);
-    encoder.set_buffer(1, Some(weights), 0);
-    encoder.set_buffer(2, Some(out), 0);
-    unsafe {
-        set_u32(encoder, 3, k);
-        set_u32(encoder, 4, dim);
-    }
-    let num_tgs = (dim + 255) / 256;
-    encoder.dispatch_thread_groups(
-        MTLSize::new(num_tgs as u64, 1, 1),
-        MTLSize::new(256, 1, 1),
-    );
-}
-
-// ---------------------------------------------------------------------------
 // RMS Normalization
 // ---------------------------------------------------------------------------
 

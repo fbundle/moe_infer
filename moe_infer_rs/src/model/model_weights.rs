@@ -16,8 +16,10 @@ pub struct TensorInfo {
     pub name: String,
     pub offset: u64,
     pub size: u64,
+    #[allow(dead_code)]
     pub ndim: usize,
     pub shape: Vec<usize>,
+    #[allow(dead_code)]
     pub dtype: String,
 }
 
@@ -166,9 +168,4 @@ impl WeightFile {
         self.data_ptr
     }
 
-    /// Byte offset of a tensor within the mmap (for GPU buffer dispatch).
-    #[inline]
-    pub fn tensor_offset(&self, name: &str) -> Option<usize> {
-        self.tensors.get(name).map(|t| t.offset as usize)
-    }
 }

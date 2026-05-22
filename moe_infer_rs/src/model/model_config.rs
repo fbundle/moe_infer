@@ -25,13 +25,8 @@ struct HfTextConfig {
     linear_num_key_heads: usize,
     linear_key_head_dim: usize,
     linear_value_head_dim: usize,
-    linear_conv_kernel_dim: Option<usize>,
     full_attention_interval: Option<usize>,
-    #[serde(default)]
-    rms_norm_eps: Option<f32>,
     rope_parameters: Option<HfRopeParams>,
-    #[serde(default)]
-    layer_types: Option<Vec<String>>,
 }
 
 #[derive(Debug, Clone, Deserialize)]

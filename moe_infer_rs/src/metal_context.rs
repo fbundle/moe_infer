@@ -163,7 +163,8 @@ impl ExpertBuffer {
 pub struct MetalContext {
     pub device: Device,
     pub queue: CommandQueue,
-    pub library: Library,
+    #[allow(dead_code)]
+    library: Library,
 
     // Pipeline states for each kernel
     pub matvec_naive: ComputePipelineState,
@@ -171,7 +172,6 @@ pub struct MetalContext {
     pub matvec_v3: ComputePipelineState,
     pub swiglu: ComputePipelineState,
     pub swiglu_vec4: Option<ComputePipelineState>,
-    pub weighted_sum: ComputePipelineState,
     pub rms_norm_sum: ComputePipelineState,
     pub rms_norm_apply_bf16: Option<ComputePipelineState>,
     pub residual_add: Option<ComputePipelineState>,
@@ -345,7 +345,6 @@ impl MetalContext {
             let matvec_naive = make_pipeline("dequant_matvec_4bit")?;
             let matvec_v3 = make_pipeline("dequant_matvec_4bit_v3")?;
             let swiglu = make_pipeline("swiglu_fused")?;
-            let weighted_sum = make_pipeline("weighted_sum")?;
             let rms_norm_sum = make_pipeline("rms_norm_sum_sq")?;
 
             // Optional pipelines
@@ -378,7 +377,6 @@ impl MetalContext {
                 matvec_v3: matvec_v3.clone(),
                 swiglu,
                 swiglu_vec4,
-                weighted_sum,
                 rms_norm_sum,
                 rms_norm_apply_bf16,
                 residual_add,
@@ -427,12 +425,12 @@ const GPU_MATVEC_GROUP_SIZE: u32 = 64;
 
 /// Wraps the entire model weight file in a Metal buffer (zero-copy via mmap).
 /// Tensor matvecs dispatch on GPU using byte offsets within this buffer.
-pub struct GpuWeightCtx {
+pub struct WeightBuffer {
     pub buf: Buffer,
     pub base: *const u8,
 }
 
-impl GpuWeightCtx {
+impl WeightBuffer {
     /// Create a Metal buffer wrapping the weight file mmap.
     pub fn new(device: &Device, wf: &WeightFile) -> Self {
         let data = wf.data_ptr();
@@ -444,7 +442,7 @@ impl GpuWeightCtx {
             None,
         );
         eprintln!("[gpu-weight] Wrapped {:.2} GB weight file in Metal buffer", size as f64 / 1e9);
-        GpuWeightCtx { buf, base: data }
+        WeightBuffer { buf, base: data }
     }
 
     /// Encode a GPU dequant matvec into an existing encoder (for batched dispatch).

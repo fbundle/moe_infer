@@ -15,7 +15,7 @@ use std::os::fd::RawFd;
 use metal::{Buffer, ComputeCommandEncoderRef};
 
 use crate::metal_kernels;
-use crate::metal_context::{GpuWeightCtx, MetalContext, MAX_K};
+use crate::metal_context::{WeightBuffer, MetalContext, MAX_K};
 use crate::constants::{CONV_KERNEL_SIZE, FULL_ATTN_INTERVAL, GROUP_SIZE, RMS_NORM_EPS};
 use crate::cache::{Cache, FullAttnCache, LinearAttnState};
 use crate::engine::Engine;
@@ -23,11 +23,13 @@ use crate::model::Model;
 use crate::metal_context::ExpertBuffer;
 use crate::math::{
     bf16_to_f32, normalize_weights, softmax, topk,
-    embed_lookup, final_norm, gpu_lm_head,
-    DeferredExperts, ExecCtxGpu, FullAttnCmd2State,
+    embed_lookup, final_norm,
+    ExecCtxGpu, FullAttnCmd2State,
     SignalCheckFn,
 };
-use crate::math::{gpu_full_attention_forward, moe_layer_forward};
+use crate::math::full_attention::gpu_full_attention_forward;
+use crate::math::moe::{DeferredExperts, moe_layer_forward};
+use crate::math::lm_head::gpu_lm_head;
 use crate::model_weights::WeightFile;
 
 /// Encode post_expert for a previously-routed layer into a command encoder.
@@ -44,7 +46,7 @@ use crate::model_weights::WeightFile;
 ///     (skipped when next_norm_weight is None, e.g. last layer)
 pub fn encode_post_expert(
     wf: &WeightFile,
-    gpu_wf: &GpuWeightCtx,
+    gpu_wf: &WeightBuffer,
     ctx: &MetalContext,
     enc: &ComputeCommandEncoderRef,
     layer_idx: usize,
@@ -142,7 +144,7 @@ pub fn encode_post_expert(
         cparams[8] = shared_gate_score;
         unsafe { std::ptr::copy_nonoverlapping(cparams.as_ptr(), combine_params_buf.contents() as *mut f32, 10); }
         enc.set_buffer(11, Some(combine_params_buf), 0);
-        unsafe {
+        {
             enc.set_bytes(12, 4, &hidden_u32 as *const u32 as *const std::ffi::c_void);
             let ku = actual_k as u32;
             enc.set_bytes(13, 4, &ku as *const u32 as *const std::ffi::c_void);
@@ -162,7 +164,7 @@ pub fn encode_post_expert(
         enc.set_compute_pipeline_state(&ctx.rms_norm_sum);
         enc.set_buffer(0, Some(buf_moe), 0);
         enc.set_buffer(1, Some(sum_sq), 0);
-        unsafe { enc.set_bytes(2, 4, &hidden_u32 as *const u32 as *const std::ffi::c_void); }
+        enc.set_bytes(2, 4, &hidden_u32 as *const u32 as *const std::ffi::c_void);
         enc.dispatch_thread_groups(metal::MTLSize::new(1, 1, 1), metal::MTLSize::new(256, 1, 1));
 
         let pipe = ctx.rms_norm_apply_bf16.as_ref().unwrap();
@@ -171,7 +173,7 @@ pub fn encode_post_expert(
         enc.set_buffer(1, Some(&gpu_wf.buf), norm_off);
         enc.set_buffer(2, Some(sum_sq), 0);
         enc.set_buffer(3, Some(ctx.buf_input.as_ref().unwrap()), 0);
-        unsafe {
+        {
             enc.set_bytes(4, 4, &hidden_u32 as *const u32 as *const std::ffi::c_void);
             let eps = RMS_NORM_EPS;
             enc.set_bytes(5, 4, &eps as *const f32 as *const std::ffi::c_void);
@@ -195,7 +197,7 @@ pub fn encode_post_expert(
 ///   - buf_shared_gate_score → shared gate scalar
 pub fn encode_pre_expert(
     wf: &WeightFile,
-    gpu_wf: &GpuWeightCtx,
+    gpu_wf: &WeightBuffer,
     ctx: &MetalContext,
     enc: &ComputeCommandEncoderRef,
     layer_idx: usize,
@@ -303,7 +305,7 @@ pub fn encode_pre_expert(
         enc.set_buffer(0, Some(out_proj_buf), 0);
         enc.set_buffer(1, Some(c.buf_moe_hidden.as_ref().unwrap()), 0);
         enc.set_buffer(2, Some(c.buf_temp_residual.as_ref().unwrap()), 0);
-        unsafe { enc.set_bytes(3, 4, &(hidden_dim as u32) as *const u32 as *const std::ffi::c_void); }
+        enc.set_bytes(3, 4, &(hidden_dim as u32) as *const u32 as *const std::ffi::c_void);
         enc.dispatch_thread_groups(
             metal::MTLSize::new(((hidden_dim + 255) / 256) as u64, 1, 1),
             metal::MTLSize::new(256, 1, 1),
@@ -320,7 +322,7 @@ pub fn encode_pre_expert(
         enc.set_compute_pipeline_state(&c.rms_norm_sum);
         enc.set_buffer(0, Some(temp_res), 0);
         enc.set_buffer(1, Some(post_sum), 0);
-        unsafe { enc.set_bytes(2, 4, &(hidden_dim as u32) as *const u32 as *const std::ffi::c_void); }
+        enc.set_bytes(2, 4, &(hidden_dim as u32) as *const u32 as *const std::ffi::c_void);
         enc.dispatch_thread_groups(metal::MTLSize::new(1, 1, 1), metal::MTLSize::new(256, 1, 1));
     }
     {
@@ -330,7 +332,7 @@ pub fn encode_pre_expert(
         enc.set_buffer(1, Some(&gw.buf), pnw_off);
         enc.set_buffer(2, Some(post_sum), 0);
         enc.set_buffer(3, Some(c.buf_post_normed.as_ref().unwrap()), 0);
-        unsafe {
+        {
             enc.set_bytes(4, 4, &(hidden_dim as u32) as *const u32 as *const std::ffi::c_void);
             enc.set_bytes(5, 4, &RMS_NORM_EPS as *const f32 as *const std::ffi::c_void);
         }
@@ -678,7 +680,7 @@ pub fn process_token_fusedexp_pipelined(
 pub struct EngineFusedExp<'a> {
     pub model: &'a Model,
     pub ctx: &'a MetalContext,
-    pub gpu_wf: &'a GpuWeightCtx,
+    pub gpu_wf: &'a WeightBuffer,
     pub expert_gpu_buffer: Option<&'a mut ExpertBuffer>,
 }
 
@@ -700,7 +702,7 @@ impl<'a> Engine for EngineFusedExp<'a> {
         &mut self,
         input_ids: &[i64],
         cache: &mut Cache,
-        mut check_signal: SignalCheckFn<'_>,
+        check_signal: SignalCheckFn<'_>,
     ) -> Result<Vec<f32>, String> {
         let n = input_ids.len();
         let hd = self.model.config.hidden_dim;
