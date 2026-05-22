@@ -1,7 +1,5 @@
-use crate::constants::GROUP_SIZE;
 use crate::metal_context::{metal_buf_shared, WeightBuffer, MetalContext};
 use crate::model::weights::WeightFile;
-use crate::math::dequant_matvec_4bit;
 
 /// GPU lm_head matvec.
 pub fn gpu_lm_head(
@@ -22,18 +20,5 @@ pub fn gpu_lm_head(
     unsafe {
         std::ptr::copy_nonoverlapping(
             out_buf.contents() as *const f32, logits.as_mut_ptr(), logits.len());
-    }
-}
-
-/// CPU-only lm_head: dequant matvec for vocab projection.
-pub fn lm_head(wf: &WeightFile, hidden: &[f32], logits: &mut [f32]) {
-    let prefix = "lm_head";
-    let hd = hidden.len();
-    if let (Some(w), Some(s), Some(b)) = (
-        wf.get_tensor_u32(&format!("{}.weight", prefix)),
-        wf.get_tensor_u16(&format!("{}.scales", prefix)),
-        wf.get_tensor_u16(&format!("{}.biases", prefix)),
-    ) {
-        dequant_matvec_4bit(w, s, b, hidden, logits, logits.len(), hd, GROUP_SIZE);
     }
 }

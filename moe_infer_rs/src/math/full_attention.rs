@@ -248,18 +248,6 @@ pub fn mixed_full_attention_forward(
     None
 }
 
-/// CPU wrapper — calls mixed_full_attention_forward without GPU resources.
-pub fn full_attention_forward(
-    wf: &WeightFile,
-    layer_idx: usize,
-    hidden: &mut [f32],
-    kv: &mut FullAttnCache,
-    pos: usize,
-    config: &ModelConfig,
-) -> Option<FullAttnGpuOut> {
-    mixed_full_attention_forward(wf, layer_idx, hidden, kv, pos, config, None, None)
-}
-
 /// GPU wrapper — calls mixed_full_attention_forward with GPU resources.
 pub fn gpu_full_attention_forward(
     wf: &WeightFile,
