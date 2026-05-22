@@ -20,22 +20,31 @@ use crate::pipeline_common::{LinearAttnState, CONV_KERNEL_SIZE};
 ///
 /// Reads from persistent GPU buffers written by pre_expert(L-1):
 ///   - buf_post_normed → expert input (h_post)
-///   - buf_shared_gate, buf_shared_up → shared SwiGLU
-/// Reads from CPU-uploaded params:
-///   - combine_params[0..K-1] = expert_weights, combine_params[8] = shared_gate_score
+///   - buf_shared_gate, buf_shared_up → shared SwiGLU inputs
+/// Uses caller-provided scratch buffers for expert intermediates (no conflict
+/// with pre_expert which also writes to buf_shared_gate/up for the NEXT layer).
+///
 /// Writes:
 ///   - buf_moe_hidden = moe_combine output (hidden state after this layer)
 ///   - buf_input = input_layernorm(buf_moe_hidden) for next layer's pre_expert
+///     (skipped when next_norm_weight is None, e.g. last layer)
 pub fn encode_post_expert(
     wf: &WeightFile,
     gpu_wf: &GpuWeightCtx,
     ctx: &MetalContext,
     enc: &ComputeCommandEncoderRef,
     layer_idx: usize,
-    expert_indices: &[usize],
     expert_weights: &[f32],
     shared_gate_score: f32,
-    expert_data: &[Buffer],       // [K] pread expert weight buffers
+    expert_data: &[Buffer],         // [K] pread expert weight buffers
+    expert_scratch_gate: &Buffer,   // moe_inter * 4
+    expert_scratch_up: &Buffer,     // moe_inter * 4
+    expert_scratch_act: &Buffer,    // moe_inter * 4
+    expert_out_bufs: &[Buffer],     // [K] per-expert down_proj outputs
+    shared_scratch: &Buffer,        // shared_inter * 4 (shared SwiGLU activation)
+    shared_down_buf: &Buffer,       // hidden_dim * 4 (shared down_proj output)
+    combine_params_buf: &Buffer,    // 40 bytes (10 f32)
+    next_norm_weight: Option<(*const std::ffi::c_void, usize)>, // (ptr, base) for next layer's input_layernorm
     hidden_dim: usize,
     moe_inter: usize,
     shared_inter: usize,
@@ -48,90 +57,75 @@ pub fn encode_post_expert(
     let actual_k = num_experts_per_tok.min(crate::pipeline_common::MAX_K);
     let prefix = format!("model.layers.{}.mlp", layer_idx);
 
-    // Expert dispatch: gate/up → SwiGLU → down for each expert
-    let buf_input = ctx.buf_post_normed.as_ref().unwrap();
-    let scratch_gate = &ctx.buf_shared_gate.as_ref().unwrap();  // reuse as gate scratch
-    let scratch_up = &ctx.buf_shared_up.as_ref().unwrap();      // reuse as up scratch
-    // We need a separate activation buffer — allocate scratch on metal context
-    // For now, use batch_out[7] as scratch (unused in pipelined path)
-    let scratch_act = &ctx.batch_out[7];  // reuse unused slot
-    let expert_out = &ctx.batch_out[6];   // reuse another slot (only need 1 at a time in combine)
+    let post_normed = ctx.buf_post_normed.as_ref().unwrap();
 
-    // Actually, we need per-expert activation and output. Use ExpertIOState-style buffers.
-    // For pipelined version, dispatch experts sequentially in one encoder.
-    // We can reuse scratch_act since experts are sequential within one encoder.
+    // ── Expert dispatch: gate/up → SwiGLU → down for each expert ──
+    // Each expert writes down_proj to its own expert_out_bufs[ki] for combine.
     for ki in 0..actual_k {
         let expert_buf = &expert_data[ki];
         if expert_buf.length() == 0 { continue; }
 
-        // gate_proj
         kernels::encode_matvec_offset(ctx, enc,
             expert_buf, layout.gate_w_off as u64,
             expert_buf, layout.gate_s_off as u64,
             expert_buf, layout.gate_b_off as u64,
-            buf_input, 0, scratch_gate, 0,
+            post_normed, 0, expert_scratch_gate, 0,
             inter_u32, hidden_u32, gs_u32, 3);
 
-        // up_proj
         kernels::encode_matvec_offset(ctx, enc,
             expert_buf, layout.up_w_off as u64,
             expert_buf, layout.up_s_off as u64,
             expert_buf, layout.up_b_off as u64,
-            buf_input, 0, scratch_up, 0,
+            post_normed, 0, expert_scratch_up, 0,
             inter_u32, hidden_u32, gs_u32, 3);
 
-        kernels::encode_swiglu(ctx, enc, scratch_gate, 0, scratch_up, 0, scratch_act, 0, inter_u32);
+        kernels::encode_swiglu(ctx, enc, expert_scratch_gate, 0, expert_scratch_up, 0,
+            expert_scratch_act, 0, inter_u32);
 
-        // down_proj → write to batch_out slot (will be read by combine)
         kernels::encode_matvec_offset(ctx, enc,
             expert_buf, layout.down_w_off as u64,
             expert_buf, layout.down_s_off as u64,
             expert_buf, layout.down_b_off as u64,
-            scratch_act, 0, expert_out, 0,
+            expert_scratch_act, 0, &expert_out_bufs[ki], 0,
             hidden_u32, inter_u32, gs_u32, 3);
     }
 
-    // Shared expert SwiGLU (reads buf_shared_gate, buf_shared_up from previous pre_expert)
-    let shared_act = &ctx.batch_out[5];  // reuse
+    // ── Shared expert SwiGLU (reads buf_shared_gate, buf_shared_up from pre_expert) ──
     {
-        let sg_persist = ctx.buf_shared_gate.as_ref().unwrap();
-        let su_persist = ctx.buf_shared_up.as_ref().unwrap();
-        kernels::encode_swiglu(ctx, enc, sg_persist, 0, su_persist, 0, shared_act, 0, shared_inter as u32);
+        let sg = ctx.buf_shared_gate.as_ref().unwrap();
+        let su = ctx.buf_shared_up.as_ref().unwrap();
+        kernels::encode_swiglu(ctx, enc, sg, 0, su, 0, shared_scratch, 0, shared_inter as u32);
     }
 
-    // Shared down_proj
-    let shared_down = &ctx.batch_out[4];
-    {
-        let sd_name = format!("{}.shared_expert.down_proj", prefix);
-        let _ = gpu_wf.encode_matvec_into(wf, ctx, enc, &sd_name, shared_act, 0, shared_down, 0, hidden_dim, shared_inter);
-    }
+    // ── Shared down_proj ──
+    let sd_name = format!("{}.shared_expert.down_proj", prefix);
+    let _ = gpu_wf.encode_matvec_into(wf, ctx, enc, &sd_name, shared_scratch, 0,
+        shared_down_buf, 0, hidden_dim, shared_inter);
 
-    // moe_combine_residual
-    // Reads: buf_moe_hidden (= h_mid, written by previous post_expert's combine)
-    //        shared_down, expert_out, combine_params
+    // ── moe_combine_residual ──
+    // Reads: buf_moe_hidden (= previous combine output or initial residual)
+    //        shared_down_buf, expert_out_bufs[0..K-1], combine_params_buf
     // Writes: buf_moe_hidden
     {
         let mcr_pipe = ctx.moe_combine_residual.as_ref().unwrap();
         enc.set_compute_pipeline_state(mcr_pipe);
         let hmid_src = ctx.buf_moe_hidden.as_ref().unwrap();
         enc.set_buffer(0, Some(hmid_src), 0);
-        enc.set_buffer(1, Some(shared_down), 0);
+        enc.set_buffer(1, Some(shared_down_buf), 0);
         enc.set_buffer(2, Some(ctx.buf_moe_hidden.as_ref().unwrap()), 0);
-        // Bind expert outputs (only the first slot is used in sequential dispatch)
         for ei in 0..crate::pipeline_common::MAX_K {
             if ei < actual_k {
-                enc.set_buffer(3 + ei as u64, Some(expert_out), 0);  // reuse same slot
+                enc.set_buffer(3 + ei as u64, Some(&expert_out_bufs[ei]), 0);
             } else {
                 enc.set_buffer(3 + ei as u64, Some(ctx.buf_moe_hidden.as_ref().unwrap()), 0);
             }
         }
-        // Upload combine params
-        let cb_p = ctx.buf_cmd3_sum_sq.as_ref().unwrap();  // reuse as params buf
+        // Upload combine params (reused each CMD — caller fills before encoding)
         let mut cparams = [0.0f32; 10];
         for (i, &w) in expert_weights.iter().enumerate() { cparams[i] = w; }
         cparams[8] = shared_gate_score;
-        unsafe { std::ptr::copy_nonoverlapping(cparams.as_ptr(), cb_p.contents() as *mut f32, 10); }
-        enc.set_buffer(11, Some(cb_p), 0);
+        unsafe { std::ptr::copy_nonoverlapping(cparams.as_ptr(), combine_params_buf.contents() as *mut f32, 10); }
+        enc.set_buffer(11, Some(combine_params_buf), 0);
         unsafe {
             enc.set_bytes(12, 4, &hidden_u32 as *const u32 as *const std::ffi::c_void);
             let ku = actual_k as u32;
@@ -143,43 +137,33 @@ pub fn encode_post_expert(
         );
     }
 
-    // GPU-side input_norm for next layer: buf_moe_hidden → buf_input
-    {
-        let next_norm_ptr = wf.get_tensor_ptr(
-            &format!("model.layers.{}.input_layernorm.weight", layer_idx + 1));
-        if let Some(next_norm_p) = next_norm_ptr {
-            let next_norm_off = (next_norm_p as usize - gpu_wf.base as usize) as u64;
-            let buf_moe = ctx.buf_moe_hidden.as_ref().unwrap();
-            let sum_sq = ctx.buf_cmd3_sum_sq.as_ref().unwrap();
+    // ── GPU-side input_norm for next layer: buf_moe_hidden → buf_input ──
+    if let Some((norm_ptr, base)) = next_norm_weight {
+        let norm_off = (norm_ptr as usize - base) as u64;
+        let buf_moe = ctx.buf_moe_hidden.as_ref().unwrap();
+        let sum_sq = ctx.buf_cmd3_sum_sq.as_ref().unwrap();
 
-            // rms_norm_sum_sq
-            {
-                enc.set_compute_pipeline_state(&ctx.rms_norm_sum);
-                enc.set_buffer(0, Some(buf_moe), 0);
-                enc.set_buffer(1, Some(sum_sq), 0);
-                unsafe { enc.set_bytes(2, 4, &hidden_u32 as *const u32 as *const std::ffi::c_void); }
-                enc.dispatch_thread_groups(metal::MTLSize::new(1, 1, 1), metal::MTLSize::new(256, 1, 1));
-            }
+        enc.set_compute_pipeline_state(&ctx.rms_norm_sum);
+        enc.set_buffer(0, Some(buf_moe), 0);
+        enc.set_buffer(1, Some(sum_sq), 0);
+        unsafe { enc.set_bytes(2, 4, &hidden_u32 as *const u32 as *const std::ffi::c_void); }
+        enc.dispatch_thread_groups(metal::MTLSize::new(1, 1, 1), metal::MTLSize::new(256, 1, 1));
 
-            // rms_norm_apply_bf16 → buf_input
-            {
-                let pipe = ctx.rms_norm_apply_bf16.as_ref().unwrap();
-                enc.set_compute_pipeline_state(pipe);
-                enc.set_buffer(0, Some(buf_moe), 0);
-                enc.set_buffer(1, Some(&gpu_wf.buf), next_norm_off);
-                enc.set_buffer(2, Some(sum_sq), 0);
-                enc.set_buffer(3, Some(ctx.buf_input.as_ref().unwrap()), 0);
-                unsafe {
-                    enc.set_bytes(4, 4, &hidden_u32 as *const u32 as *const std::ffi::c_void);
-                    let eps = crate::pipeline_common::RMS_NORM_EPS;
-                    enc.set_bytes(5, 4, &eps as *const f32 as *const std::ffi::c_void);
-                }
-                enc.dispatch_thread_groups(
-                    metal::MTLSize::new(((hidden_dim + 255) / 256) as u64, 1, 1),
-                    metal::MTLSize::new(256, 1, 1),
-                );
-            }
+        let pipe = ctx.rms_norm_apply_bf16.as_ref().unwrap();
+        enc.set_compute_pipeline_state(pipe);
+        enc.set_buffer(0, Some(buf_moe), 0);
+        enc.set_buffer(1, Some(&gpu_wf.buf), norm_off);
+        enc.set_buffer(2, Some(sum_sq), 0);
+        enc.set_buffer(3, Some(ctx.buf_input.as_ref().unwrap()), 0);
+        unsafe {
+            enc.set_bytes(4, 4, &hidden_u32 as *const u32 as *const std::ffi::c_void);
+            let eps = crate::pipeline_common::RMS_NORM_EPS;
+            enc.set_bytes(5, 4, &eps as *const f32 as *const std::ffi::c_void);
         }
+        enc.dispatch_thread_groups(
+            metal::MTLSize::new(((hidden_dim + 255) / 256) as u64, 1, 1),
+            metal::MTLSize::new(256, 1, 1),
+        );
     }
 }
 
