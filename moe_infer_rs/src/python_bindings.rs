@@ -64,6 +64,8 @@ impl ModelState {
             key_dim,
             value_dim,
             config.hidden_dim,
+            config.num_experts,
+            config.shared_intermediate,
         );
         let expert_io = Some(ctx.init_expert_buffers(
             config.expert_size_4bit,

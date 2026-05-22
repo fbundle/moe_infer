@@ -6,7 +6,7 @@ Usage:
     python helpers/strip_model.py \
         --input hub/models--mlx-community--Qwen3.5-35B-A3B-4bit \
         --output hub/models--mlx-community--Qwen3.5-35B-A3B-4bit-stripped \
-        --num-layers 3 --num-experts 4
+        --num-layers 4 --num-experts 4
 """
 
 import argparse
@@ -255,7 +255,7 @@ def main():
     parser = argparse.ArgumentParser(description="Strip MoE model to fewer layers/experts")
     parser.add_argument("--input", type=str, required=True, help="Path to input model dir")
     parser.add_argument("--output", type=str, required=True, help="Path to output model dir")
-    parser.add_argument("--num-layers", type=int, default=3)
+    parser.add_argument("--num-layers", type=int, default=4)
     parser.add_argument("--num-experts", type=int, default=4)
     args = parser.parse_args()
     run(args.input, args.output, args.num_layers, args.num_experts)

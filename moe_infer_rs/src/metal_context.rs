@@ -216,6 +216,23 @@ pub struct MetalContext {
     pub buf_cmd3_sum_sq: Option<Buffer>,
     /// CMD3 moe_combine_residual output — next layer reads hidden from here (FAST PATH)
     pub buf_moe_hidden: Option<Buffer>,
+    // ── Pipelined FusedExp persistent GPU buffers ──
+    /// Gate projection output [num_experts] f32 — read by CPU for routing
+    pub buf_gate_scores: Option<Buffer>,
+    /// Shared expert gate scalar [1] f32
+    pub buf_shared_gate_score: Option<Buffer>,
+    /// Post-attn normed hidden [hidden_dim] f32 — expert input for next cmd buf
+    pub buf_post_normed: Option<Buffer>,
+    /// Shared gate proj [shared_inter] f32 — stays on GPU for next cmd buf
+    pub buf_shared_gate: Option<Buffer>,
+    /// Shared up proj [shared_inter] f32 — stays on GPU for next cmd buf
+    pub buf_shared_up: Option<Buffer>,
+    /// out_proj output [hidden_dim] f32 — scratch for pre_expert
+    pub buf_out_proj: Option<Buffer>,
+    /// residual_add output [hidden_dim] f32 — scratch for pre_expert
+    pub buf_temp_residual: Option<Buffer>,
+    /// Post-attn norm sum_sq [4] f32 — scratch for pre_expert
+    pub buf_post_sum_sq: Option<Buffer>,
 }
 
 impl MetalContext {
@@ -230,6 +247,8 @@ impl MetalContext {
         key_dim: usize,
         value_dim: usize,
         hidden_dim: usize,
+        num_experts: usize,
+        shared_intermediate: usize,
     ) {
         self.buf_conv_state.clear();
         self.buf_delta_state.clear();
@@ -256,6 +275,15 @@ impl MetalContext {
         self.buf_cmd3_sum_sq = Some(metal_buf_shared(&self.device, 4));
         self.buf_input = Some(metal_buf_shared(&self.device, hidden_dim * 4));
         self.buf_moe_hidden = Some(metal_buf_shared(&self.device, hidden_dim * 4));
+        // Pipelined FusedExp buffers
+        self.buf_gate_scores = Some(metal_buf_shared(&self.device, num_experts * 4));
+        self.buf_shared_gate_score = Some(metal_buf_shared(&self.device, 4));
+        self.buf_post_normed = Some(metal_buf_shared(&self.device, hidden_dim * 4));
+        self.buf_shared_gate = Some(metal_buf_shared(&self.device, shared_intermediate * 4));
+        self.buf_shared_up = Some(metal_buf_shared(&self.device, shared_intermediate * 4));
+        self.buf_out_proj = Some(metal_buf_shared(&self.device, hidden_dim * 4));
+        self.buf_temp_residual = Some(metal_buf_shared(&self.device, hidden_dim * 4));
+        self.buf_post_sum_sq = Some(metal_buf_shared(&self.device, 4));
     }
 
     /// Allocate persistent GPU buffers for expert I/O. Returns the state which
@@ -400,6 +428,14 @@ impl MetalContext {
                 buf_input: None,
                 buf_cmd3_sum_sq: None,
                 buf_moe_hidden: None,
+                buf_gate_scores: None,
+                buf_shared_gate_score: None,
+                buf_post_normed: None,
+                buf_shared_gate: None,
+                buf_shared_up: None,
+                buf_out_proj: None,
+                buf_temp_residual: None,
+                buf_post_sum_sq: None,
             })
         })
     }
