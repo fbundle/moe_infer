@@ -108,6 +108,7 @@ struct ExecCtx<'a> {
     ctx: &'a MetalContext,
     gpu_wf: &'a WeightBuffer,
     expert_gpu_buffer: Option<&'a mut ExpertBuffer>,
+    k: usize,
     timing: BTreeMap<String, TelemetryValue>,
 }
 
@@ -246,7 +247,7 @@ impl<'a> ExecCtx<'a> {
 
         moe_layer_forward(
             wf, layer, hidden, &self.model.expert_files[layer],
-            self.ctx, self.gpu_wf, config,
+            self.ctx, self.gpu_wf, config, self.k,
             Some(attn), self.expert_gpu_buffer.as_deref_mut(),
             &mut self.timing,
         )
@@ -264,7 +265,7 @@ impl<'a> ExecCtx<'a> {
         let num_experts = self.model.config.num_experts;
         let moe_inter = self.model.config.moe_intermediate;
         let shared_inter = self.model.config.shared_intermediate;
-        let k = self.model.config.num_experts_per_tok;
+        let k = self.k;
         let layout = &self.model.config.expert_layout_4bit;
         let qkv_dim = self.model.config.linear_conv_dim;
         let total_key = self.model.config.linear_total_key;
@@ -419,6 +420,7 @@ fn moe_layer_forward(
     ctx: &MetalContext,
     gpu_wf: &WeightBuffer,
     config: &ModelConfig,
+    k: usize,
     attn_state: Option<FullAttnGpuOut>,
     mut expert_gpu_buffer: Option<&mut ExpertBuffer>,
     timing: &mut BTreeMap<String, TelemetryValue>,
@@ -429,7 +431,6 @@ fn moe_layer_forward(
     let shared_inter = config.shared_intermediate;
     let expert_size = config.expert_size_4bit;
     let layout = &config.expert_layout_4bit;
-    let k = config.num_experts_per_tok;
 
     // Save h_mid (residual)
     let h_mid = hidden.to_vec();
@@ -1323,6 +1324,7 @@ pub struct EngineFusedExp<'a> {
     pub ctx: &'a MetalContext,
     pub gpu_wf: &'a WeightBuffer,
     pub expert_gpu_buffer: Option<&'a mut ExpertBuffer>,
+    pub k: usize,
     pub timing: BTreeMap<String, TelemetryValue>,
 }
 
@@ -1333,6 +1335,10 @@ impl<'a> Engine for EngineFusedExp<'a> {
         cache: &mut Cache,
         check_signal: SignalCheckFn<'_>,
     ) -> Result<Vec<f32>, String> {
+        assert!(self.k <= self.model.config.num_experts_per_tok,
+            "k ({}) must not exceed model's num_experts_per_tok ({})",
+            self.k, self.model.config.num_experts_per_tok);
+
         let t0 = Instant::now();
         let n = input_ids.len();
         let hd = self.model.config.hidden_dim;
@@ -1350,6 +1356,7 @@ impl<'a> Engine for EngineFusedExp<'a> {
             ctx: self.ctx,
             gpu_wf: self.gpu_wf,
             expert_gpu_buffer: self.expert_gpu_buffer.as_deref_mut(),
+            k: self.k,
             timing: BTreeMap::new(),
         };
 

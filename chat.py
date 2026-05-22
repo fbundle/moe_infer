@@ -12,11 +12,11 @@ def get_qwen3_response(completion: str) -> str:
     
 
 class Conversation:
-    def __init__(self, tokenizer_path: str, model_path: str):
+    def __init__(self, tokenizer_path: str, model_path: str, **kwargs):
         self.tokenizer = AutoTokenizer.from_pretrained(tokenizer_path)
         self.model = Model(model_path)
         
-        self.engine = Engine(self.model, pipeline_mode="FusedExp")
+        self.engine = Engine(self.model, **kwargs)
         self.cache = Cache(self.model)
         
         self.messages = []
@@ -53,7 +53,7 @@ class Conversation:
 hf_path = "hub/models--mlx-community--Qwen3.6-35B-A3B-4bit"
 path = "data/models--mlx-community--Qwen3.6-35B-A3B-4bit"
 
-c = Conversation(hf_path, path)
+c = Conversation(hf_path, path, pipeline_mode="FusedExp", k=4)
 
 while True:
     message = input("> ")

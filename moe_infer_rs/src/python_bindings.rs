@@ -153,6 +153,7 @@ pub struct Engine {
     gpu_wf: WeightBuffer,
     expert_gpu_buffer: Option<ExpertBuffer>,
     mode: String,
+    k: usize,
     pub telemetry: Telemetry,
 }
 
@@ -176,6 +177,7 @@ impl EngineTrait for Engine {
                     ctx: &self.ctx,
                     gpu_wf: &self.gpu_wf,
                     expert_gpu_buffer: self.expert_gpu_buffer.as_mut(),
+                    k: self.k,
                     timing: BTreeMap::new(),
                 };
                 let logits = engine.forward(input_ids, cache, check_signal);
@@ -202,8 +204,8 @@ impl EngineTrait for Engine {
 #[pymethods]
 impl Engine {
     #[new]
-    #[pyo3(signature = (model, pipeline_mode="FusedExp"))]
-    fn new(model: &Model, pipeline_mode: &str) -> PyResult<Self> {
+    #[pyo3(signature = (model, pipeline_mode="FusedExp", k=0))]
+    fn new(model: &Model, pipeline_mode: &str, k: usize) -> PyResult<Self> {
         match pipeline_mode {
             "Cpu" | "CpuOnly" | "FusedExp" | "FusedWoods" => {}
             _ => return Err(pyo3::exceptions::PyValueError::new_err(format!(
@@ -211,6 +213,12 @@ impl Engine {
             ))),
         }
         let config = &model.inner.config;
+        let k = if k == 0 { config.num_experts_per_tok } else { k };
+        if k > config.num_experts_per_tok {
+            return Err(pyo3::exceptions::PyValueError::new_err(format!(
+                "k ({}) must not exceed model's num_experts_per_tok ({})", k, config.num_experts_per_tok
+            )));
+        }
         let mut ctx = MetalContext::init()
             .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(format!("metal: {}", e)))?;
         let key_dim = config.linear_total_key / config.linear_num_k_heads;
@@ -244,6 +252,7 @@ impl Engine {
             gpu_wf,
             expert_gpu_buffer,
             mode: pipeline_mode.to_string(),
+            k,
             telemetry: Telemetry { prefill_ms: 0.0, total_ms: 0.0, tokens_generated: 0, engine: BTreeMap::new() },
         })
     }
