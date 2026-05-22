@@ -9,7 +9,7 @@ MODEL_DIR = os.path.join(ROOT, "data", "models--mlx-community--Qwen3.5-35B-A3B-4
 C_DIR = os.path.join(ROOT, "moe_infer_c")
 RS_DIR = os.path.join(ROOT, "moe_infer_rs")
 
-TOKEN_COUNTS = [100, 200, 300]
+TOKEN_COUNTS = [20, 50, 100]
 RUST_MODES = ["Gpu", "FusedWoods", "FusedExp"]
 WARMUP_TOKENS = 32
 
