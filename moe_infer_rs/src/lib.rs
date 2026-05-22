@@ -1,4 +1,4 @@
-#[path = "math/util.rs"] mod math;
+#[path = "math_util.rs"] mod math;
 pub mod engine;
 pub mod model;
 
