@@ -44,7 +44,7 @@ class Conversation:
 
         self.messages.append({"role": "assistant", "content": response})
 
-        return completion
+        return response
 
 hf_path = "hub/models--mlx-community--Qwen3.6-35B-A3B-4bit"
 path = "data/models--mlx-community--Qwen3.6-35B-A3B-4bit"
