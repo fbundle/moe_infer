@@ -38,7 +38,7 @@ python helpers/gen_model_config.py \
 
 ```bash
 cd moe_infer_rs
-maturin develop --release --features python-bindings
+maturin develop --release
 ```
 
 ### 3. Run inference
@@ -110,21 +110,29 @@ from moe_infer import Context, Cache
 | `min_p` | 0.0 | Minimum probability relative to max |
 | `eos_token_ids` | [248046, 248044] | Stop tokens |
 
-## Rust CLI
+## Verification
+
+`verify_nway.py` checks numerical correctness across all engines on a stripped 4-layer model:
 
 ```bash
-cd moe_infer_rs
-
-# Benchmark
-cargo run --release --bin bench -- \
-  --model ../hub/models--mlx-community--Qwen3.5-35B-A3B-4bit \
-  --tokens 500
-
-# HTTP server with SSE streaming
-cargo run --release -- \
-  --model ../hub/models--mlx-community--Qwen3.5-35B-A3B-4bit \
-  --serve 8080
+python verify_nway.py
 ```
+
+Runs `Cpu`, `Gpu`, `FusedWoods`, `FusedExp` (Rust), `C` (C bench), and `mlx-lm` on the same token sequence, then compares logits pairwise. Outputs an N×N `max_diff` matrix with per-engine status (IDENTICAL / MATCH / CLOSE / DIVERGE).
+
+Expected results: all non-mlx engines agree within `2.6e-05` (ULP-level). mlx-lm diverges at `~0.11` due to bf16 precision. C bench and Rust FusedWoods are byte-for-byte identical.
+
+## Benchmarking
+
+`bench.py` benchmarks C and Rust GPU pipelines on the full 40-layer model:
+
+```bash
+python bench.py
+```
+
+Tests forward passes at 100, 200, and 300 tokens across `Gpu`, `FusedWoods`, `FusedExp` (Rust) and the C bench. Prints per-engine latency and throughput, plus speedup vs C.
+
+Requires the full model in `data/models--mlx-community--Qwen3.5-35B-A3B-4bit`.
 
 ## Model Format
 

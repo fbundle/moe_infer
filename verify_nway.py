@@ -2,6 +2,7 @@
 """N-way logit verification: mlx-lm vs Rust pipelines vs C bench on stripped model."""
 import subprocess, sys, os, json, struct, tempfile
 import numpy as np
+from tqdm import tqdm
 
 ROOT = os.path.dirname(os.path.abspath(__file__))
 MLX_DIR = os.path.join(ROOT, "hub", "models--mlx-community--Qwen3.5-35B-A3B-4bit-stripped")
@@ -17,7 +18,6 @@ def run_rust(mode):
     """Run Rust engine with given pipeline mode, return last-position logits."""
     from moe_infer import Context, Cache
 
-    print(f"[nway] Running Rust {mode}...")
     t0 = __import__('time').time()
 
     ctx = Context()
@@ -29,10 +29,11 @@ def run_rust(mode):
 
     elapsed = __import__('time').time() - t0
     logits = np.array(logits_all[-1], dtype=np.float32)
-
-    print(f"[nway] Rust {mode}: {elapsed*1000:.0f} ms")
-    print(f"  min={logits.min():.4f} max={logits.max():.4f} mean={logits.mean():.4f} NaNs={np.isnan(logits).sum()}")
     ctx.unload_model()
+
+    tqdm.write(f"[nway] Rust {mode:<12}: {elapsed*1000:5.0f} ms  "
+               f"min={logits.min():.4f} max={logits.max():.4f} "
+               f"mean={logits.mean():.4f} NaNs={np.isnan(logits).sum()}")
     return logits
 
 
@@ -88,8 +89,9 @@ def run_c():
 
     logits = np.fromfile(logits_path, dtype=np.float32)
 
-    print(f"[nway] C bench: {elapsed*1000:.0f} ms")
-    print(f"  min={logits.min():.4f} max={logits.max():.4f} mean={logits.mean():.4f} NaNs={np.isnan(logits).sum()}")
+    tqdm.write(f"[nway] C bench        : {elapsed*1000:5.0f} ms  "
+               f"min={logits.min():.4f} max={logits.max():.4f} "
+               f"mean={logits.mean():.4f} NaNs={np.isnan(logits).sum()}")
 
     os.unlink(tokens_path)
     os.unlink(logits_path)
@@ -115,8 +117,9 @@ def run_mlx():
     logits = np.array(mx.array(outputs[0, -1, :]).astype(mx.float32))
 
     elapsed = __import__('time').time() - t0
-    print(f"[nway] MLX-LM: {elapsed*1000:.0f} ms")
-    print(f"  min={logits.min():.4f} max={logits.max():.4f} mean={logits.mean():.4f} NaNs={np.isnan(logits).sum()}")
+    tqdm.write(f"[nway] MLX-LM          : {elapsed*1000:5.0f} ms  "
+               f"min={logits.min():.4f} max={logits.max():.4f} "
+               f"mean={logits.mean():.4f} NaNs={np.isnan(logits).sum()}")
     return logits
 
 
@@ -241,20 +244,20 @@ def main():
     )
     print()
 
+    engines = ["Cpu", "Gpu", "FusedWoods", "FusedExp", "C", "mlx-lm"]
+
     results = {}
-    for mode in ["Cpu", "Gpu", "FusedWoods", "FusedExp"]:
+    for mode in tqdm(["Cpu", "Gpu", "FusedWoods", "FusedExp"],
+                     desc="Rust pipelines", unit="mode"):
         results[mode] = run_rust(mode)
 
     results["mlx-lm"] = run_mlx()
-
-    # C engine (FusedWoods pipeline)
     results["C"] = run_c()
 
     print("\n" + "=" * 60)
     print("Pairwise comparisons")
     print("=" * 60)
 
-    engines = ["Cpu", "Gpu", "FusedWoods", "FusedExp", "C", "mlx-lm"]
     max_diffs = {}
     for i, e1 in enumerate(engines):
         for e2 in engines[i+1:]:
