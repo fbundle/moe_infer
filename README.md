@@ -31,7 +31,7 @@ python chat.py
 ## Python API
 
 ```python
-from moe_infer import Model, Engine, Cache
+from moe_infer import Model, Engine, Cache, record_engine_telemetry
 ```
 
 ### Model
@@ -44,11 +44,16 @@ from moe_infer import Model, Engine, Cache
 
 | Method | Description |
 |--------|-------------|
-| `engine = Engine(model, pipeline_mode="FusedExp")` | Initialize Metal GPU resources and load the model |
+| `engine = Engine(model, pipeline_mode="FusedExp", k=0)` | Initialize Metal GPU resources. `k` selects active experts per token (0 = model default) |
 | `engine.forward(input_ids, cache)` | Forward pass, returns `[n_tokens, vocab_size]` float32 logits |
-| `engine.generate(input_ids, cache, max_tokens, temperature, top_k, top_p, min_p, eos_token_ids)` | Autoregressive generation, returns `[n_tokens]` int64 token ids |
-| `engine.stream_generate(input_ids, cache, ...)` | Like generate but yields `(token_id, logits)` tuples incrementally |
-| `engine.telemetry()` | Returns dict: `prefill_ms`, `total_ms`, `tokens_generated`, `tokens_per_sec` |
+| `engine.stream_generate(input_ids, cache, ...)` | Autoregressive generation, yields `(token_id, logits)` tuples incrementally |
+| `engine.telemetry()` | Returns dict: `prefill_ms`, `total_ms`, `tokens_generated`, `tokens_per_sec`, plus engine-specific metrics |
+
+### Telemetry
+
+| Function | Description |
+|----------|-------------|
+| `record_engine_telemetry(on: bool)` | Enable/disable engine-level timing (e.g. `engine.expert_io_ms`) |
 
 ### Cache
 
@@ -108,21 +113,31 @@ MoE-Infer expects a model directory with:
 
 ```
 model_dir/
-├── model_weights.bin        # Mmap'd: all non-expert weights (embeddings, norms, projections, shared experts)
-├── model_weights.json       # Tensor manifest (name → offset, size, shape, dtype)
-├── model_config.json        # Model hyperparameters
-├── packed_experts/          # Per-layer expert files
+├── config.json                # HF config (read directly by Rust engine)
+├── model_weights.bin          # Mmap'd: all non-expert weights (embeddings, norms, projections, shared experts)
+├── model_weights.json         # Tensor manifest (name → offset, size, shape, dtype)
+├── packed_experts/            # Per-layer expert files (required)
 │   ├── layer_00.bin
 │   ├── layer_01.bin
 │   └── ...
-├── tokenizer.json           # HF tokenizer (used by Python bindings)
+├── packed_experts_lz4/        # LZ4-compressed experts (optional, faster SSD I/O)
+│   ├── layer_00.bin
+│   ├── layer_01.bin
+│   └── ...
+├── tokenizer.json             # HF tokenizer (used by Python bindings)
 └── vocab.json
 ```
+
+The engine auto-detects `packed_experts_lz4/` at load time and falls back to `packed_experts/` if not present.
 
 Helper scripts in `helpers/` convert from HuggingFace/MLX format:
 - `convert.py` — One-step conversion: config, weights, and expert repacking
 - `extract_weights.py` — Non-expert weights → `model_weights.bin` + `model_weights.json`
 - `repack_experts_4bit.py` — MLX 4-bit experts → `packed_experts/` per-layer files
+- `compress_experts_lz4.py` — Compress packed experts with LZ4 → `packed_experts_lz4/` (~40-55% smaller)
+- `repack_experts_2bit.py` — Requantize experts to 2-bit → `packed_experts_2bit/` (experimental)
+- `quantize_from_hf.py` — Convert HuggingFace unquantized models → MoE-Infer format
+- `strip_model.py` — Build a small 4-layer model for fast verification
 
 ## Performance
 
@@ -142,34 +157,41 @@ Expert I/O (SSD reads) dominates at ~72% of per-layer time.
 ```
 moe_infer_rs/              Rust engine + Python bindings
   src/
-    engine.rs              Engine trait, ExecCtxGpu, SignalCheckFn
+    engine.rs              Engine trait, TelemetryValue, record_engine_telemetry
     engine/
       cpu.rs               CPU engine (self-contained, pure f32)
-      fusedexp.rs          FusedExp pipeline (self-contained)
-      fusedwoods.rs        FusedWoods pipeline (self-contained, recommended)
+      fusedexp.rs          FusedExp pipeline (per-phase telemetry, K configurable)
+      fusedwoods.rs        FusedWoods pipeline (3-CMD, recommended)
     model/
-      mod.rs               Model struct
-      config.rs            JSON model config
+      mod.rs               Model struct (loads all files at startup)
+      config.rs            ModelConfig derived from HF config.json
       weights.rs           Mmap'd weight file + tensor lookup
+      expert.rs            ExpertFile enum (Raw pread / Lz4 decompress)
     math_util.rs           Math utilities (rms_norm, softmax, sigmoid, dequant, RoPE, etc.)
     metal_util/
-      context.rs           Metal device init, pipeline creation, GPU scratch buffers
+      context.rs           Metal device init, pipeline creation, ExpertCache LRU, scratch bufs
       kernels.rs           Metal kernel dispatch (matvec, SwiGLU, conv1d, SSM, attention)
-    cache.rs               KV cache, linear attention state
-    constants.rs           Model constants (GROUP_SIZE, MAX_SEQ, etc.)
-    python_bindings.rs     PyO3 bindings (Model, Engine, Cache)
-    lib.rs                 Module declarations
-  shaders/
-    shaders.metal          Metal compute shaders (embedded at compile time)
+      shaders.metal         Metal compute shaders (embedded at compile time via include_str!)
+    cache.rs               KV cache + linear attention state
+    constants.rs           Architecture constants
+    timer.rs               Wall-clock timer
+    python_bindings.rs     PyO3 bindings (Model, Engine, Cache, stream_generate)
+    lib.rs                 Module declarations + Python module init
+    error.rs               Error types
   Cargo.toml
 
 helpers/                   Model conversion scripts
   convert.py               One-step convert: config + weights + experts
-  extract_weights.py       Non-expert weights → model_weights.bin
-  repack_experts_4bit.py   MLX experts → packed_experts/
-  gen_model_config.py      Config generation
+  extract_weights.py       Non-expert weights → model_weights.bin + model_weights.json
+  repack_experts_4bit.py   MLX 4-bit experts → packed_experts/
+  compress_experts_lz4.py  packed_experts/ → packed_experts_lz4/ (~40-55% compression)
+  repack_experts_2bit.py   packed_experts/ → packed_experts_2bit/ (experimental)
+  strip_model.py           Build 4-layer stripped model for fast verification
+  quantize_from_hf.py      Convert HuggingFace unquantized models → MoE-Infer format
 
-verify_nway.py             Multi-engine logit verification
+bench.py                   Multi-engine performance benchmark
+verify_nway.py             N-way logit comparison (Cpu, FusedExp, FusedWoods, C, mlx-lm)
+chat.py                    Interactive chat demo
 ```
 
 ## License

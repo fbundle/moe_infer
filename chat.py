@@ -3,7 +3,7 @@
 from typing import Iterator
 import numpy as np
 from transformers import AutoTokenizer
-from moe_infer import Model, Engine, Cache  # type: ignore
+from moe_infer import Model, Engine, Cache, record_engine_telemetry  # type: ignore
 
 def get_qwen3_response(completion: str) -> str:
     completion = completion.removesuffix("<|im_end|>")
@@ -52,6 +52,8 @@ class Conversation:
 
 hf_path = "hub/models--mlx-community--Qwen3.6-35B-A3B-4bit"
 path = "data/models--mlx-community--Qwen3.6-35B-A3B-4bit"
+
+record_engine_telemetry(True)
 
 c = Conversation(hf_path, path, pipeline_mode="FusedExp", k=4)
 

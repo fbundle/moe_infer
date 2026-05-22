@@ -47,7 +47,7 @@ def main():
     print(f"  Output: {output_dir}")
     print()
 
-    steps = ["config", "weights", "experts", "lz4"]
+    steps = ["config", "weights", "experts"]
     if args.step:
         steps = [args.step]
 

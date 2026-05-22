@@ -13,7 +13,7 @@ use crate::model::Model as CoreModel;
 use crate::engine::cpu::EngineCPU;
 use crate::engine::fusedexp::EngineFusedExp;
 use crate::engine::fusedwoods::EngineFusedWoods;
-use crate::engine::{Engine as EngineTrait, SignalCheckFn, TelemetryValue, set_record_telemetry as set_telemetry};
+use crate::engine::{Engine as EngineTrait, SignalCheckFn, TelemetryValue, set_record_telemetry};
 use crate::math::softmax;
 use crate::metal_context::{ExpertBuffer, WeightBuffer, MetalContext};
 
@@ -21,8 +21,8 @@ use crate::metal_context::{ExpertBuffer, WeightBuffer, MetalContext};
 
 /// Enable or disable engine-level telemetry recording globally.
 #[pyfunction]
-pub fn record_telemetry(on: bool) {
-    set_telemetry(on);
+pub fn record_engine_telemetry(on: bool) {
+    set_record_telemetry(on);
 }
 
 // ─── Model (thin wrapper) ───────────────────────────────────────────────────
