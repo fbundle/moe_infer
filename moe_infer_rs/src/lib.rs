@@ -1,8 +1,4 @@
 #[path = "math/util.rs"] mod math;
-#[path = "math/full_attention.rs"] mod math_full_attention;
-#[path = "math/linear_attention.rs"] mod math_linear_attention;
-#[path = "math/lm_head.rs"] mod math_lm_head;
-#[path = "math/moe.rs"] mod math_moe;
 pub mod engine;
 pub mod model;
 

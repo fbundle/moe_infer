@@ -29,7 +29,6 @@ use crate::math::{
     embed_lookup, final_norm, normalize_weights, rms_norm, sigmoid,
     softmax, topk,
 };
-use crate::math_lm_head::gpu_lm_head;
 
 // ─── Full attention GPU output (local copy) ───────────────────────────────
 
@@ -1270,6 +1269,29 @@ fn encode_post_expert(
             metal::MTLSize::new(((hidden_dim + 255) / 256) as u64, 1, 1),
             metal::MTLSize::new(256, 1, 1),
         );
+    }
+}
+
+// ─── gpu_lm_head (local copy) ────────────────────────────────────────────
+
+fn gpu_lm_head(
+    wf: &WeightFile, hidden: &[f32], logits: &mut [f32],
+    gpu_wf: &WeightBuffer, ctx: &MetalContext,
+) {
+    let x_buf = metal_buf_shared(&ctx.device, hidden.len() * 4);
+    unsafe {
+        std::ptr::copy_nonoverlapping(hidden.as_ptr(), x_buf.contents() as *mut f32, hidden.len());
+    }
+    let out_buf = metal_buf_shared(&ctx.device, logits.len() * 4);
+    let cm = ctx.queue.new_command_buffer();
+    let enc = cm.new_compute_command_encoder();
+    gpu_wf.encode_matvec_into(wf, ctx, &enc, "lm_head", &x_buf, 0, &out_buf, 0, logits.len(), hidden.len());
+    enc.end_encoding();
+    cm.commit();
+    cm.wait_until_completed();
+    unsafe {
+        std::ptr::copy_nonoverlapping(
+            out_buf.contents() as *const f32, logits.as_mut_ptr(), logits.len());
     }
 }
 
