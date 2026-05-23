@@ -13,6 +13,7 @@ use crate::model::Model as CoreModel;
 use crate::engine::cpu::EngineCPU;
 use crate::engine::fusedexp::EngineFusedExp;
 use crate::engine::fusedwoods::EngineFusedWoods;
+use crate::error::MoEError;
 use crate::engine::{Engine as EngineTrait, SignalCheckFn, TelemetryValue, set_record_telemetry};
 use crate::math::softmax;
 use crate::metal_context::{ExpertBuffer, WeightBuffer, MetalContext};
@@ -38,7 +39,7 @@ impl Model {
     fn new(model_path: &str) -> PyResult<Self> {
         CoreModel::load(model_path)
             .map(|m| Model { inner: Arc::new(m) })
-            .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e))
+            .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))
     }
 
     fn __repr__(&self) -> String {
@@ -95,21 +96,27 @@ pub fn sample(logits: &mut [f32], temperature: f32, top_k: usize, top_p: f32, mi
     }
     softmax(logits);
 
+    // One sorted copy shared by top-k and top-p to avoid redundant allocations.
+    let needs_cutoff = (top_k > 0 && top_k < n) || top_p < 1.0;
+    let sorted = if needs_cutoff {
+        let mut s: Vec<f32> = logits.to_vec();
+        s.sort_unstable_by(|a, b| b.partial_cmp(a).unwrap());
+        s
+    } else {
+        Vec::new()
+    };
+
     if top_k > 0 && top_k < n {
-        let mut v: Vec<f32> = logits.to_vec();
-        v.select_nth_unstable_by(top_k, |a, b| b.partial_cmp(a).unwrap());
-        let t = v[top_k - 1];
+        let t = sorted[top_k - 1];
         for x in logits.iter_mut() { if *x < t { *x = 0.0; } }
     }
     if top_p < 1.0 {
-        let mut s: Vec<f32> = logits.iter().copied().filter(|&x| x > 0.0).collect();
-        s.sort_unstable_by(|a, b| b.partial_cmp(a).unwrap());
-        let total: f32 = s.iter().sum();
+        let total: f32 = sorted.iter().sum();
         let mut cum = 0.0;
         let mut cut = 0.0;
-        for v in s {
+        for &v in &sorted {
             cum += v;
-            if cum / total >= top_p { cut = v; break; }
+            if total > 0.0 && cum / total >= top_p { cut = v; break; }
         }
         for x in logits.iter_mut() { if *x < cut { *x = 0.0; } }
     }
@@ -163,7 +170,7 @@ impl EngineTrait for Engine {
         input_ids: &[i64],
         cache: &mut CoreCache,
         check_signal: SignalCheckFn<'_>,
-    ) -> Result<Vec<f32>, String> {
+    ) -> Result<Vec<f32>, MoEError> {
         let result = match self.mode.as_str() {
             "Cpu" | "CpuOnly" => {
                 let mut engine = EngineCPU { model: &self.model };
@@ -195,7 +202,7 @@ impl EngineTrait for Engine {
                 self.telemetry.engine = engine.telemetry();
                 logits
             }
-            _ => return Err(format!("Unknown pipeline mode: {}", self.mode)),
+            _ => return Err(MoEError::Config(format!("Unknown pipeline mode: {}", self.mode))),
         };
         result
     }
@@ -270,7 +277,7 @@ impl Engine {
         let logits = EngineTrait::forward(
             self, new_ids, &mut cache.inner,
             &mut || py.check_signals().is_err(),
-        ).map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e))?;
+        ).map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))?;
 
         let arr = PyArray2::<f32>::from_owned_array(py,
             numpy::ndarray::Array2::from_shape_vec((n, vs), logits).unwrap());

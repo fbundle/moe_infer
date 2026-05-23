@@ -1,5 +1,8 @@
 use std::ffi::c_void;
+use std::io;
 use std::os::fd::RawFd;
+
+use crate::error::MoEError;
 
 /// Unified expert weight storage: either raw packed or LZ4-compressed.
 pub enum ExpertFile {
@@ -23,7 +26,7 @@ impl ExpertFile {
     }
 
     /// Read the weights for a single expert into `dst` (must be expert_size bytes).
-    pub fn read_expert(&self, expert_idx: usize, dst: &mut [u8]) -> Result<(), String> {
+    pub fn read_expert(&self, expert_idx: usize, dst: &mut [u8]) -> Result<(), MoEError> {
         match self {
             ExpertFile::Raw { fd, expert_size } => {
                 let off = (expert_idx as i64) * (*expert_size as i64);
@@ -31,7 +34,8 @@ impl ExpertFile {
                     libc::pread(*fd, dst.as_mut_ptr() as *mut c_void, *expert_size, off)
                 };
                 if n != *expert_size as isize {
-                    Err(format!("pread expert {}: got {} expected {}", expert_idx, n, expert_size))
+                    Err(MoEError::Io(io::Error::new(io::ErrorKind::UnexpectedEof,
+                        format!("pread expert {}: got {} expected {}", expert_idx, n, expert_size))))
                 } else {
                     Ok(())
                 }
@@ -48,7 +52,8 @@ impl ExpertFile {
                     libc::pread(*fd, comp.as_mut_ptr() as *mut c_void, comp_sz, file_off);
                 }
                 let decomp = lz4_flex::decompress(&comp, *expert_size)
-                    .map_err(|e| format!("lz4 decompress expert {}: {}", expert_idx, e))?;
+                    .map_err(|e| MoEError::Io(io::Error::new(io::ErrorKind::InvalidData,
+                        format!("lz4 decompress expert {}: {}", expert_idx, e))))?;
                 let n = (*expert_size).min(decomp.len());
                 dst[..n].copy_from_slice(&decomp[..n]);
                 Ok(())

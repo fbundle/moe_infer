@@ -9,6 +9,7 @@ use metal::{Buffer, CommandBuffer, MTLSize};
 
 use crate::cache::{Cache, FullAttnCache, LinearAttnState};
 use crate::constants::{CONV_KERNEL_SIZE, FULL_ATTN_INTERVAL, GROUP_SIZE, MAX_SEQ, RMS_NORM_EPS};
+use crate::error::MoEError;
 use crate::engine::Engine;
 use crate::metal_kernels;
 use crate::metal_context::{metal_buf_shared, ExpertBuffer, WeightBuffer, MetalContext, MAX_K};
@@ -1518,12 +1519,12 @@ fn process_token_inner(
     capture_per_layer: bool,
     layer_outputs: &mut Vec<Vec<f32>>,
     use_fusedwoods: bool,
-) -> Result<(), String> {
+) -> Result<(), MoEError> {
     let mut deferred: Option<DeferredExperts> = None;
     let hd = exec.config.hidden_dim;
     for layer in 0..exec.config.num_layers {
         if layer % 4 == 0 && check_signal() {
-            return Err("interrupted".into());
+            return Err(MoEError::Metal("interrupted".into()));
         }
         let prev_gpu_combined = deferred.as_ref().map_or(false, |d| d.gpu_combined);
         if !prev_gpu_combined {
@@ -1619,7 +1620,7 @@ impl<'a> Engine for EngineFusedWoods<'a> {
         input_ids: &[i64],
         cache: &mut Cache,
         check_signal: SignalCheckFn<'_>,
-    ) -> Result<Vec<f32>, String> {
+    ) -> Result<Vec<f32>, MoEError> {
         let n = input_ids.len();
         let hd = self.model.config.hidden_dim;
         let vs = self.model.config.vocab_size;

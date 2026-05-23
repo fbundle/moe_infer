@@ -23,6 +23,7 @@ use crate::cache::{Cache, LinearAttnState};
 use crate::engine::Engine;
 use crate::model::Model;
 use crate::model::expert::ExpertFile;
+use crate::error::MoEError;
 use crate::engine::{SignalCheckFn, TelemetryValue};
 use crate::model::config::{ExpertLayout, ModelConfig};
 use crate::model::weights::WeightFile;
@@ -1339,7 +1340,7 @@ impl<'a> Engine for EngineFusedExp<'a> {
         input_ids: &[i64],
         cache: &mut Cache,
         check_signal: SignalCheckFn<'_>,
-    ) -> Result<Vec<f32>, String> {
+    ) -> Result<Vec<f32>, MoEError> {
         assert!(self.k <= self.model.config.num_experts_per_tok,
             "k ({}) must not exceed model's num_experts_per_tok ({})",
             self.k, self.model.config.num_experts_per_tok);
@@ -1379,7 +1380,7 @@ impl<'a> Engine for EngineFusedExp<'a> {
             let pos = exec.cache.pos;
             while layer < num_layers {
                 if check_signal() {
-                    return Err("interrupted".into());
+                    return Err(MoEError::Metal("interrupted".into()));
                 }
 
                 let is_full = (layer + 1) % FULL_ATTN_INTERVAL == 0;

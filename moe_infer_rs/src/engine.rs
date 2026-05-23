@@ -2,6 +2,7 @@ use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use crate::cache::Cache;
+use crate::error::MoEError;
 
 pub mod cpu;
 pub mod fusedexp;
@@ -37,7 +38,7 @@ pub trait Engine {
         input_ids: &[i64],
         cache: &mut Cache,
         check_signal: SignalCheckFn<'_>,
-    ) -> Result<Vec<f32>, String>;
+    ) -> Result<Vec<f32>, MoEError>;
 
     /// Per-engine telemetry. Keys are like `engine.*`.
     /// Values can be scalars or per-invocation lists.

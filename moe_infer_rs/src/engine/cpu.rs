@@ -3,6 +3,7 @@
 use crate::cache::Cache;
 use crate::constants::{CONV_KERNEL_SIZE, FULL_ATTN_INTERVAL, GROUP_SIZE, RMS_NORM_EPS};
 use crate::engine::Engine;
+use crate::error::MoEError;
 use crate::model::Model;
 use crate::engine::SignalCheckFn;
 use crate::math::{
@@ -485,7 +486,7 @@ impl<'a> Engine for EngineCPU<'a> {
         input_ids: &[i64],
         cache: &mut Cache,
         check_signal: SignalCheckFn<'_>,
-    ) -> Result<Vec<f32>, String> {
+    ) -> Result<Vec<f32>, MoEError> {
         let hd = self.model.config.hidden_dim;
         let vs = self.model.config.vocab_size;
         let num_layers = self.model.config.num_layers;
@@ -501,7 +502,7 @@ impl<'a> Engine for EngineCPU<'a> {
 
             for layer in 0..num_layers {
                 if layer % 4 == 0 && check_signal() {
-                    return Err("interrupted".into());
+                    return Err(MoEError::Metal("interrupted".into()));
                 }
                 let is_full = (layer + 1) % FULL_ATTN_INTERVAL == 0;
                 let residual = hidden.to_vec();
