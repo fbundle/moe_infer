@@ -174,6 +174,7 @@ fn mixed_full_attention_forward(
 
     // Append K, V to cache
     let cache_pos = kv.len;
+    assert!(cache_pos < MAX_SEQ, "sequence length {} exceeds MAX_SEQ ({})", cache_pos, MAX_SEQ);
     kv.k_cache[cache_pos * kv_dim..(cache_pos + 1) * kv_dim].copy_from_slice(&k);
     kv.v_cache[cache_pos * kv_dim..(cache_pos + 1) * kv_dim].copy_from_slice(&v);
     kv.len += 1;

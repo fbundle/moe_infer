@@ -137,27 +137,45 @@ impl WeightFile {
     #[inline]
     pub fn get_tensor_u32(&self, name: &str) -> Option<&[u32]> {
         let t = self.tensors.get(name)?;
-        let ptr = unsafe { self.data_ptr.add(t.offset as usize) } as *const u32;
+        let byte_ptr = unsafe { self.data_ptr.add(t.offset as usize) };
+        debug_assert_eq!(
+            byte_ptr as usize % std::mem::align_of::<u32>(),
+            0,
+            "u32 tensor '{}' at misaligned offset {}",
+            name, t.offset
+        );
         let len = t.size as usize / 4;
-        Some(unsafe { std::slice::from_raw_parts(ptr, len) })
+        Some(unsafe { std::slice::from_raw_parts(byte_ptr as *const u32, len) })
     }
 
     /// Get a tensor as a slice of u16 (for scales/biases/norm weights).
     #[inline]
     pub fn get_tensor_u16(&self, name: &str) -> Option<&[u16]> {
         let t = self.tensors.get(name)?;
-        let ptr = unsafe { self.data_ptr.add(t.offset as usize) } as *const u16;
+        let byte_ptr = unsafe { self.data_ptr.add(t.offset as usize) };
+        debug_assert_eq!(
+            byte_ptr as usize % std::mem::align_of::<u16>(),
+            0,
+            "u16 tensor '{}' at misaligned offset {}",
+            name, t.offset
+        );
         let len = t.size as usize / 2;
-        Some(unsafe { std::slice::from_raw_parts(ptr, len) })
+        Some(unsafe { std::slice::from_raw_parts(byte_ptr as *const u16, len) })
     }
 
     /// Get a tensor as a slice of f32.
     #[inline]
     pub fn get_tensor_f32(&self, name: &str) -> Option<&[f32]> {
         let t = self.tensors.get(name)?;
-        let ptr = unsafe { self.data_ptr.add(t.offset as usize) } as *const f32;
+        let byte_ptr = unsafe { self.data_ptr.add(t.offset as usize) };
+        debug_assert_eq!(
+            byte_ptr as usize % std::mem::align_of::<f32>(),
+            0,
+            "f32 tensor '{}' at misaligned offset {}",
+            name, t.offset
+        );
         let len = t.size as usize / 4;
-        Some(unsafe { std::slice::from_raw_parts(ptr, len) })
+        Some(unsafe { std::slice::from_raw_parts(byte_ptr as *const f32, len) })
     }
 
     /// Raw base pointer to the mmap'd data (for GPU buffer wrapping).

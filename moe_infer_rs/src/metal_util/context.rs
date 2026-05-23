@@ -461,13 +461,25 @@ impl WeightBuffer {
         in_dim: usize,
     ) -> bool {
         let w_ptr = match wf.get_tensor_ptr(&format!("{}.weight", prefix)) {
-            Some(p) => p, None => return false,
+            Some(p) => p,
+            None => {
+                eprintln!("[encode_matvec_into] WARNING: tensor not found: {}.weight", prefix);
+                return false;
+            }
         };
         let s_ptr = match wf.get_tensor_ptr(&format!("{}.scales", prefix)) {
-            Some(p) => p, None => return false,
+            Some(p) => p,
+            None => {
+                eprintln!("[encode_matvec_into] WARNING: tensor not found: {}.scales", prefix);
+                return false;
+            }
         };
         let b_ptr = match wf.get_tensor_ptr(&format!("{}.biases", prefix)) {
-            Some(p) => p, None => return false,
+            Some(p) => p,
+            None => {
+                eprintln!("[encode_matvec_into] WARNING: tensor not found: {}.biases", prefix);
+                return false;
+            }
         };
 
         let w_off = (w_ptr as usize - self.base as usize) as u64;

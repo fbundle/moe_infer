@@ -1,7 +1,7 @@
 /// CPU-only engine: no GPU resources, all dequant matvecs on CPU.
 
 use crate::cache::Cache;
-use crate::constants::{CONV_KERNEL_SIZE, FULL_ATTN_INTERVAL, GROUP_SIZE, RMS_NORM_EPS};
+use crate::constants::{CONV_KERNEL_SIZE, FULL_ATTN_INTERVAL, GROUP_SIZE, MAX_SEQ, RMS_NORM_EPS};
 use crate::engine::Engine;
 use crate::error::MoEError;
 use crate::model::Model;
@@ -151,6 +151,7 @@ impl<'a> ExecCtx<'a> {
         // Append K, V to cache
         let kv_cache = self.cache.kv[layer_idx].as_mut().unwrap();
         let cache_pos = kv_cache.len;
+        assert!(cache_pos < MAX_SEQ, "sequence length {} exceeds MAX_SEQ ({})", cache_pos, MAX_SEQ);
         kv_cache.k_cache[cache_pos * kv_dim..(cache_pos + 1) * kv_dim].copy_from_slice(&k);
         kv_cache.v_cache[cache_pos * kv_dim..(cache_pos + 1) * kv_dim].copy_from_slice(&v);
         kv_cache.len += 1;

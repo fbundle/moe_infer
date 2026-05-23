@@ -211,6 +211,7 @@ impl<'a> ExecCtx<'a> {
         // Append K, V to cache
         let kv_cache = self.cache.kv[layer].as_mut().unwrap();
         let cache_pos = kv_cache.len;
+        assert!(cache_pos < MAX_SEQ, "sequence length {} exceeds MAX_SEQ ({})", cache_pos, MAX_SEQ);
         kv_cache.k_cache[cache_pos * kv_dim..(cache_pos + 1) * kv_dim].copy_from_slice(&k);
         kv_cache.v_cache[cache_pos * kv_dim..(cache_pos + 1) * kv_dim].copy_from_slice(&v);
         kv_cache.len += 1;
@@ -1048,6 +1049,12 @@ fn encode_pre_expert(
 ) {
     let c = ctx;
     let gw = gpu_wf;
+    debug_assert!(linear_idx < c.buf_conv_state.len(),
+        "linear_idx {} out of bounds for buf_conv_state (len {})", linear_idx, c.buf_conv_state.len());
+    debug_assert!(linear_idx < c.buf_delta_state.len(),
+        "linear_idx {} out of bounds for buf_delta_state (len {})", linear_idx, c.buf_delta_state.len());
+    debug_assert!(c.batch_out.len() >= 7,
+        "batch_out too short (len {}), need >= 7", c.batch_out.len());
     let prefix = format!("model.layers.{}.linear_attn", layer_idx);
 
     let input_buf = c.buf_input.as_ref().unwrap();
@@ -1238,8 +1245,11 @@ fn encode_post_expert(
     }
 
     let sd_name = format!("{}.shared_expert.down_proj", prefix);
-    let _ = gpu_wf.encode_matvec_into(wf, ctx, enc, &sd_name, shared_scratch, 0,
-        shared_down_buf, 0, hidden_dim, shared_inter);
+    if !gpu_wf.encode_matvec_into(wf, ctx, enc, &sd_name, shared_scratch, 0,
+        shared_down_buf, 0, hidden_dim, shared_inter)
+    {
+        eprintln!("[fusedexp] WARNING: shared expert down_proj tensor not found: {}", sd_name);
+    }
 
     {
         let mcr_pipe = ctx.moe_combine_residual.as_ref().unwrap();
