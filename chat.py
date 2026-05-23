@@ -53,7 +53,7 @@ class Conversation:
 hf_path = "hub/models--mlx-community--Qwen3.6-35B-A3B-4bit"
 path = "data/models--mlx-community--Qwen3.6-35B-A3B-4bit"
 
-record_engine_telemetry(True)
+record_engine_telemetry(False)
 
 c = Conversation(hf_path, path, pipeline_mode="FusedExp", k=4)
 

@@ -78,10 +78,6 @@ def main():
 
     elapsed = time.time() - t0
     print(f"Done in {elapsed:.0f}s. Model ready in: {output_dir}/")
-    print()
-    print("Next steps:")
-    print(f"  cd moe_infer_rs")
-    print(f"  cargo run --release -- --serve 8000 --model {output_dir}")
 
 
 if __name__ == "__main__":

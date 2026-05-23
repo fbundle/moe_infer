@@ -170,7 +170,6 @@ All scripts read from the same MLX-format model directory and output to a single
 | Mode | Description | Sync Points/Layer |
 |------|-------------|-------------------|
 | `Cpu` | Pure CPU reference. All dequant matvecs, norms, attention, SSM on CPU. | N/A (sequential) |
-| `Gpu` | Individual GPU kernel dispatch per operation. No command buffer fusion. | 10+ |
 | `FusedExp` | Linear attention fused into CMD1. MoE experts dispatched individually. | 4–6 |
 | `FusedWoods` | Full C-engine architecture: CMD1 (linear attn) + CMD2 (full attn + o_proj + routing) + async CMD3 (experts + combine). | 2–3 |
 
@@ -316,6 +315,6 @@ helpers/                   Model conversion scripts
   quantize_from_hf.py      Convert HuggingFace unquantized models → MoE-Infer format
 
 bench.py                   Multi-engine performance benchmark
-verify_nway.py             N-way logit comparison (Cpu, Gpu, FusedExp, FusedWoods, C, mlx-lm)
+verify_nway.py             N-way logit comparison (Cpu, FusedExp, FusedWoods, C, mlx-lm)
 chat.py                    Interactive chat demo
 ```

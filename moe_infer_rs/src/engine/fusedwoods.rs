@@ -447,6 +447,9 @@ fn gpu_linear_attention(
                 hidden.as_mut_ptr(), hidden_dim);
         }
 
+        // Shift CPU-side conv1d ring buffer. GPU paths process conv1d on
+        // GPU (`buf_conv_state`), so the CPU shadow state is zero-filled
+        // rather than read back — avoids a costly GPU→CPU round-trip.
         let state_off = (CONV_KERNEL_SIZE - 2) * qkv_dim;
         state.conv_state.copy_within(qkv_dim.., 0);
         state.conv_state[state_off..state_off + qkv_dim].fill(0.0);
@@ -565,6 +568,8 @@ fn gpu_linear_attention(
         cmd_buf.commit();
         cmd_buf.wait_until_completed();
 
+        // GPU-side conv1d processed on GPU; zero CPU shadow state instead
+        // of a GPU→CPU readback (same rationale as the fused CMD1 path above).
         let state_off = (CONV_KERNEL_SIZE - 2) * qkv_dim;
         state.conv_state.copy_within(qkv_dim.., 0);
         state.conv_state[state_off..state_off + qkv_dim].fill(0.0);
@@ -791,23 +796,6 @@ impl DeferredExperts {
         self._keep_alive.clear();
     }
 
-    fn complete_fast(&mut self, hidden: &mut [f32], hidden_dim: usize) {
-        if let Some(ref cmd_buf) = self.cmd_buf {
-            cmd_buf.wait_until_completed();
-        }
-        if let Some(ref out_buf) = self.out_buf {
-            unsafe {
-                std::ptr::copy_nonoverlapping(
-                    out_buf.contents() as *const f32,
-                    hidden.as_mut_ptr(),
-                    hidden_dim,
-                );
-            }
-        }
-        self.cmd_buf = None;
-        self.out_buf = None;
-        self._keep_alive.clear();
-    }
 }
 
 // ─── moe_layer_forward (local copy, with FusedWoods lin_attn CMD2) ───────
@@ -1550,7 +1538,7 @@ fn process_token_inner(
         if is_full {
             if prev_gpu_combined {
                 if let Some(ref mut def) = deferred.take() {
-                    def.complete_fast(hidden, hd);
+                    def.complete(hidden, hd);
                 }
             }
             if let Some(ref mut kv) = kv[layer] {
@@ -1574,7 +1562,7 @@ fn process_token_inner(
             );
             if prev_gpu_combined {
                 if let Some(ref mut def) = deferred.take() {
-                    def.complete_fast(hidden, hd);
+                    def.complete(hidden, hd);
                 }
                 if let Some(ref mut ls) = lin_state {
                     ls.h_mid.copy_from_slice(hidden);

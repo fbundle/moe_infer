@@ -40,11 +40,18 @@ impl Model {
             if lz4_path.exists() {
                 use std::io::Read;
                 // Header: [u32 num_experts][u32 off_0]...[u32 off_{N-1}][u32 total_size]
+                // Guard against corrupted files (expert count must match config).
                 let mut f = std::fs::File::open(&lz4_path)
                     .map_err(|e| format!("lz4 expert {}: {}", layer, e))?;
                 let mut hdr4 = [0u8; 4];
                 f.read_exact(&mut hdr4).map_err(|e| format!("lz4 hdr {}: {}", layer, e))?;
                 let n = u32::from_le_bytes(hdr4) as usize;
+                if n != config.num_experts {
+                    return Err(format!(
+                        "lz4 expert {}: header says {} experts, config says {} — file may be corrupted",
+                        layer, n, config.num_experts
+                    ));
+                }
                 let off_len = n + 1;
                 let mut off = vec![0u32; off_len];
                 let mut off_buf = vec![0u8; off_len * 4];

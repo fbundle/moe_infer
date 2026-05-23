@@ -6,8 +6,8 @@ from tqdm import tqdm
 
 ROOT = os.path.dirname(os.path.abspath(__file__))
 
-MODEL_DIR = os.path.join(ROOT, "data", "models--mlx-community--Qwen3.5-35B-A3B-4bit-stripped")
-MLX_MODEL_DIR = os.path.join(ROOT, "hub", "models--mlx-community--Qwen3.5-35B-A3B-4bit-stripped")
+MODEL_DIR = os.path.join(ROOT, "data", "models--mlx-community--Qwen3.6-35B-A3B-4bit-stripped")
+MLX_MODEL_DIR = os.path.join(ROOT, "hub", "models--mlx-community--Qwen3.6-35B-A3B-4bit-stripped")
 
 RUST_ENGINES = ["Cpu", "FusedWoods", "FusedExp"]
 ENGINES = RUST_ENGINES + ["C", "mlx-lm"]
@@ -275,12 +275,10 @@ def main():
     print("Summary")
     print("=" * 60)
 
-    # Rust internal consistency: Cpu vs Gpu, FusedWoods, FusedExp
+    # Rust internal consistency: Cpu vs FusedWoods, FusedExp
     rust_pairs = [
-        ("Cpu", "Gpu"),
         ("Cpu", "FusedWoods"),
         ("Cpu", "FusedExp"),
-        ("Gpu", "FusedWoods"),
         ("FusedWoods", "FusedExp"),
     ]
     all_rust_ok = True

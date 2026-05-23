@@ -68,7 +68,6 @@ from moe_infer import Model, Engine, Cache, record_engine_telemetry
 | Mode | Description |
 |------|-------------|
 | `Cpu` | Pure CPU reference. All operations on CPU. Slow but useful for debugging. |
-| `Gpu` | GPU kernels with individual dispatch. No command buffer fusion. |
 | `FusedExp` | Linear attention fused into one command buffer. MoE experts dispatched individually. |
 | `FusedWoods` | Full 3-command-buffer pipeline (CMD1 + CMD2 + async CMD3). **Recommended.** |
 
@@ -91,7 +90,7 @@ from moe_infer import Model, Engine, Cache, record_engine_telemetry
 python verify_nway.py
 ```
 
-Runs `Cpu`, `Gpu`, `FusedWoods`, `FusedExp` (Rust), `C` (C bench), and `mlx-lm` on the same token sequence, then compares logits pairwise. Outputs an N×N `max_diff` matrix with per-engine status (IDENTICAL / MATCH / CLOSE / DIVERGE).
+Runs `Cpu`, `FusedWoods`, `FusedExp` (Rust), `C` (C bench), and `mlx-lm` on the same token sequence, then compares logits pairwise. Outputs an N×N `max_diff` matrix with per-engine status (IDENTICAL / MATCH / CLOSE / DIVERGE).
 
 Expected results: all non-mlx engines agree within `2.6e-05` (ULP-level). mlx-lm diverges at `~0.11` due to bf16 precision. C bench and Rust FusedWoods are byte-for-byte identical.
 
@@ -103,7 +102,7 @@ Expected results: all non-mlx engines agree within `2.6e-05` (ULP-level). mlx-lm
 python bench.py
 ```
 
-Tests forward passes at 100, 200, and 300 tokens across `Gpu`, `FusedWoods`, `FusedExp` (Rust) and the C bench. Prints per-engine latency and throughput, plus speedup vs C.
+Tests forward passes at 100, 200, and 300 tokens across `FusedWoods`, `FusedExp` (Rust) and the C bench. Prints per-engine latency and throughput, plus speedup vs C.
 
 Requires the full model in `data/models--mlx-community--Qwen3.5-35B-A3B-4bit`.
 
@@ -147,7 +146,6 @@ Apple M4, Qwen3.5-35B-A3B-4bit (40 layers, 256 experts, K=8), 32-token prompt, 1
 |------|-------|
 | FusedWoods | 2.69 |
 | FusedExp | 2.14 |
-| Gpu | 1.70 |
 | Cpu | 0.15 |
 
 Expert I/O (SSD reads) dominates at ~72% of per-layer time.

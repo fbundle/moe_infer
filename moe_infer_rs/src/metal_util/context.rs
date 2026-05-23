@@ -327,11 +327,11 @@ impl MetalContext {
             compile_opts.set_language_version(MTLLanguageVersion::V3_1);
 
             eprintln!("[metal] Compiling shaders from source...");
-            let t_compile = crate::timer::now_ms();
+            let t_compile = crate::timer::now();
             let library = device
                 .new_library_with_source(SHADER_SOURCE, &compile_opts)
                 .map_err(|e| MoEError::Shader(format!("Shader compilation failed: {:?}", e)))?;
-            eprintln!("[metal] Shader compilation: {:.0} ms", crate::timer::now_ms() - t_compile);
+            eprintln!("[metal] Shader compilation: {:.0} ms", crate::timer::now().duration_since(t_compile).as_secs_f64() * 1000.0);
 
             // Helper to create a pipeline
             let make_pipeline = |name: &str| -> Result<ComputePipelineState, MoEError> {

@@ -4,8 +4,8 @@ Strip a large MoE model down to a few layers + few experts for verification.
 
 Usage:
     python helpers/strip_model.py \
-        --input hub/models--mlx-community--Qwen3.5-35B-A3B-4bit \
-        --output hub/models--mlx-community--Qwen3.5-35B-A3B-4bit-stripped \
+        --input hub/models--mlx-community--Qwen3.6-35B-A3B-4bit \
+        --output data/models--mlx-community--Qwen3.6-35B-A3B-4bit-stripped \
         --num-layers 4 --num-experts 4
 """
 

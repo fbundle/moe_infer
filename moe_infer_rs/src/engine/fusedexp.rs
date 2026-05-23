@@ -954,6 +954,11 @@ fn moe_layer_forward(
 
 // ─── Private helpers ──────────────────────────────────────────────────────
 
+/// Shift the CPU-side conv1d ring buffer one slot left, zero the new slot.
+///
+/// GPU paths process conv1d entirely on GPU (`buf_conv_state`). The CPU-side
+/// `conv_state` is shadow state that's never read — shifting + zeroing
+/// preserves the ring-buffer structure without a costly GPU→CPU readback.
 fn update_conv_state(state: &mut LinearAttnState, qkv_dim: usize) {
     let state_off = (CONV_KERNEL_SIZE - 2) * qkv_dim;
     state.conv_state.copy_within(qkv_dim.., 0);
