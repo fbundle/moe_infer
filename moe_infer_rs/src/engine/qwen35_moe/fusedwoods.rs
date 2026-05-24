@@ -287,17 +287,23 @@ fn mixed_full_attention_forward<C: ModelConfig>(
 
     if use_gpu_attn {
         let c = ctx.unwrap();
+        let fa_idx = layer_idx / FULL_ATTN_INTERVAL;
+        let cache_pos = seq_len - 1;
+        let kc_buf = c.buf_kv_k[fa_idx].clone();
+        let vc_buf = c.buf_kv_v[fa_idx].clone();
+        unsafe {
+            let k_dst = (kc_buf.contents() as *mut f32).add(cache_pos * kv_dim);
+            std::ptr::copy_nonoverlapping(k.as_ptr(), k_dst, kv_dim);
+            let v_dst = (vc_buf.contents() as *mut f32).add(cache_pos * kv_dim);
+            std::ptr::copy_nonoverlapping(v.as_ptr(), v_dst, kv_dim);
+        }
         let q_buf = metal_buf_shared(&c.device, q_dim * 4);
-        let kc_buf = metal_buf_shared(&c.device, seq_stride * kv_dim * 4);
-        let vc_buf = metal_buf_shared(&c.device, seq_stride * kv_dim * 4);
         let scores_buf = metal_buf_shared(&c.device, num_attn_heads * seq_stride * 4);
         let out_buf = metal_buf_shared(&c.device, q_dim * 4);
         let q_gate_buf = metal_buf_shared(&c.device, q_dim * 4);
         let hidden_buf = metal_buf_shared(&c.device, hidden_dim * 4);
         unsafe {
             std::ptr::copy_nonoverlapping(q.as_ptr(), q_buf.contents() as *mut f32, q_dim);
-            std::ptr::copy_nonoverlapping(kv.k_cache.as_ptr(), kc_buf.contents() as *mut f32, seq_len * kv_dim);
-            std::ptr::copy_nonoverlapping(kv.v_cache.as_ptr(), vc_buf.contents() as *mut f32, seq_len * kv_dim);
             std::ptr::copy_nonoverlapping(q_gate.as_ptr(), q_gate_buf.contents() as *mut f32, q_dim);
             std::ptr::copy_nonoverlapping(hidden.as_ptr(), hidden_buf.contents() as *mut f32, hidden_dim);
         }
