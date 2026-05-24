@@ -1,6 +1,19 @@
-we are porting C code into Rust code
-our goal is to port 100% C code into Rust code
-and reach C performance, the current C performance is 4-5 tok/s
-moreover, the output must be correct
-user will test using
-python chat_rs.py --model output/models--mlx-community--Qwen3.6-35B-A3B-4bit --tokenizer hub/models--mlx-community--Qwen3.6-35B-A3B-4bit --temperature 0.0 2> /dev/null
+change engine FusedExp.forward into the following 
+
+forward(input_ids, cache)
+    ctx = make ExecCtx
+
+    for token in input_ids
+        - get hidden
+        - copy hidden to GPU
+        for layer in layers:
+            ctx, GateScores = ctx.op1_wait(token, layer)
+            routing = ctx.route_experts(GateScores)
+            ctx = ctx.op2(token, layer, routing)
+        
+        hidden = ctx.hidden()
+
+        -- get logits
+
+    return all logits
+
