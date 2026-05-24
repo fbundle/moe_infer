@@ -26,7 +26,7 @@ pub const CONV_KERNEL_SIZE: usize = 4;
 // ─── Expert layout helper ───────────────────────────────────────────────
 
 /// Compute the expert 4-bit packed layout constants from model dims.
-#[allow(non_snake_case)]
+#[allow(non_snake_case, dead_code)]
 pub struct ExpertLayout {
     pub gate_w_off: usize,
     pub gate_s_off: usize,
@@ -49,6 +49,7 @@ pub struct ExpertLayout {
     pub expert_size_4bit: usize,
 }
 
+#[allow(dead_code)]
 pub const fn expert_layout(hd: usize, mi: usize, gs: usize) -> ExpertLayout {
     let gate_w = mi * hd / 2;
     let gate_sb = mi * (hd / gs) * 2;
@@ -77,13 +78,14 @@ pub const fn expert_layout(hd: usize, mi: usize, gs: usize) -> ExpertLayout {
     }
 }
 
-// Shared expert layout for models with HD=2048, MI=512, GS=64.
+#[allow(dead_code)]
 const L: ExpertLayout = expert_layout(2048, 512, 64);
 
 // ─── Backward-compat re-exports ─────────────────────────────────────────
 /// Mirrors the #define constants in moe_infer_c/bench.m.
 /// These modules exist so external code that still references
 /// `qwen35_35b::HIDDEN_DIM` continues to compile.
+#[allow(dead_code)]
 pub mod qwen35_35b {
     pub use crate::engine::qwen35_moe::constants::{FullModel, ModelConfig};
     pub const HIDDEN_DIM: usize = 2048;
@@ -141,6 +143,7 @@ pub mod qwen35_35b {
     }
 }
 
+#[allow(dead_code)]
 pub mod qwen35_35b_stripped {
     pub use crate::engine::qwen35_moe::constants::{StrippedModel, ModelConfig};
     pub const HIDDEN_DIM: usize = 2048;
