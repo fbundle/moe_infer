@@ -123,8 +123,10 @@ def main():
 
     # ── Table ──
     print("\n" + "=" * 70)
-    print(f"{'Engine':<18} {'100 tok':>14} {'200 tok':>14} {'300 tok':>14}")
-    print(f"{'':>18} {'ms':>6} {'tok/s':>7} {'ms':>6} {'tok/s':>7} {'ms':>6} {'tok/s':>7}")
+    header = " ".join(f"{n:<4d} tok".rjust(14) for n in TOKEN_COUNTS)
+    sub_header = " ".join(f"{'ms':>6} {'tok/s':>7}" for _ in TOKEN_COUNTS)
+    print(f"{'Engine':<18} {header}")
+    print(f"{'':>18} {sub_header}")
     print("-" * 70)
 
     for label in all_modes:
