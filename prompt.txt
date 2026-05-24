@@ -1,19 +1,11 @@
-change engine FusedExp.forward into the following 
-
-forward(input_ids, cache)
-    ctx = make ExecCtx
-
-    for token in input_ids
-        - get hidden
-        - copy hidden to GPU
-        for layer in layers:
-            ctx, GateScores = ctx.op1_wait(token, layer)
-            routing = ctx.route_experts(GateScores)
-            ctx = ctx.op2(token, layer, routing)
+    fn op1_wait(self, layer: usize) -> (Self, GateScores) {
+        let is_full = (layer + 1) % FULL_ATTN_INTERVAL == 0;
+        if is_full {
+            self.op1_wait_full(layer)
+        } else {
+            self.op1_wait_linear(layer)
+        }
         
-        hidden = ctx.hidden_wait()
-
-        -- get logits
-
-    return all logits
-
+        -- get gate scores
+        return 
+    }

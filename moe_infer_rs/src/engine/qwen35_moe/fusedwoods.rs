@@ -9,7 +9,7 @@ use std::marker::PhantomData;
 
 use metal::{Buffer, CommandBuffer, MTLSize};
 
-use crate::cache::{Cache, FullAttnCache, LinearAttnState};
+use crate::cache::{Cache, FullState, LinearState, State};
 use super::constants::ModelConfig;
 use crate::constants::{MAX_SEQ, RMS_NORM_EPS, FULL_ATTN_INTERVAL, GROUP_SIZE, CONV_KERNEL_SIZE};
 use crate::error::MoEError;
@@ -159,7 +159,7 @@ fn mixed_full_attention_forward<C: ModelConfig>(
     wf: &WeightFile,
     layer_idx: usize,
     hidden: &mut [f32],
-    kv: &mut FullAttnCache,
+    kv: &mut FullState,
     pos: usize,
 
     gpu_wf: Option<&WeightBuffer>,
@@ -386,7 +386,7 @@ fn gpu_linear_attention<C: ModelConfig>(
     wf: &WeightFile,
     layer_idx: usize,
     hidden: &mut [f32],
-    state: &mut LinearAttnState,
+    state: &mut LinearState,
     hidden_dim: usize,
     num_k_heads: usize,
     num_v_heads: usize,
@@ -1661,8 +1661,7 @@ fn process_token_inner<C: ModelConfig>(
     exec: &mut ExecCtxGpu<'_>,
     hidden: &mut [f32],
     pos: usize,
-    kv: &mut [Option<FullAttnCache>],
-    lin: &mut [Option<LinearAttnState>],
+    states: &mut [State],
     check_signal: SignalCheckFn<'_>,
     capture_per_layer: bool,
     layer_outputs: &mut Vec<Vec<f32>>,
@@ -1694,12 +1693,12 @@ fn process_token_inner<C: ModelConfig>(
         let mut lin_state: Option<LinearAttnGpuOut> = None;
         let mut has_h_mid_saved = false;
         if is_full {
-            if let Some(ref mut kv) = kv[layer] {
+            if let State::Full(ref mut kv) = states[layer] {
                 attn_state = mixed_full_attention_forward(
                     exec.wf, layer, hidden, kv, pos,
                     Some(exec.gpu_wf), Some(exec.ctx), exec.norm_cache, s);
             }
-        } else if let Some(ref mut lin_s) = lin[layer] {
+        } else if let State::Linear(ref mut lin_s) = states[layer] {
             let li = layer - (layer + 1) / FULL_ATTN_INTERVAL;
             if use_fusedwoods && !prev_gpu_combined {
                 s.h_mid_saved.copy_from_slice(hidden);
@@ -1785,17 +1784,19 @@ impl<'a, C: ModelConfig> Engine for FusedWoods<'a, C> {
     fn forward(
         &mut self,
         input_ids: &[i64],
-        cache: &mut Cache,
+        mut cache: Cache,
         check_signal: SignalCheckFn<'_>,
-    ) -> Result<Vec<f32>, MoEError> {
+    ) -> Result<(Cache, Vec<f32>), MoEError> {
         let n = input_ids.len();
         let hd = C::HIDDEN_DIM;
         let vs = C::VOCAB_SIZE;
 
         let mut logits = vec![0.0f32; n * vs];
         if n == 0 {
-            return Ok(logits);
+            return Ok((cache, logits));
         }
+
+        self.ctx.upload_cache(&cache, C::NUM_LAYERS, C::NUM_KV_HEADS * C::HEAD_DIM);
 
         let mut embed = vec![0.0f32; n * hd];
         for (i, &id) in input_ids.iter().enumerate() {
@@ -1822,7 +1823,7 @@ impl<'a, C: ModelConfig> Engine for FusedWoods<'a, C> {
             };
             process_token_inner(
                 &mut exec, &mut hidden,
-                cache.pos, &mut cache.kv, &mut cache.lin,
+                cache.pos, &mut cache.states,
                 &mut || check_signal(), false, &mut Vec::new(),
                 true, scratch,
             )?;
@@ -1833,6 +1834,8 @@ impl<'a, C: ModelConfig> Engine for FusedWoods<'a, C> {
                 exec.gpu_wf, exec.ctx);
         }
 
-        Ok(logits)
+        self.ctx.download_cache(&mut cache, C::NUM_LAYERS, C::NUM_KV_HEADS * C::HEAD_DIM);
+
+        Ok((cache, logits))
     }
 }

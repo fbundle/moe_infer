@@ -4,6 +4,8 @@
 use metal::*;
 use objc::rc::autoreleasepool;
 use std::collections::HashMap;
+use crate::cache::Cache;
+use crate::constants::FULL_ATTN_INTERVAL;
 use crate::error::MoEError;
 use crate::metal_kernels;
 use crate::model::weights::WeightFile;
@@ -487,6 +489,87 @@ impl MetalContext {
                 buf_qkv_v: None,
             })
         })
+    }
+}
+
+// ─── Cache ↔ GPU sync ─────────────────────────────────────────────────────
+
+impl MetalContext {
+    /// Upload CPU cache state → GPU buffers (restoring from persistent state).
+    pub fn upload_cache(&self, cache: &Cache, num_layers: usize, kv_dim: usize) {
+        if cache.pos == 0 { return; }
+        for layer in 0..num_layers {
+            if (layer + 1) % FULL_ATTN_INTERVAL == 0 {
+                let fa_idx = layer / FULL_ATTN_INTERVAL;
+                let kv = cache.full(layer);
+                let n = kv.len * kv_dim;
+                unsafe {
+                    std::ptr::copy_nonoverlapping(
+                        kv.k_cache.as_ptr(),
+                        self.buf_kv_k[fa_idx].contents() as *mut f32,
+                        n,
+                    );
+                    std::ptr::copy_nonoverlapping(
+                        kv.v_cache.as_ptr(),
+                        self.buf_kv_v[fa_idx].contents() as *mut f32,
+                        n,
+                    );
+                }
+            } else {
+                let li = layer - (layer + 1) / FULL_ATTN_INTERVAL;
+                let lin = cache.lin(layer);
+                unsafe {
+                    std::ptr::copy_nonoverlapping(
+                        lin.ssm_state.as_ptr(),
+                        self.buf_delta_state[li].contents() as *mut f32,
+                        lin.ssm_state.len(),
+                    );
+                    std::ptr::copy_nonoverlapping(
+                        lin.conv_state.as_ptr(),
+                        self.buf_conv_state[li].contents() as *mut f32,
+                        lin.conv_state.len(),
+                    );
+                }
+            }
+        }
+    }
+
+    /// Download GPU state → CPU cache (for persistence).
+    pub fn download_cache(&self, cache: &mut Cache, num_layers: usize, kv_dim: usize) {
+        for layer in 0..num_layers {
+            if (layer + 1) % FULL_ATTN_INTERVAL == 0 {
+                let fa_idx = layer / FULL_ATTN_INTERVAL;
+                unsafe {
+                    let kv = cache.full_mut(layer);
+                    let n = kv.len * kv_dim;
+                    std::ptr::copy_nonoverlapping(
+                        self.buf_kv_k[fa_idx].contents() as *const f32,
+                        kv.k_cache.as_mut_ptr(),
+                        n,
+                    );
+                    std::ptr::copy_nonoverlapping(
+                        self.buf_kv_v[fa_idx].contents() as *const f32,
+                        kv.v_cache.as_mut_ptr(),
+                        n,
+                    );
+                }
+            } else {
+                let li = layer - (layer + 1) / FULL_ATTN_INTERVAL;
+                unsafe {
+                    let lin = cache.lin_mut(layer);
+                    std::ptr::copy_nonoverlapping(
+                        self.buf_delta_state[li].contents() as *const f32,
+                        lin.ssm_state.as_mut_ptr(),
+                        lin.ssm_state.len(),
+                    );
+                    std::ptr::copy_nonoverlapping(
+                        self.buf_conv_state[li].contents() as *const f32,
+                        lin.conv_state.as_mut_ptr(),
+                        lin.conv_state.len(),
+                    );
+                }
+            }
+        }
     }
 }
 

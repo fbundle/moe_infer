@@ -32,13 +32,13 @@ pub enum TelemetryValue {
 }
 
 pub trait Engine {
-    /// Process `input_ids` through all layers. Returns logits [n, vocab_size].
+    /// Process `input_ids` through all layers. Returns logits [n, vocab_size] and updated cache.
     fn forward(
         &mut self,
         input_ids: &[i64],
-        cache: &mut Cache,
+        cache: Cache,
         check_signal: SignalCheckFn<'_>,
-    ) -> Result<Vec<f32>, MoEError>;
+    ) -> Result<(Cache, Vec<f32>), MoEError>;
 
     /// Per-engine telemetry. Keys are like `engine.*`.
     /// Values can be scalars or per-invocation lists.
@@ -127,9 +127,9 @@ impl ErasedEngine {
     pub fn forward(
         &mut self,
         input_ids: &[i64],
-        cache: &mut Cache,
+        cache: Cache,
         check_signal: SignalCheckFn<'_>,
-    ) -> Result<Vec<f32>, MoEError> {
+    ) -> Result<(Cache, Vec<f32>), MoEError> {
         match self {
             ErasedEngine::FusedExp(e) => Engine::forward(e, input_ids, cache, check_signal),
             ErasedEngine::FusedWoods(e) => Engine::forward(e, input_ids, cache, check_signal),

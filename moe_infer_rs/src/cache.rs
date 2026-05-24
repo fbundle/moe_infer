@@ -1,14 +1,41 @@
-use metal::Buffer;
+use std::fs::File;
+use std::io::{BufReader, BufWriter};
+use std::path::Path;
+
+use serde::{Deserialize, Serialize};
 
 use crate::constants::{CONV_KERNEL_SIZE, FULL_ATTN_INTERVAL, MAX_SEQ};
 use crate::model::config::ModelConfig;
 
-// ─── Cache (data only) ──────────────────────────────────────────────────────
+// ─── Per-layer state ────────────────────────────────────────────────────────
 
+#[derive(Serialize, Deserialize)]
+pub enum State {
+    Full(FullState),
+    Linear(LinearState),
+}
+
+impl State {
+    pub fn as_full(&self) -> &FullState {
+        match self { State::Full(s) => s, _ => panic!("expected Full state") }
+    }
+    pub fn as_full_mut(&mut self) -> &mut FullState {
+        match self { State::Full(s) => s, _ => panic!("expected Full state") }
+    }
+    pub fn as_linear(&self) -> &LinearState {
+        match self { State::Linear(s) => s, _ => panic!("expected Linear state") }
+    }
+    pub fn as_linear_mut(&mut self) -> &mut LinearState {
+        match self { State::Linear(s) => s, _ => panic!("expected Linear state") }
+    }
+}
+
+// ─── Cache — a list of per-layer state + sequence position ──────────────────
+
+#[derive(Serialize, Deserialize)]
 pub struct Cache {
     pub pos: usize,
-    pub kv: Vec<Option<FullAttnCache>>,
-    pub lin: Vec<Option<LinearAttnState>>,
+    pub states: Vec<State>,
 }
 
 impl Cache {
@@ -17,76 +44,98 @@ impl Cache {
         let num_kv_heads = config.get_usize("num_kv_heads").unwrap();
         let head_dim = config.get_usize("head_dim").unwrap();
         let kv_dim = num_kv_heads * head_dim;
-        let linear_num_v_heads = config.get_usize("linear_num_v_heads").unwrap();
-        let linear_total_key = config.get_usize("linear_total_key").unwrap();
-        let linear_num_k_heads = config.get_usize("linear_num_k_heads").unwrap();
-        let linear_total_value = config.get_usize("linear_total_value").unwrap();
-        let linear_conv_dim = config.get_usize("linear_conv_dim").unwrap();
+        let lnum_v_heads = config.get_usize("linear_num_v_heads").unwrap();
+        let ltotal_key = config.get_usize("linear_total_key").unwrap();
+        let lnum_k_heads = config.get_usize("linear_num_k_heads").unwrap();
+        let ltotal_value = config.get_usize("linear_total_value").unwrap();
+        let lconv_dim = config.get_usize("linear_conv_dim").unwrap();
 
-        let mut kv = Vec::with_capacity(num_layers);
-        let mut lin = Vec::with_capacity(num_layers);
+        let mut states = Vec::with_capacity(num_layers);
         for layer in 0..num_layers {
             if (layer + 1) % FULL_ATTN_INTERVAL == 0 {
-                kv.push(Some(FullAttnCache::new(MAX_SEQ, kv_dim)));
-                lin.push(None);
+                states.push(State::Full(FullState::new(MAX_SEQ, kv_dim)));
             } else {
-                kv.push(None);
-                lin.push(Some(LinearAttnState::new(
-                    linear_num_v_heads,
-                    linear_total_key / linear_num_k_heads,
-                    linear_total_value / linear_num_v_heads,
-                    linear_conv_dim,
+                states.push(State::Linear(LinearState::new(
+                    lnum_v_heads,
+                    ltotal_key / lnum_k_heads,
+                    ltotal_value / lnum_v_heads,
+                    lconv_dim,
                 )));
             }
         }
-        Cache { pos: 0, kv, lin }
+        Cache { pos: 0, states }
     }
+
+    /// Accessors panicking if the layer has the wrong attention type.
+    pub fn full(&self, layer: usize) -> &FullState { self.states[layer].as_full() }
+    pub fn full_mut(&mut self, layer: usize) -> &mut FullState { self.states[layer].as_full_mut() }
+    pub fn lin(&self, layer: usize) -> &LinearState { self.states[layer].as_linear() }
+    pub fn lin_mut(&mut self, layer: usize) -> &mut LinearState { self.states[layer].as_linear_mut() }
 
     pub fn reset(&mut self) {
         self.pos = 0;
-        for kv in self.kv.iter_mut().flatten() {
-            kv.reset();
+        for s in &mut self.states {
+            match s {
+                State::Full(kv) => kv.len = 0,
+                State::Linear(ls) => {
+                    ls.conv_state.fill(0.0);
+                    ls.ssm_state.fill(0.0);
+                }
+            }
         }
-        for s in self.lin.iter_mut().flatten() {
-            s.conv_state.fill(0.0);
-            s.ssm_state.fill(0.0);
-        }
+    }
+
+    /// Serialize cache to a JSON file (for persistence across restarts).
+    pub fn save(&self, path: impl AsRef<Path>) -> Result<(), Box<dyn std::error::Error>> {
+        let file = File::create(path)?;
+        let writer = BufWriter::new(file);
+        serde_json::to_writer(writer, self)?;
+        Ok(())
+    }
+
+    /// Deserialize cache from a JSON file.
+    pub fn load(path: impl AsRef<Path>) -> Result<Self, Box<dyn std::error::Error>> {
+        let file = File::open(path)?;
+        let reader = BufReader::new(file);
+        let cache: Cache = serde_json::from_reader(reader)?;
+        Ok(cache)
     }
 }
 
-// ─── Full attention cache ───────────────────────────────────────────────────
+// ─── Full-attention state ───────────────────────────────────────────────────
 
-pub struct FullAttnCache {
+#[derive(Serialize, Deserialize)]
+pub struct FullState {
     pub k_cache: Vec<f32>,
     pub v_cache: Vec<f32>,
     pub len: usize,
 }
 
-impl FullAttnCache {
+impl FullState {
     pub fn new(max_seq: usize, kv_dim: usize) -> Self {
-        FullAttnCache {
+        FullState {
             k_cache: vec![0.0f32; max_seq * kv_dim],
             v_cache: vec![0.0f32; max_seq * kv_dim],
             len: 0,
         }
     }
-
-    pub fn reset(&mut self) {
-        self.len = 0;
-    }
 }
 
-// ─── Linear attention state ─────────────────────────────────────────────────
+// ─── Linear-attention state ─────────────────────────────────────────────────
 
-pub struct LinearAttnState {
+#[derive(Serialize, Deserialize)]
+pub struct LinearState {
     pub conv_state: Vec<f32>,
     pub ssm_state: Vec<f32>,
-    pub ssm_state_gpu: Option<Buffer>,
+    #[serde(skip, default = "default_ssm_gpu")]
+    pub ssm_state_gpu: Option<metal::Buffer>,
 }
 
-impl LinearAttnState {
+fn default_ssm_gpu() -> Option<metal::Buffer> { None }
+
+impl LinearState {
     pub fn new(num_v_heads: usize, key_dim: usize, value_dim: usize, qkv_dim: usize) -> Self {
-        LinearAttnState {
+        LinearState {
             conv_state: vec![0.0f32; (CONV_KERNEL_SIZE - 1) * qkv_dim],
             ssm_state: vec![0.0f32; num_v_heads * value_dim * key_dim],
             ssm_state_gpu: None,
