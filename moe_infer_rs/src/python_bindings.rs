@@ -48,25 +48,25 @@ impl Model {
 
 #[pyclass(unsendable)]
 pub struct Cache {
-    inner: Option<CoreCache>,
+    inner: CoreCache,
 }
 
 #[pymethods]
 impl Cache {
     #[new]
     fn new(model: &Model) -> Self {
-        Cache { inner: Some(CoreCache::new(&model.inner.config)) }
+        Cache { inner: CoreCache::new(&model.inner.config) }
     }
 
     #[getter]
-    fn pos(&self) -> usize { self.inner.as_ref().map_or(0, |c| c.pos) }
+    fn pos(&self) -> usize { self.inner.pos }
 
     fn reset(&mut self) {
-        if let Some(ref mut c) = self.inner { c.reset(); }
+        self.inner.reset();
     }
 
     fn __repr__(&self) -> String {
-        format!("Cache(pos={})", self.inner.as_ref().map_or(0, |c| c.pos))
+        format!("Cache(pos={})", self.inner.pos)
     }
 }
 
@@ -169,17 +169,14 @@ impl Engine {
     ) -> PyResult<PyObject> {
         let ids = input_ids.readonly();
         let ids = ids.as_slice()?;
-        let pos = cache.inner.as_ref().map_or(0, |c| c.pos);
+        let pos = cache.inner.pos;
         let start = if pos < ids.len() { pos } else { 0 };
         let new_ids = &ids[start..];
         let n = new_ids.len();
         let vs = self.model.config.get_usize("vocab_size").unwrap();
 
-        let core_cache = cache.inner.take()
-            .ok_or_else(|| pyo3::exceptions::PyRuntimeError::new_err("cache already consumed"))?;
-        let (new_cache, logits) = self.forward_impl(new_ids, core_cache, &mut || py.check_signals().is_err())
+        let logits = self.forward_impl(new_ids, &mut cache.inner, &mut || py.check_signals().is_err())
             .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))?;
-        cache.inner = Some(new_cache);
 
         let arr = PyArray2::<f32>::from_owned_array(py,
             numpy::ndarray::Array2::from_shape_vec((n, vs), logits)
@@ -216,9 +213,9 @@ impl Engine {
     fn forward_impl(
         &mut self,
         input_ids: &[i64],
-        cache: CoreCache,
+        cache: &mut CoreCache,
         check_signal: SignalCheckFn<'_>,
-    ) -> Result<(CoreCache, Vec<f32>), MoEError> {
+    ) -> Result<Vec<f32>, MoEError> {
         if self.engine.is_none() {
             // SAFETY: Engine is on the PyO3 heap (stable address).
             self.engine = Some(unsafe {
@@ -229,9 +226,9 @@ impl Engine {
             });
         }
         let eng = self.engine.as_mut().unwrap();
-        let (cache, logits) = eng.forward(input_ids, cache, check_signal)?;
+        let logits = eng.forward(cache, input_ids, check_signal)?;
         self.telemetry = eng.telemetry();
-        Ok((cache, logits))
+        Ok(logits)
     }
 }
 

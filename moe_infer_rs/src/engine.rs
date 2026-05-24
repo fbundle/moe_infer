@@ -32,13 +32,14 @@ pub enum TelemetryValue {
 }
 
 pub trait Engine {
-    /// Process `input_ids` through all layers. Returns logits [n, vocab_size] and updated cache.
+    /// Process `input_ids` through all layers. Returns logits [n, vocab_size].
+    /// `cache` is mutated in place.
     fn forward(
         &mut self,
+        cache: &mut Cache,
         input_ids: &[i64],
-        cache: Cache,
         check_signal: SignalCheckFn<'_>,
-    ) -> Result<(Cache, Vec<f32>), MoEError>;
+    ) -> Result<Vec<f32>, MoEError>;
 
     /// Per-engine telemetry. Keys are like `engine.*`.
     /// Values can be scalars or per-invocation lists.
@@ -126,15 +127,15 @@ impl ErasedEngine {
 
     pub fn forward(
         &mut self,
+        cache: &mut Cache,
         input_ids: &[i64],
-        cache: Cache,
         check_signal: SignalCheckFn<'_>,
-    ) -> Result<(Cache, Vec<f32>), MoEError> {
+    ) -> Result<Vec<f32>, MoEError> {
         match self {
-            ErasedEngine::FusedExp(e) => Engine::forward(e, input_ids, cache, check_signal),
-            ErasedEngine::FusedWoods(e) => Engine::forward(e, input_ids, cache, check_signal),
-            ErasedEngine::FusedExpStripped(e) => Engine::forward(e, input_ids, cache, check_signal),
-            ErasedEngine::FusedWoodsStripped(e) => Engine::forward(e, input_ids, cache, check_signal),
+            ErasedEngine::FusedExp(e) => Engine::forward(e, cache, input_ids, check_signal),
+            ErasedEngine::FusedWoods(e) => Engine::forward(e, cache, input_ids, check_signal),
+            ErasedEngine::FusedExpStripped(e) => Engine::forward(e, cache, input_ids, check_signal),
+            ErasedEngine::FusedWoodsStripped(e) => Engine::forward(e, cache, input_ids, check_signal),
         }
     }
 

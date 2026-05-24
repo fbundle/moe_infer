@@ -57,16 +57,16 @@ fn timing_add(tm: &mut BTreeMap<String, TelemetryValue>, key: &str, dt: f64) {
 
 // ─── Execution context ─────────────────────────────────────────────────────
 
-struct ExecCtx<'e, 'c, C: ModelConfig> {
-    engine: FusedExp<'e, C>,
+struct ExecCtx<'b, 'a, 'c, C: ModelConfig> {
+    engine: &'b mut FusedExp<'a, C>,
     cache: &'c mut Cache,
     pending: Option<DeferredExperts>,
 }
 
-impl<'e, 'c, C: ModelConfig> ExecCtx<'e, 'c, C> {
+impl<'b, 'a, 'c, C: ModelConfig> ExecCtx<'b, 'a, 'c, C> {
     // ── Initialise GPU hidden buffers from embedding ────────────────────────
 
-    fn init_hidden(self, hidden: &[f32]) -> Self {
+    fn init_hidden(&mut self, hidden: &[f32]) {
         let hd = C::HIDDEN_DIM;
         {
             let buf_moe = self.engine.ctx.buf_moe_hidden.as_ref().unwrap();
@@ -88,18 +88,17 @@ impl<'e, 'c, C: ModelConfig> ExecCtx<'e, 'c, C> {
                 unsafe { std::ptr::copy_nonoverlapping(hidden.as_ptr(), buf_in.contents() as *mut f32, hd); }
             }
         }
-        self
     }
 
     // ── op1: pre-expert (attention + gate projections) ─────────────────────
 
-    fn op1_wait(mut self, layer: usize) -> (Self, GateScores) {
+    fn op1_wait(&mut self, layer: usize) -> GateScores {
         let is_full = (layer + 1) % FULL_ATTN_INTERVAL == 0;
-        self = if is_full {
-            self.op1_wait_full(layer)
+        if is_full {
+            self.op1_wait_full(layer);
         } else {
-            self.op1_wait_linear(layer)
-        };
+            self.op1_wait_linear(layer);
+        }
         self.pending = None;
         let c = self.engine.ctx;
         let mut gate_scores = vec![0.0f32; C::NUM_EXPERTS];
@@ -110,11 +109,11 @@ impl<'e, 'c, C: ModelConfig> ExecCtx<'e, 'c, C> {
                 gate_scores.as_mut_ptr(), C::NUM_EXPERTS);
             shared_gate_score = *(c.buf_shared_gate_score.as_ref().unwrap().contents() as *const f32);
         }
-        (self, GateScores { scores: gate_scores, shared_gate_score })
+        GateScores { scores: gate_scores, shared_gate_score }
     }
 
     /// Full-attn op1: entirely on GPU — input_norm → QKV → Q/K norms → RoPE → KV-cache → attention → gate.
-    fn op1_wait_full(mut self, layer: usize) -> Self {
+    fn op1_wait_full(&mut self, layer: usize) {
         let wf = &self.engine.model.wf;
         let gw = self.engine.gpu_wf;
         let c = self.engine.ctx;
@@ -375,13 +374,11 @@ impl<'e, 'c, C: ModelConfig> ExecCtx<'e, 'c, C> {
             assert!(cache_pos < MAX_SEQ, "sequence length {} exceeds MAX_SEQ ({})", cache_pos, MAX_SEQ);
             kv_cache.len += 1;
         }
-
-        self
     }
 
     /// Linear-attn op1: uses the pending op2 buffer (or creates a new one)
     /// to form a fused post_expert(prev) + pre_expert(curr) command when pipelining.
-    fn op1_wait_linear(mut self, layer: usize) -> Self {
+    fn op1_wait_linear(&mut self, layer: usize) {
         let hd = C::HIDDEN_DIM;
         let num_experts = C::NUM_EXPERTS;
         let shared_inter = C::SHARED_INTERMEDIATE;
@@ -417,8 +414,6 @@ impl<'e, 'c, C: ModelConfig> ExecCtx<'e, 'c, C> {
         cmd.commit();
         cmd.wait_until_completed();
         drop(keep_alive);
-
-        self
     }
 
     // ── Routing ───────────────────────────────────────────────────────────
@@ -482,7 +477,8 @@ impl<'e, 'c, C: ModelConfig> ExecCtx<'e, 'c, C> {
 
     // ── op2: post-expert (encodes into pending buffer, does NOT commit) ────
 
-    fn op2(mut self, layer: usize, routing: &Routing) -> Self {
+    fn op2(&mut self, layer: usize, routing: &Routing) {
+
         let hd = C::HIDDEN_DIM;
         let moe_inter = C::MOE_INTERMEDIATE;
         let shared_inter = C::SHARED_INTERMEDIATE;
@@ -526,7 +522,6 @@ impl<'e, 'c, C: ModelConfig> ExecCtx<'e, 'c, C> {
             cmd_buf: Some(cmd),
             _keep_alive: keep_alive,
         });
-        self
     }
 
     // ── Commit final pending work & read hidden from GPU ──────────────────
@@ -908,10 +903,10 @@ impl<'a, C: ModelConfig> FusedExp<'a, C> {
 impl<'a, C: ModelConfig> Engine for FusedExp<'a, C> {
     fn forward(
         &mut self,
+        cache: &mut Cache,
         input_ids: &[i64],
-        mut cache: Cache,
         check_signal: SignalCheckFn<'_>,
-    ) -> Result<(Cache, Vec<f32>), MoEError> {
+    ) -> Result<Vec<f32>, MoEError> {
         assert!(self.k <= C::NUM_EXPERTS_PER_TOK,
             "k ({}) must not exceed model's num_experts_per_tok ({})",
             self.k, C::NUM_EXPERTS_PER_TOK);
@@ -924,24 +919,13 @@ impl<'a, C: ModelConfig> Engine for FusedExp<'a, C> {
 
         let mut logits = vec![0.0f32; n * vs];
         if n == 0 {
-            return Ok((cache, logits));
+            return Ok(logits);
         }
 
-        self.ctx.upload_cache(&cache, C::NUM_LAYERS, C::NUM_KV_HEADS * C::HEAD_DIM);
+        self.ctx.upload_cache(cache, C::NUM_LAYERS, C::NUM_KV_HEADS * C::HEAD_DIM);
 
-        let engine: FusedExp<'_, C> = FusedExp {
-            model: self.model,
-            ctx: self.ctx,
-            gpu_wf: self.gpu_wf,
-            expert_gpu_buffer: self.expert_gpu_buffer.take(),
-            k: self.k,
-            timing: std::mem::take(&mut self.timing),
-            _phantom: PhantomData,
-        };
-
-        let timing;
         {
-            let mut exec = ExecCtx { engine, cache: &mut cache, pending: None };
+            let mut exec = ExecCtx { engine: self, cache, pending: None };
 
             let mut embed = vec![0.0f32; n * hd];
             for (i, &id) in input_ids.iter().enumerate() {
@@ -950,32 +934,27 @@ impl<'a, C: ModelConfig> Engine for FusedExp<'a, C> {
 
             for (ti, _) in input_ids.iter().enumerate() {
                 let embed_hidden = &embed[ti * hd..(ti + 1) * hd];
-                exec = exec.init_hidden(embed_hidden);
+                exec.init_hidden(embed_hidden);
 
                 for layer in 0..num_layers {
                     if check_signal() {
                         return Err(MoEError::Metal("interrupted".into()));
                     }
-                    let (new_ctx, gate_scores) = exec.op1_wait(layer);
-                    exec = new_ctx;
+                    let gate_scores = exec.op1_wait(layer);
                     let routing = exec.route_experts(layer, gate_scores);
-                    exec = exec.op2(layer, &routing);
+                    exec.op2(layer, &routing);
                 }
 
                 let mut hidden = exec.hidden_wait();
                 exec.cache.pos += 1;
                 exec.final_norm_and_lm_head(&mut hidden, &mut logits[ti * vs..(ti + 1) * vs]);
             }
+        } // exec dropped — ends borrows of self + cache
 
-            timing = exec.engine.timing;
-        } // exec dropped here — ends cache borrow
+        self.ctx.download_cache(cache, C::NUM_LAYERS, C::NUM_KV_HEADS * C::HEAD_DIM);
 
-        self.ctx.download_cache(&mut cache, C::NUM_LAYERS, C::NUM_KV_HEADS * C::HEAD_DIM);
-
-        let mut tm = timing;
-        timing_add(&mut tm, "engine.total_ms", t0.elapsed().as_secs_f64() * 1000.0);
-        self.timing = tm;
-        Ok((cache, logits))
+        timing_add(&mut self.timing, "engine.total_ms", t0.elapsed().as_secs_f64() * 1000.0);
+        Ok(logits)
     }
 
     fn telemetry(&self) -> BTreeMap<String, TelemetryValue> {

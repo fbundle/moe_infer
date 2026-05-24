@@ -1783,20 +1783,20 @@ impl<'a, C: ModelConfig> FusedWoods<'a, C> {
 impl<'a, C: ModelConfig> Engine for FusedWoods<'a, C> {
     fn forward(
         &mut self,
+        cache: &mut Cache,
         input_ids: &[i64],
-        mut cache: Cache,
         check_signal: SignalCheckFn<'_>,
-    ) -> Result<(Cache, Vec<f32>), MoEError> {
+    ) -> Result<Vec<f32>, MoEError> {
         let n = input_ids.len();
         let hd = C::HIDDEN_DIM;
         let vs = C::VOCAB_SIZE;
 
         let mut logits = vec![0.0f32; n * vs];
         if n == 0 {
-            return Ok((cache, logits));
+            return Ok(logits);
         }
 
-        self.ctx.upload_cache(&cache, C::NUM_LAYERS, C::NUM_KV_HEADS * C::HEAD_DIM);
+        self.ctx.upload_cache(cache, C::NUM_LAYERS, C::NUM_KV_HEADS * C::HEAD_DIM);
 
         let mut embed = vec![0.0f32; n * hd];
         for (i, &id) in input_ids.iter().enumerate() {
@@ -1834,8 +1834,8 @@ impl<'a, C: ModelConfig> Engine for FusedWoods<'a, C> {
                 exec.gpu_wf, exec.ctx);
         }
 
-        self.ctx.download_cache(&mut cache, C::NUM_LAYERS, C::NUM_KV_HEADS * C::HEAD_DIM);
+        self.ctx.download_cache(cache, C::NUM_LAYERS, C::NUM_KV_HEADS * C::HEAD_DIM);
 
-        Ok((cache, logits))
+        Ok(logits)
     }
 }
