@@ -94,6 +94,16 @@ Key differences from HF format:
 - **8-bit → 4-bit conversion**: INT8 gate tensors are dequantized to f32 then re-quantized to 4-bit affine (group_size=64) to match the engine's uniform 4-bit code path.
 - **Excluded**: vision tower weights, expert tensors (stored separately), and MTP (Multi-Token Prediction) expert layers.
 
+### Dtype mappings
+
+Weights are stored in three dtypes, each chosen for its precision/throughput tradeoff:
+
+| Dtype | `WeightFile` method | Used for |
+|-------|--------------------|----------|
+| **U32 (packed int4)** | `get_tensor_u32()` | All `nn.Linear` weight matrices: attention Q/K/V/O projections, expert gate/up/down, shared expert, router gate. 8 nibbles per u32, dequantized on the fly by the Metal shader: `nibble * scale + bias` |
+| **BF16 (u16)** | `get_tensor_u16()` | **(a)** Scales and biases for every 4-bit weight (one pair per group of 64 weights). **(b)** RMS norm weights (`input_layernorm`, `post_attention_layernorm`, `q_norm`, `k_norm`, `model.norm`). Cast to f32 at runtime via `bf16_to_f32`. Scale/biases never leave the Metal buffer — the shader reads them directly |
+| **F32** | `get_tensor_f32()` | Embedding (`embed_tokens`), output head (`lm_head`), and SSM decay parameter (`A_log`). Embeddings and lm_head stay f32 to avoid accumulating precision loss at the pipeline boundaries. `A_log` is exponentiated at runtime, which amplifies BF16 round-off error |
+
 ### MoE-Infer Expert Weights
 
 Per-layer flat binary files `packed_experts/layer_NN.bin`. Produced by `helpers/repack_experts_4bit.py`.

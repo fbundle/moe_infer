@@ -18,8 +18,8 @@ use crate::error::MoEError;
 use crate::engine::{SignalCheckFn, TelemetryValue};
 use crate::model::weights::WeightFile;
 use crate::math::{
-    apply_rope, bf16_to_f32, dequant_matvec_4bit,
-    embed_lookup, final_norm, normalize_weights, rms_norm, sigmoid,
+    apply_rope, bf16_to_f32,
+    embed_lookup, final_norm, normalize_weights, rms_norm,
     softmax, topk,
 };
 
@@ -245,12 +245,12 @@ impl<'a, C: ModelConfig> ExecCtx<'a, C> {
             o_prefix: format!("{}.o_proj", prefix),
         };
 
-        moe_layer_forward::<C>(
+        Some(moe_layer_forward::<C>(
             wf, layer, hidden, &self.model.expert_files[layer],
             self.ctx, self.gpu_wf, self.k,
-            Some(attn), self.expert_gpu_buffer.as_deref_mut(),
+            attn, self.expert_gpu_buffer.as_mut().unwrap(),
             &mut self.timing,
-        )
+        ))
     }
 
     // ── Linear layer group (N+1 pipelined) ─────────────────────────────────
@@ -418,20 +418,16 @@ fn moe_layer_forward<C: ModelConfig>(
     expert_file: &ExpertFile,
     ctx: &MetalContext,
     gpu_wf: &WeightBuffer,
-
     k: usize,
-    attn_state: Option<FullAttnGpuOut>,
-    mut expert_gpu_buffer: Option<&mut ExpertBuffer>,
+    attn: FullAttnGpuOut,
+    io: &mut ExpertBuffer,
     timing: &mut BTreeMap<String, TelemetryValue>,
-) -> Option<DeferredExperts> {
+) -> DeferredExperts {
     let hidden_dim = C::HIDDEN_DIM;
     let num_experts = C::NUM_EXPERTS;
     let moe_inter = C::MOE_INTERMEDIATE;
     let shared_inter = C::SHARED_INTERMEDIATE;
     let expert_size = C::EXPERT_SIZE_4BIT;
-
-    // Save h_mid (residual)
-    let h_mid = hidden.to_vec();
 
     let post_norm_name = format!("model.layers.{}.post_attention_layernorm.weight", layer_idx);
     let mut h_post = vec![0.0f32; hidden_dim];
@@ -445,37 +441,26 @@ fn moe_layer_forward<C: ModelConfig>(
     let prefix = format!("model.layers.{}.mlp", layer_idx);
 
     // GPU buffers preserved for expert dispatch combine
-    let mut sg_buf_gpu: Option<Buffer>;
-    let mut su_buf_gpu: Option<Buffer>;
-    let mut hmid_gpu_override: Option<Buffer> = None;
+    let sg_buf_gpu: Buffer;
+    let su_buf_gpu: Buffer;
+    let hmid_gpu_override: Buffer;
 
-    // ── CMD2 fusion path: batched attn + o_proj + residual + norm + gate ──
-    let use_cmd2_fusion = attn_state.is_some()
-        && ctx.attn_scores_batched.is_some()
-        && ctx.attn_softmax_batched.is_some()
-        && ctx.attn_values_batched.is_some()
-        && ctx.sigmoid_gate.is_some()
-        && ctx.residual_add.is_some()
-        && ctx.rms_norm_apply_bf16.is_some();
+    // ── CMD2: batched attn + o_proj + residual + norm + gate ──
+    // Use pre-allocated buffers from MetalContext (matching C)
+    let o_proj_buf = ctx.buf_out_proj.as_ref().unwrap().clone();
+    let temp_buf = ctx.buf_temp_residual.as_ref().unwrap().clone();
+    let sum_sq_buf = ctx.buf_post_sum_sq.as_ref().unwrap().clone();
+    let normed_buf = ctx.buf_post_normed.as_ref().unwrap().clone();
+    let gate_buf = ctx.buf_gate_scores.as_ref().unwrap().clone();
+    let sg_buf = ctx.buf_shared_gate.as_ref().unwrap().clone();
+    let su_buf = ctx.buf_shared_up.as_ref().unwrap().clone();
+    let sge_buf = ctx.buf_shared_gate_score.as_ref().unwrap().clone();
 
-    if use_cmd2_fusion {
-        let attn = attn_state.unwrap();
+    let cmd_buf = ctx.queue.new_command_buffer();
+    let enc = cmd_buf.new_compute_command_encoder();
 
-        // Use pre-allocated buffers from MetalContext (matching C)
-        let o_proj_buf = ctx.buf_out_proj.as_ref().unwrap().clone();
-        let temp_buf = ctx.buf_temp_residual.as_ref().unwrap().clone();
-        let sum_sq_buf = ctx.buf_post_sum_sq.as_ref().unwrap().clone();
-        let normed_buf = ctx.buf_post_normed.as_ref().unwrap().clone();
-        let gate_buf = ctx.buf_gate_scores.as_ref().unwrap().clone();
-        let sg_buf = ctx.buf_shared_gate.as_ref().unwrap().clone();
-        let su_buf = ctx.buf_shared_up.as_ref().unwrap().clone();
-        let sge_buf = ctx.buf_shared_gate_score.as_ref().unwrap().clone();
-
-        let cmd_buf = ctx.queue.new_command_buffer();
-        let enc = cmd_buf.new_compute_command_encoder();
-
-        // Step 1: attn_scores_batched
-        {
+    // Step 1: attn_scores_batched
+    {
             let pipe = ctx.attn_scores_batched.as_ref().unwrap();
             enc.set_compute_pipeline_state(pipe);
             enc.set_buffer(0, Some(&attn.q_buf), 0);
@@ -601,48 +586,10 @@ fn moe_layer_forward<C: ModelConfig>(
             std::ptr::copy_nonoverlapping(normed_buf.contents() as *const f32, hidden.as_mut_ptr(), hidden_dim);
         }
 
-        sg_buf_gpu = Some(sg_buf);
-        su_buf_gpu = Some(su_buf);
+        sg_buf_gpu = sg_buf;
+        su_buf_gpu = su_buf;
         h_post.copy_from_slice(hidden);
-        hmid_gpu_override = Some(temp_buf);
-    } else {
-        // Non-fused path: post-norm on CPU, router CMD separately
-        // (fallback, shouldn't normally be reached in FusedExp)
-        let pnw = wf.get_tensor_u16(&post_norm_name);
-        if let Some(pnw) = pnw {
-            let pnw_f32: Vec<f32> = pnw.iter().map(|&v| bf16_to_f32(v)).collect();
-            rms_norm(hidden, &pnw_f32, &mut h_post, hidden_dim, RMS_NORM_EPS);
-        } else {
-            h_post.copy_from_slice(hidden);
-        }
-
-        // Router gate + shared expert projections on GPU (reuse pre-allocated buffers)
-        let x_buf = ctx.buf_post_normed.as_ref().unwrap().clone();
-        unsafe { let dst = x_buf.contents() as *mut f32; std::ptr::copy_nonoverlapping(h_post.as_ptr(), dst, hidden_dim); }
-        let gate_buf = ctx.buf_gate_scores.as_ref().unwrap().clone();
-        let sg_buf = ctx.buf_shared_gate.as_ref().unwrap().clone();
-        let su_buf = ctx.buf_shared_up.as_ref().unwrap().clone();
-        let sge_buf = ctx.buf_shared_gate_score.as_ref().unwrap().clone();
-
-        let cmd_buf = ctx.queue.new_command_buffer();
-        let enc = cmd_buf.new_compute_command_encoder();
-        gpu_wf.encode_matvec_into(wf, ctx, &enc, &format!("{}.gate", prefix), &x_buf, 0, &gate_buf, 0, num_experts, hidden_dim);
-        gpu_wf.encode_matvec_into(wf, ctx, &enc, &format!("{}.shared_expert.gate_proj", prefix), &x_buf, 0, &sg_buf, 0, shared_inter, hidden_dim);
-        gpu_wf.encode_matvec_into(wf, ctx, &enc, &format!("{}.shared_expert.up_proj", prefix), &x_buf, 0, &su_buf, 0, shared_inter, hidden_dim);
-        gpu_wf.encode_matvec_into(wf, ctx, &enc, &format!("{}.shared_expert_gate", prefix), &x_buf, 0, &sge_buf, 0, 1, hidden_dim);
-        enc.end_encoding();
-        cmd_buf.commit();
-        cmd_buf.wait_until_completed();
-
-        unsafe {
-            std::ptr::copy_nonoverlapping(gate_buf.contents() as *const f32, gate_scores.as_mut_ptr(), num_experts);
-            std::ptr::copy_nonoverlapping(sg_buf.contents() as *const f32, shared_gate.as_mut_ptr(), shared_inter);
-            std::ptr::copy_nonoverlapping(su_buf.contents() as *const f32, shared_up.as_mut_ptr(), shared_inter);
-            shared_gate_score = *(sge_buf.contents() as *const f32);
-        }
-        sg_buf_gpu = Some(sg_buf);
-        su_buf_gpu = Some(su_buf);
-    }
+        hmid_gpu_override = temp_buf;
 
     // ── Routing: softmax + topk ──
     softmax(&mut gate_scores);
@@ -652,7 +599,6 @@ fn moe_layer_forward<C: ModelConfig>(
     normalize_weights(&mut expert_weights);
 
     // ── Routed expert computation ──
-    let mut moe_out = vec![0.0f32; hidden_dim];
     let actual_k = k.min(MAX_K);
     let hidden_u32 = hidden_dim as u32;
     let inter_u32 = moe_inter as u32;
@@ -660,109 +606,65 @@ fn moe_layer_forward<C: ModelConfig>(
 
     // Phase 1: Parallel pread (cache hits skip I/O)
     let mut valid = [false; MAX_K];
-    let mut fallback_expert_bufs: Vec<Buffer> = Vec::new();
+    let mut miss_ei = [0usize; MAX_K];
+    let mut miss_k_slot = [0usize; MAX_K];
+    let mut miss_count = 0;
 
-    if let Some(ref mut io) = expert_gpu_buffer {
-        let mut miss_ei = [0usize; MAX_K];
-        let mut miss_k_slot = [0usize; MAX_K];
-        let mut miss_count = 0;
-
-        for ki in 0..actual_k {
-            let eidx = expert_indices[ki];
-            if let Some(buf) = io.cache.lookup(layer_idx, eidx) {
-                io.expert_data[ki] = buf;
-                valid[ki] = true;
-            } else {
-                miss_ei[miss_count] = eidx;
-                miss_k_slot[miss_count] = ki;
-                miss_count += 1;
-            }
+    for ki in 0..actual_k {
+        let eidx = expert_indices[ki];
+        if let Some(buf) = io.cache.lookup(layer_idx, eidx) {
+            io.expert_data[ki] = buf;
+            valid[ki] = true;
+        } else {
+            miss_ei[miss_count] = eidx;
+            miss_k_slot[miss_count] = ki;
+            miss_count += 1;
         }
+    }
 
+    for m in 0..miss_count {
+        let ki = miss_k_slot[m];
+        let eidx = miss_ei[m];
+        let buf = io.cache.insert_get_buf(layer_idx, eidx);
+        io.expert_data[ki] = buf;
+    }
+
+    if miss_count > 0 {
+        let t_io = Instant::now();
+        // Snapshot pointers as usize (Send + Sync) to avoid &mut conflicts inside rayon::scope.
+        let mut reads: [(usize, usize); MAX_K] = [(0, 0); MAX_K];
         for m in 0..miss_count {
             let ki = miss_k_slot[m];
-            let eidx = miss_ei[m];
-            let buf = io.cache.insert_get_buf(layer_idx, eidx);
-            io.expert_data[ki] = buf;
+            reads[m] = (miss_ei[m], io.expert_data[ki].contents() as usize);
         }
-
-        if miss_count > 0 {
-            let t_io = Instant::now();
-            // Snapshot pointers as usize (Send + Sync) to avoid &mut conflicts inside rayon::scope.
-            let mut reads: [(usize, usize); MAX_K] = [(0, 0); MAX_K];
+        rayon::scope(|s| {
             for m in 0..miss_count {
-                let ki = miss_k_slot[m];
-                reads[m] = (miss_ei[m], io.expert_data[ki].contents() as usize);
+                let (eidx, ptr_u) = reads[m];
+                let dst = unsafe { std::slice::from_raw_parts_mut(ptr_u as *mut u8, expert_size) };
+                s.spawn(move |_| {
+                    expert_file.read_expert(eidx, dst).unwrap();
+                });
             }
-            rayon::scope(|s| {
-                for m in 0..miss_count {
-                    let (eidx, ptr_u) = reads[m];
-                    let dst = unsafe { std::slice::from_raw_parts_mut(ptr_u as *mut u8, expert_size) };
-                    s.spawn(move |_| {
-                        expert_file.read_expert(eidx, dst).unwrap();
-                    });
-                }
-            });
-            let dt = t_io.elapsed().as_secs_f64() * 1000.0;
-            timing_add(timing, "engine.expert_io_ms", dt);
-        }
-        for m in 0..miss_count {
-            valid[miss_k_slot[m]] = true;
-        }
-    } else {
-        let t_io = Instant::now();
-        for ki in 0..actual_k {
-            let eidx = expert_indices[ki];
-            let buf = metal_buf_shared(&ctx.device, expert_size);
-            let mut dst = vec![0u8; expert_size];
-            if expert_file.read_expert(eidx, &mut dst).is_ok() {
-                unsafe {
-                    let ptr = buf.contents() as *mut u8;
-                    std::ptr::copy_nonoverlapping(dst.as_ptr(), ptr, expert_size);
-                }
-                valid[ki] = true;
-            }
-            fallback_expert_bufs.push(buf);
-        }
+        });
         let dt = t_io.elapsed().as_secs_f64() * 1000.0;
         timing_add(timing, "engine.expert_io_ms", dt);
     }
+    for m in 0..miss_count {
+        valid[miss_k_slot[m]] = true;
+    }
 
-    let any_valid = valid.iter().take(actual_k).any(|&v| v);
+    // Phase 2: Expert dispatch — always uses pre-allocated ExpertBuffer
+    unsafe { let dst = io.input_buf.contents() as *mut f32; std::ptr::copy_nonoverlapping(h_post.as_ptr(), dst, hidden_dim); }
+    let out_bufs: Vec<Buffer> = io.expert_out.iter().take(actual_k).cloned().collect();
+    let x_buf = io.input_buf.clone();
+    let gate_out = io.scratch_gate.clone();
+    let up_out = io.scratch_up.clone();
+    let act_out = io.scratch_act.clone();
+    let shared_act_gpu = io.shared_act.clone();
+    let shared_down_gpu = io.shared_down.clone();
+    let params_buf = io.combine_params.clone();
 
-    if any_valid {
-        let io_ref = expert_gpu_buffer.as_deref();
-
-        let (x_buf, gate_out, up_out, act_out, out_bufs,
-             shared_act_gpu, shared_down_gpu, _hidden_out, params_buf)
-            = if let Some(io) = io_ref {
-            unsafe { let dst = io.input_buf.contents() as *mut f32; std::ptr::copy_nonoverlapping(h_post.as_ptr(), dst, hidden_dim); }
-            let ob: Vec<Buffer> = io.expert_out.iter().take(actual_k).cloned().collect();
-            (io.input_buf.clone(), io.scratch_gate.clone(), io.scratch_up.clone(),
-             io.scratch_act.clone(), ob,
-             io.shared_act.clone(), io.shared_down.clone(),
-             io.combine_out.clone(), io.combine_params.clone())
-        } else {
-            let x = metal_buf_shared(&ctx.device, hidden_dim * 4);
-            unsafe { let dst = x.contents() as *mut f32; std::ptr::copy_nonoverlapping(h_post.as_ptr(), dst, hidden_dim); }
-            (x,
-             metal_buf_shared(&ctx.device, moe_inter * 4),
-             metal_buf_shared(&ctx.device, moe_inter * 4),
-             metal_buf_shared(&ctx.device, moe_inter * 4),
-             (0..actual_k).map(|_| metal_buf_shared(&ctx.device, hidden_dim * 4)).collect(),
-             metal_buf_shared(&ctx.device, shared_inter * 4),
-             metal_buf_shared(&ctx.device, hidden_dim * 4),
-             metal_buf_shared(&ctx.device, hidden_dim * 4),
-             metal_buf_shared(&ctx.device, 40))
-        };
-
-        let hmid_gpu = if let Some(buf) = hmid_gpu_override.take() {
-            buf
-        } else {
-            let buf = metal_buf_shared(&ctx.device, hidden_dim * 4);
-            unsafe { let dst = buf.contents() as *mut f32; std::ptr::copy_nonoverlapping(h_mid.as_ptr(), dst, hidden_dim); }
-            buf
-        };
+    let hmid_gpu = hmid_gpu_override;
 
         // Fused CMD: K experts + shared SwiGLU + shared down_proj + moe_combine_residual
         let cmd_buf = ctx.queue.new_command_buffer();
@@ -770,13 +672,7 @@ fn moe_layer_forward<C: ModelConfig>(
 
         for ki in 0..actual_k {
             if !valid[ki] { continue; }
-            let expert_buf: &Buffer = if let Some(io) = io_ref {
-                &io.expert_data[ki]
-            } else if ki < fallback_expert_bufs.len() {
-                &fallback_expert_bufs[ki]
-            } else {
-                continue;
-            };
+            let expert_buf = &io.expert_data[ki];
             metal_kernels::encode_matvec_offset(ctx, &enc,
                 expert_buf, C::GATE_W_OFF as u64,
                 expert_buf, C::GATE_S_OFF as u64,
@@ -802,9 +698,7 @@ fn moe_layer_forward<C: ModelConfig>(
         }
 
         // Shared expert SwiGLU on GPU
-        if let (Some(ref sg), Some(ref su)) = (sg_buf_gpu.as_ref(), su_buf_gpu.as_ref()) {
-            metal_kernels::encode_swiglu(ctx, &enc, sg, 0, su, 0, &shared_act_gpu, 0, shared_inter as u32);
-        }
+        metal_kernels::encode_swiglu(ctx, &enc, &sg_buf_gpu, 0, &su_buf_gpu, 0, &shared_act_gpu, 0, shared_inter as u32);
 
         gpu_wf.encode_matvec_into(wf, ctx, &enc,
             &format!("{}.shared_expert.down_proj", prefix),
@@ -877,85 +771,15 @@ fn moe_layer_forward<C: ModelConfig>(
 
         let mut keep_alive = Vec::with_capacity(4);
         keep_alive.push(hmid_gpu);
-        if io_ref.is_none() {
-            keep_alive.push(shared_act_gpu);
-            keep_alive.push(shared_down_gpu);
-            keep_alive.push(params_buf);
-            keep_alive.push(x_buf);
-            keep_alive.push(gate_out);
-            keep_alive.push(up_out);
-            keep_alive.push(act_out);
-            keep_alive.extend(out_bufs);
-            keep_alive.extend(fallback_expert_bufs);
-        }
-        if let Some(b) = sg_buf_gpu.take() { keep_alive.push(b); }
-        if let Some(b) = su_buf_gpu.take() { keep_alive.push(b); }
+        keep_alive.extend(out_bufs);
+        keep_alive.push(sg_buf_gpu);
+        keep_alive.push(su_buf_gpu);
 
-        return Some(DeferredExperts {
-            cmd_buf: Some(cmd_buf.to_owned()),
-            out_buf: ctx.buf_moe_hidden.clone(),
-            _keep_alive: keep_alive,
-        });
+    DeferredExperts {
+        cmd_buf: Some(cmd_buf.to_owned()),
+        out_buf: ctx.buf_moe_hidden.clone(),
+        _keep_alive: keep_alive,
     }
-
-    // ── CPU fallback: compute everything synchronously ──
-    let mut expert_data = vec![0u8; expert_size];
-    let mut gate_tmp = vec![0.0f32; moe_inter];
-    let mut up_tmp = vec![0.0f32; moe_inter];
-    let mut act_tmp = vec![0.0f32; moe_inter];
-    let mut eout = vec![0.0f32; hidden_dim];
-
-    for (&eidx, &ew) in expert_indices.iter().zip(expert_weights.iter()) {
-        if expert_file.read_expert(eidx, &mut expert_data).is_err() { continue; }
-
-        let gw = unsafe { std::slice::from_raw_parts(expert_data.as_ptr().add(C::GATE_W_OFF) as *const u32, C::GATE_W_SIZE / 4) };
-        let gs = unsafe { std::slice::from_raw_parts(expert_data.as_ptr().add(C::GATE_S_OFF) as *const u16, C::GATE_S_SIZE / 2) };
-        let gb = unsafe { std::slice::from_raw_parts(expert_data.as_ptr().add(C::GATE_B_OFF) as *const u16, C::GATE_B_SIZE / 2) };
-        dequant_matvec_4bit(gw, gs, gb, &h_post, &mut gate_tmp, moe_inter, hidden_dim, GROUP_SIZE);
-
-        let uw = unsafe { std::slice::from_raw_parts(expert_data.as_ptr().add(C::UP_W_OFF) as *const u32, C::UP_W_SIZE / 4) };
-        let us = unsafe { std::slice::from_raw_parts(expert_data.as_ptr().add(C::UP_S_OFF) as *const u16, C::UP_S_SIZE / 2) };
-        let ub = unsafe { std::slice::from_raw_parts(expert_data.as_ptr().add(C::UP_B_OFF) as *const u16, C::UP_B_SIZE / 2) };
-        dequant_matvec_4bit(uw, us, ub, &h_post, &mut up_tmp, moe_inter, hidden_dim, GROUP_SIZE);
-
-        for i in 0..moe_inter {
-            let g = gate_tmp[i];
-            let silu_g = g / (1.0 + (-g).exp());
-            act_tmp[i] = silu_g * up_tmp[i];
-        }
-
-        let dw = unsafe { std::slice::from_raw_parts(expert_data.as_ptr().add(C::DOWN_W_OFF) as *const u32, C::DOWN_W_SIZE / 4) };
-        let ds = unsafe { std::slice::from_raw_parts(expert_data.as_ptr().add(C::DOWN_S_OFF) as *const u16, C::DOWN_S_SIZE / 2) };
-        let db = unsafe { std::slice::from_raw_parts(expert_data.as_ptr().add(C::DOWN_B_OFF) as *const u16, C::DOWN_B_SIZE / 2) };
-        dequant_matvec_4bit(dw, ds, db, &act_tmp, &mut eout, hidden_dim, moe_inter, GROUP_SIZE);
-
-        for d in 0..hidden_dim { moe_out[d] += eout[d] * ew; }
-    }
-
-    // ── Shared expert SwiGLU + down_proj ──
-    let mut shared_out = vec![0.0f32; hidden_dim];
-    let mut shared_act = vec![0.0f32; shared_inter];
-    for i in 0..shared_inter {
-        let g = shared_gate[i];
-        shared_act[i] = (g / (1.0 + (-g).exp())) * shared_up[i];
-    }
-
-    if let (Some(sdw), Some(sds), Some(sdb)) = (
-        wf.get_tensor_u32(&format!("{}.shared_expert.down_proj.weight", prefix)),
-        wf.get_tensor_u16(&format!("{}.shared_expert.down_proj.scales", prefix)),
-        wf.get_tensor_u16(&format!("{}.shared_expert.down_proj.biases", prefix)),
-    ) {
-        dequant_matvec_4bit(sdw, sds, sdb, &shared_act, &mut shared_out, hidden_dim, shared_inter, GROUP_SIZE);
-    }
-
-    let shared_weight = sigmoid(shared_gate_score);
-
-    // ── Final combine: hidden = h_mid + moe_out + shared_weight * shared_out ──
-    for i in 0..hidden_dim {
-        hidden[i] = h_mid[i] + moe_out[i] + shared_weight * shared_out[i];
-    }
-
-    None
 }
 
 // ─── Private helpers ──────────────────────────────────────────────────────
