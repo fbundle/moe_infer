@@ -7,7 +7,7 @@ use crate::error::MoEError;
 use crate::engine::qwen35_moe::metal_context::{WeightBuffer, MetalContext, ExpertBuffer};
 use crate::model::Model;
 
-#[path = "engine/qwen35_moe/mod.rs"]
+#[path = "engine/qwen35_moe.rs"]
 pub mod qwen35_moe;
 
 /// Signal check callback: returns true if processing should abort (e.g. Ctrl-C).
