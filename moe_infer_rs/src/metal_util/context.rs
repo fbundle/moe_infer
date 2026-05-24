@@ -224,6 +224,8 @@ pub struct MetalContext {
     pub buf_temp_residual: Option<Buffer>,
     /// Post-attn norm sum_sq [4] f32 — scratch for pre_expert
     pub buf_post_sum_sq: Option<Buffer>,
+    /// Residual (h_mid) upload buffer [hidden_dim] f32 — used in CMD2 for residual_add
+    pub buf_residual: Option<Buffer>,
 }
 
 impl MetalContext {
@@ -275,6 +277,7 @@ impl MetalContext {
         self.buf_out_proj = Some(metal_buf_shared(&self.device, hidden_dim * 4));
         self.buf_temp_residual = Some(metal_buf_shared(&self.device, hidden_dim * 4));
         self.buf_post_sum_sq = Some(metal_buf_shared(&self.device, 4));
+        self.buf_residual = Some(metal_buf_shared(&self.device, hidden_dim * 4));
     }
 
     /// Allocate persistent GPU buffers for expert I/O. Returns the state which
@@ -409,6 +412,7 @@ impl MetalContext {
                 buf_out_proj: None,
                 buf_temp_residual: None,
                 buf_post_sum_sq: None,
+                buf_residual: None,
             })
         })
     }

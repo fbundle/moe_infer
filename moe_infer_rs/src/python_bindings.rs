@@ -11,7 +11,7 @@ use crate::cache::Cache as CoreCache;
 use crate::model::Model as CoreModel;
 use crate::engine::cpu::EngineCPU;
 use crate::engine::fusedexp::EngineFusedExp;
-use crate::engine::fusedwoods::EngineFusedWoods;
+use crate::engine::fusedwoods::{EngineFusedWoods, FusedWoodsScratch};
 use crate::error::MoEError;
 use crate::engine::{Engine as EngineTrait, SignalCheckFn, TelemetryValue, set_record_telemetry};
 use crate::metal_context::{ExpertBuffer, WeightBuffer, MetalContext};
@@ -244,12 +244,14 @@ impl Engine {
                 let expert_buf: Option<&mut ExpertBuffer> =
                     unsafe { (&mut self.expert_gpu_buffer as *mut Option<ExpertBuffer>)
                         .as_mut().unwrap().as_mut() };
+                let scratch = FusedWoodsScratch::new(&model_ref.config);
                 let e = EngineFusedWoods {
                     model: model_ref,
                     ctx: ctx_ref,
                     gpu_wf: gpu_wf_ref,
                     expert_gpu_buffer: expert_buf,
                     norm_cache: std::collections::HashMap::new(),
+                    scratch,
                 };
                 EngineInner { fused_woods: ManuallyDrop::new(e) }
             }

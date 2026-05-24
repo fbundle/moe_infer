@@ -465,15 +465,15 @@ fn moe_layer_forward(
     if use_cmd2_fusion {
         let attn = attn_state.unwrap();
 
-        // Allocate intermediate buffers
-        let o_proj_buf = metal_buf_shared(&ctx.device, hidden_dim * 4);
-        let temp_buf = metal_buf_shared(&ctx.device, hidden_dim * 4);
-        let sum_sq_buf = metal_buf_shared(&ctx.device, 4);
-        let normed_buf = metal_buf_shared(&ctx.device, hidden_dim * 4);
-        let gate_buf = metal_buf_shared(&ctx.device, num_experts * 4);
-        let sg_buf = metal_buf_shared(&ctx.device, shared_inter * 4);
-        let su_buf = metal_buf_shared(&ctx.device, shared_inter * 4);
-        let sge_buf = metal_buf_shared(&ctx.device, 4);
+        // Use pre-allocated buffers from MetalContext (matching C)
+        let o_proj_buf = ctx.buf_out_proj.as_ref().unwrap().clone();
+        let temp_buf = ctx.buf_temp_residual.as_ref().unwrap().clone();
+        let sum_sq_buf = ctx.buf_post_sum_sq.as_ref().unwrap().clone();
+        let normed_buf = ctx.buf_post_normed.as_ref().unwrap().clone();
+        let gate_buf = ctx.buf_gate_scores.as_ref().unwrap().clone();
+        let sg_buf = ctx.buf_shared_gate.as_ref().unwrap().clone();
+        let su_buf = ctx.buf_shared_up.as_ref().unwrap().clone();
+        let sge_buf = ctx.buf_shared_gate_score.as_ref().unwrap().clone();
 
         let cmd_buf = ctx.queue.new_command_buffer();
         let enc = cmd_buf.new_compute_command_encoder();
@@ -620,13 +620,13 @@ fn moe_layer_forward(
             h_post.copy_from_slice(hidden);
         }
 
-        // Router gate + shared expert projections on GPU
-        let x_buf = metal_buf_shared(&ctx.device, hidden_dim * 4);
+        // Router gate + shared expert projections on GPU (reuse pre-allocated buffers)
+        let x_buf = ctx.buf_post_normed.as_ref().unwrap().clone();
         unsafe { let dst = x_buf.contents() as *mut f32; std::ptr::copy_nonoverlapping(h_post.as_ptr(), dst, hidden_dim); }
-        let gate_buf = metal_buf_shared(&ctx.device, num_experts * 4);
-        let sg_buf = metal_buf_shared(&ctx.device, shared_inter * 4);
-        let su_buf = metal_buf_shared(&ctx.device, shared_inter * 4);
-        let sge_buf = metal_buf_shared(&ctx.device, 4);
+        let gate_buf = ctx.buf_gate_scores.as_ref().unwrap().clone();
+        let sg_buf = ctx.buf_shared_gate.as_ref().unwrap().clone();
+        let su_buf = ctx.buf_shared_up.as_ref().unwrap().clone();
+        let sge_buf = ctx.buf_shared_gate_score.as_ref().unwrap().clone();
 
         let cmd_buf = ctx.queue.new_command_buffer();
         let enc = cmd_buf.new_compute_command_encoder();
