@@ -64,14 +64,14 @@ impl Cache {
         self.inner.reset();
     }
 
-    fn save(&self, path: &str) -> PyResult<()> {
-        self.inner.save(path)
+    fn save(&self, bin_path: &str, json_path: &str) -> PyResult<()> {
+        self.inner.save(std::path::Path::new(bin_path), std::path::Path::new(json_path))
             .map_err(|e| pyo3::exceptions::PyIOError::new_err(e.to_string()))
     }
 
     #[staticmethod]
-    fn load(path: &str) -> PyResult<Self> {
-        CoreCache::load(path)
+    fn load(bin_path: &str, json_path: &str) -> PyResult<Self> {
+        CoreCache::load(std::path::Path::new(bin_path), std::path::Path::new(json_path))
             .map(|c| Cache { inner: c })
             .map_err(|e| pyo3::exceptions::PyIOError::new_err(e.to_string()))
     }
