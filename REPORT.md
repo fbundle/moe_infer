@@ -8,7 +8,7 @@ Built on the 3-command-buffer GPU pipeline architecture designed by Dan Woods in
 
 **Supported models**: `mlx-community/Qwen3.5-35B-A3B-4bit`, `mlx-community/Qwen3.6-35B-A3B-4bit`
 
-**Hardware**: Apple Silicon (M1–M4) with unified memory. Tested on M4.
+**Hardware**: Apple Silicon (M1–M4) with unified memory. Tested on M1 Pro (10-core CPU, 14-core GPU).
 
 ## Architecture
 
@@ -40,7 +40,7 @@ Input → RMS Norm → Attention (linear or full) → Residual Add
 
 ### Expert I/O
 
-Expert weights (~19 GB 4-bit) live on SSD in per-layer files (`packed_experts/layer_NN.bin`). Only K=8 active experts are read per layer (~1.77 MB each) via parallel `pread()` across 4 threads, with an LRU cache (32 entries) to avoid re-reading repeated experts.
+Expert weights (~19 GB 4-bit) live on SSD in per-layer files (`packed_experts/layer_NN.bin`). Only K=8 active experts are read per layer (~1.77 MB each) via parallel `pread()` across 4 threads, with an LRU cache (512 entries) to avoid re-reading repeated experts.
 
 **LZ4 compression** (optional): `helpers/compress_experts_lz4.py` compresses the per-layer expert files with LZ4, reducing total expert size by ~40-55%. The engine auto-detects `packed_experts_lz4/` at load time and transparently decompresses on read via `lz4_flex`. This is a drop-in replacement for the raw packed files and reduces SSD bandwidth by roughly 30-50%. Both `ExpertFile::Raw` and `ExpertFile::Lz4` variants share the same `read_expert()` interface.
 
@@ -54,7 +54,7 @@ Non-expert weights (0.65 GB) use `mmap()` — they fit in memory and are accesse
 
 **3. Double-buffering for prediction preads.** The C engine uses an A/B buffer pair (`buf_multi_expert_data` / `buf_multi_expert_data_B`). While the GPU processes expert A's results, prediction preads fill the B buffer for the next layer. `mmap()` can't provide independent buffer copies — it's a single mapping. The double-buffer scheme is essential for overlapping I/O with compute (see Expert Prediction in §C vs Rust FusedWoods).
 
-**4. Explicit eviction control.** The LRU cache (32 entries) decides which experts stay resident based on application-level routing patterns. With `mmap()` + memory pressure, the kernel's page reclaimer makes that decision instead — and it has no knowledge of MoE routing. Under the wrong access pattern, the kernel evicts the wrong pages and thrashing results. With `pread()`, eviction is deterministic and application-controlled.
+**4. Explicit eviction control.** The LRU cache (512 entries) decides which experts stay resident based on application-level routing patterns. With `mmap()` + memory pressure, the kernel's page reclaimer makes that decision instead — and it has no knowledge of MoE routing. Under the wrong access pattern, the kernel evicts the wrong pages and thrashing results. With `pread()`, eviction is deterministic and application-controlled.
 
 **5. Scale mismatch.** Non-expert weights (0.65 GB) are small enough to mmap once at startup and keep resident forever — the `newBufferWithBytesNoCopy` Metal buffer wrapping the mmap'd region is valid for the lifetime of the process. Experts (19 GB) can't be kept resident alongside KV caches, activations, and scratch buffers. `pread()` is the correct primitive for "read this blob, use it on GPU, discard it."
 
@@ -167,13 +167,14 @@ All scripts read from the same MLX-format model directory and output to a single
 
 ## Pipeline Modes
 
-| Mode | Description | Sync Points/Layer |
-|------|-------------|-------------------|
-| `Cpu` | Pure CPU reference. All dequant matvecs, norms, attention, SSM on CPU. | N/A (sequential) |
-| `FusedExp` | Linear attention fused into CMD1. MoE experts dispatched individually. | 4–6 |
-| `FusedWoods` | Full C-engine architecture: CMD1 (linear attn) + CMD2 (full attn + o_proj + routing) + async CMD3 (experts + combine). | 2–3 |
+| Mode | Attention | Expert dispatch | Model variant |
+|------|-----------|-----------------|---------------|
+| `FusedExp` | Full self-attention every 4 layers + linear SSM on other layers | Every layer | Full (40 layers, 256 experts) |
+| `FusedWoods` | Same hybrid attention as FusedExp | Only at full-attention layers | Full (40 layers, 256 experts) |
+| `FusedExpStripped` | Same as FusedExp | Every layer | Stripped (4 layers, 4 experts) |
+| `FusedWoodsStripped` | Same as FusedWoods | Only at full-attention layers | Stripped (4 layers, 4 experts) |
 
-`FusedWoods` (named after Dan Woods, author of the original C inference engine) is the recommended mode and matches the C engine's 3-command-buffer design.
+All modes use the 3-CMD GPU pipeline. `FusedWoods` is named after Dan Woods, author of the original C inference engine. The stripped variants use a reduced 4-layer 4-expert model suitable for fast verification iteration.
 
 ### FusedWoods Command Buffer Layout
 
@@ -189,17 +190,34 @@ All scripts read from the same MLX-format model directory and output to a single
 
 ## Performance
 
-Benchmarked on Apple M4, Qwen3.5-35B-A3B-4bit full model, K=8 experts, 32-token prompt, 100-token greedy generation.
+Benchmarked on M1 Pro (10-core CPU, 14-core GPU), Qwen3.5-35B-A3B-4bit full model (40 layers, 256 experts, K=8), prompt prefill.
 
-| Metric | Value |
-|--------|-------|
-| Generation speed (FusedWoods) | 2.69 tok/s |
-| Expert I/O (disk read) | ~5.8 ms/layer |
-| Expert I/O share of per-layer time | ~72% |
-| Weight file (mmap) | 0.65 GB |
-| Expert files (SSD) | ~19 GB |
+```
+Engine                   20 tok       50 tok       100 tok      200 tok
+                       ms   tok/s    ms   tok/s    ms   tok/s    ms   tok/s
+----------------------------------------------------------------------
+C                    3372     5.9   6031     8.3  11508     8.7  23007     8.7
+Rust FusedWoods      3122     6.4   6319     7.9  12145     8.2  24412     8.2
+Rust FusedExp        2302     8.7   5251     9.5  11148     9.0  21467     9.3
 
-Expert I/O dominates latency. The LRU cache and parallel pread bring Rust within 4% of the C baseline.
+Speedup vs C:
+   20 tok:  Rust FusedExp  1.46x   |  Rust FusedWoods 1.08x
+   50 tok:  Rust FusedExp  1.15x   |  Rust FusedWoods 0.95x
+  100 tok:  Rust FusedExp  1.03x   |  Rust FusedWoods 0.95x
+  200 tok:  Rust FusedExp  1.07x   |  Rust FusedWoods 0.94x
+```
+
+### FusedExp per-phase telemetry (full model, 20 tokens, prompt prefill)
+
+| Stage | Mean (ms) | Share |
+|-------|-----------|-------|
+| Wall time | 1996 | — |
+| engine.expert_io_ms | 671 | 33.6% |
+| engine.full_attention_layer | 1.8 | <0.1% |
+| engine.linear_group | 6.9 | 0.3% |
+| engine.total_ms | 1996 | — |
+
+Expert I/O (SSD pread) dominates at ~34% of wall time for short prompts and ~43% for 100-token prompts. Full-attention and linear SSM GPU compute are negligible (<10 ms total).
 
 ## Numerical Verification
 
@@ -281,27 +299,29 @@ Both also share the GPU-side input_norm optimization: CMD3 computes RMS norm of 
 ## Project Structure
 
 ```
-moe_infer_rs/              Rust engine + Python bindings
+moe_infer_rs/              Rust engine + Python bindings (~20k lines)
   src/
-    engine.rs              Engine trait, TelemetryValue, set_record_engine_telemetry
+    engine.rs              Engine trait, ErasedEngine enum, PipelineMode, telemetry
     engine/
-      cpu.rs               CPU engine (self-contained, pure f32)
-      fusedexp.rs          FusedExp pipeline (per-phase telemetry, K configurable)
-      fusedwoods.rs        FusedWoods pipeline (3-CMD, recommended, no telemetry yet)
+      qwen35_moe/
+        mod.rs             FusedExp/FusedWoods re-exports + type aliases
+        fusedexp.rs        FusedExp pipeline (3-CMD, experts every layer)
+        fusedwoods.rs      FusedWoods pipeline (3-CMD, experts at full-attn layers)
+        constants.rs       ModelConfig trait + FullModel/StrippedModel impls
     model/
-      mod.rs               Model struct (loads all files at startup)
+      mod.rs               Model struct (loads config + all weight files at startup)
       config.rs            ModelConfig derived from HF config.json
       weights.rs           Mmap'd weight file + tensor lookup (model_weights.bin/json)
       expert.rs            ExpertFile enum (Raw pread / Lz4 decompress)
     cache.rs               KV cache + linear attention state
-    constants.rs           Architecture constants (MAX_SEQ, GROUP_SIZE, etc.)
-    math_util.rs           Math utilities (rms_norm, softmax, sigmoid, dequant, RoPE, etc.)
+    constants.rs           Shared constants + backward-compat qwen35_35b re-exports
+    math_util.rs           RMS norm, softmax, sigmoid, dequant, RoPE, conv1d, top-k
     metal_util/
-      context.rs           Metal device init, pipeline creation, ExpertCache LRU, scratch bufs
+      context.rs           Metal device & pipeline init, ExpertCache LRU (512 entries), pre-allocated scratch bufs
       kernels.rs           Metal kernel dispatch (matvec, SwiGLU, conv1d, SSM, attention)
-      shaders.metal         Metal compute shaders (embedded at compile time via include_str!)
-    timer.rs               Wall-clock timer (SystemTime, ms precision)
-    python_bindings.rs     PyO3 bindings (Model, Engine, Cache, stream_generate, telemetry)
+      shaders.metal        Metal compute shaders (embedded via include_str!)
+    timer.rs               Wall-clock timer
+    python_bindings.rs     PyO3 bindings (Model, Cache, Engine, record_engine_telemetry)
     lib.rs                 Module declarations + Python module init
   Cargo.toml
 
