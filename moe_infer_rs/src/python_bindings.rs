@@ -1,6 +1,5 @@
 /// Thin PyO3 bindings for the MoE-Infer inference engine.
 use std::collections::BTreeMap;
-use std::mem::ManuallyDrop;
 use std::sync::Arc;
 
 use numpy::{PyArray1, PyArray2, PyArrayMethods};
@@ -9,10 +8,9 @@ use pyo3::types::PyList;
 
 use crate::cache::Cache as CoreCache;
 use crate::model::Model as CoreModel;
-use crate::engine::qwen35_moe::{FusedExp, FusedExpStripped, FusedWoods, FusedWoodsStripped, FullModel, StrippedModel};
 use crate::constants::{qwen35_35b, qwen35_35b_stripped};
 use crate::error::MoEError;
-use crate::engine::{SignalCheckFn, TelemetryValue, set_record_telemetry, Engine as _};
+use crate::engine::{SignalCheckFn, TelemetryValue, set_record_telemetry, PipelineMode, ErasedEngine};
 use crate::metal_context::{ExpertBuffer, WeightBuffer, MetalContext};
 
 // ─── Module-level functions ──────────────────────────────────────────────────
@@ -70,34 +68,11 @@ impl Cache {
     fn __repr__(&self) -> String { format!("Cache(pos={})", self.inner.pos) }
 }
 
-// ─── Pipeline mode ────────────────────────────────────────────────────────
-
-#[derive(Clone, Copy)]
-enum PipelineMode {
-    FusedExp,
-    FusedWoods,
-    FusedExpStripped,
-    FusedWoodsStripped,
-}
-
-// ─── Erased engine storage ──────────────────────────────────────────────────
-
-/// Union of the three engine types. Variant is tracked by `PipelineMode` in Engine.
-/// All references are erased to 'static via unsafe — valid because:
-/// - Engine is heap-allocated by PyO3 and never moved after construction.
-/// - The inner engine is lazily created on first forward() call (post-move).
-/// - Engine::drop manually drops the correct variant before the owned fields.
-union EngineInner {
-    fused_exp: ManuallyDrop<FusedExp<'static, FullModel>>,
-    fused_woods: ManuallyDrop<FusedWoods<'static, FullModel>>,
-    fused_exp_stripped: ManuallyDrop<FusedExp<'static, StrippedModel>>,
-    fused_woods_stripped: ManuallyDrop<FusedWoods<'static, StrippedModel>>,
-}
-
-// ─── Engine (owns GPU resources, holds the inner engine) ────────────────────
+// ─── Engine (owns GPU resources, holds the type-erased inner engine) ─────────
 
 #[pyclass(unsendable)]
 pub struct Engine {
+    engine: Option<ErasedEngine>,
     model: Arc<CoreModel>,
     ctx: MetalContext,
     gpu_wf: WeightBuffer,
@@ -106,9 +81,6 @@ pub struct Engine {
     k: usize,
     /// Engine-level telemetry: only populated when record_engine_telemetry(true).
     pub telemetry: BTreeMap<String, TelemetryValue>,
-    /// Lazily-initialized on first forward() call.
-    /// SAFETY: created after Engine is on the PyO3 heap, references are stable.
-    inner: Option<EngineInner>,
 }
 
 #[pymethods]
@@ -175,6 +147,7 @@ impl Engine {
             num_layers, hidden_dim, num_experts, pipeline_mode
         );
         Ok(Engine {
+            engine: None,
             model: model.inner.clone(),
             ctx,
             gpu_wf,
@@ -182,7 +155,6 @@ impl Engine {
             mode,
             k,
             telemetry: BTreeMap::new(),
-            inner: None,
         })
     }
 
@@ -231,108 +203,31 @@ impl Engine {
 // ─── Internal forward impl (lazy-inits the inner engine) ────────────────────
 
 impl Engine {
-    fn init_inner(&mut self) -> Result<(), MoEError> {
-        // SAFETY: Engine is on the PyO3 heap (stable address). We create
-        // 'static references to its fields; these remain valid because PyO3
-        // never moves pyclass objects after construction.
-        let model_ref: &CoreModel = unsafe { &*(Arc::as_ptr(&self.model) as *const CoreModel) };
-        let ctx_ref: &MetalContext = unsafe { &*(&self.ctx as *const MetalContext) };
-        let gpu_wf_ref: &WeightBuffer = unsafe { &*(&self.gpu_wf as *const WeightBuffer) };
-        let k = self.k;
-
-        self.inner = Some(match self.mode {
-            PipelineMode::FusedExp => {
-                let expert_buf: Option<&mut ExpertBuffer> =
-                    unsafe { (&mut self.expert_gpu_buffer as *mut Option<ExpertBuffer>)
-                        .as_mut().unwrap().as_mut() };
-                let e = FusedExp::new(model_ref, ctx_ref, gpu_wf_ref, expert_buf, k)?;
-                EngineInner { fused_exp: ManuallyDrop::new(e) }
-            }
-            PipelineMode::FusedWoods => {
-                let expert_buf: Option<&mut ExpertBuffer> =
-                    unsafe { (&mut self.expert_gpu_buffer as *mut Option<ExpertBuffer>)
-                        .as_mut().unwrap().as_mut() };
-                let e = FusedWoods::new(model_ref, ctx_ref, gpu_wf_ref, expert_buf)?;
-                EngineInner { fused_woods: ManuallyDrop::new(e) }
-            }
-            PipelineMode::FusedExpStripped => {
-                let expert_buf: Option<&mut ExpertBuffer> =
-                    unsafe { (&mut self.expert_gpu_buffer as *mut Option<ExpertBuffer>)
-                        .as_mut().unwrap().as_mut() };
-                let e = FusedExpStripped::new(model_ref, ctx_ref, gpu_wf_ref, expert_buf, k)?;
-                EngineInner { fused_exp_stripped: ManuallyDrop::new(e) }
-            }
-            PipelineMode::FusedWoodsStripped => {
-                let expert_buf: Option<&mut ExpertBuffer> =
-                    unsafe { (&mut self.expert_gpu_buffer as *mut Option<ExpertBuffer>)
-                        .as_mut().unwrap().as_mut() };
-                let e = FusedWoodsStripped::new(model_ref, ctx_ref, gpu_wf_ref, expert_buf)?;
-                EngineInner { fused_woods_stripped: ManuallyDrop::new(e) }
-            }
-        });
-        Ok(())
-    }
-
     fn forward_impl(
         &mut self,
         input_ids: &[i64],
         cache: &mut CoreCache,
         check_signal: SignalCheckFn<'_>,
     ) -> Result<Vec<f32>, MoEError> {
-        if self.inner.is_none() {
-            self.init_inner()?;
+        if self.engine.is_none() {
+            // SAFETY: Engine is on the PyO3 heap (stable address).
+            self.engine = Some(unsafe {
+                ErasedEngine::new(
+                    &self.model, &self.ctx, &self.gpu_wf,
+                    self.expert_gpu_buffer.as_mut(), self.k, self.mode,
+                )?
+            });
         }
-        let inner = self.inner.as_mut().unwrap();
-        // SAFETY: the variant matches self.mode, set in init_inner.
-        unsafe {
-            match self.mode {
-                PipelineMode::FusedExp => {
-                    let logits = inner.fused_exp.forward(input_ids, cache, check_signal);
-                    self.telemetry = inner.fused_exp.telemetry();
-                    logits
-                }
-                PipelineMode::FusedWoods => {
-                    let logits = inner.fused_woods.forward(input_ids, cache, check_signal);
-                    self.telemetry = inner.fused_woods.telemetry();
-                    logits
-                }
-                PipelineMode::FusedExpStripped => {
-                    let logits = inner.fused_exp_stripped.forward(input_ids, cache, check_signal);
-                    self.telemetry = inner.fused_exp_stripped.telemetry();
-                    logits
-                }
-                PipelineMode::FusedWoodsStripped => {
-                    let logits = inner.fused_woods_stripped.forward(input_ids, cache, check_signal);
-                    self.telemetry = inner.fused_woods_stripped.telemetry();
-                    logits
-                }
-            }
-        }
+        let eng = self.engine.as_mut().unwrap();
+        let logits = eng.forward(input_ids, cache, check_signal)?;
+        self.telemetry = eng.telemetry();
+        Ok(logits)
     }
 }
 
 impl Drop for Engine {
     fn drop(&mut self) {
-        // SAFETY: drop the inner engine before the fields it borrows from.
-        // The variant matches self.mode.
-        if let Some(mut inner) = self.inner.take() {
-            unsafe {
-                match self.mode {
-                    PipelineMode::FusedExp => {
-                        std::ptr::drop_in_place(&mut inner.fused_exp as *mut ManuallyDrop<FusedExp<'static, FullModel>>);
-                    }
-                    PipelineMode::FusedWoods => {
-                        std::ptr::drop_in_place(&mut inner.fused_woods as *mut ManuallyDrop<FusedWoods<'static, FullModel>>);
-                    }
-                    PipelineMode::FusedExpStripped => {
-                        std::ptr::drop_in_place(&mut inner.fused_exp_stripped as *mut ManuallyDrop<FusedExpStripped>);
-                    }
-                    PipelineMode::FusedWoodsStripped => {
-                        std::ptr::drop_in_place(&mut inner.fused_woods_stripped as *mut ManuallyDrop<FusedWoodsStripped>);
-                    }
-                }
-            }
-        }
-        // Fields self.model, self.ctx, etc. drop normally after this.
+        // Drop engine before the fields it references (model, ctx, gpu_wf).
+        let _ = self.engine.take();
     }
 }
