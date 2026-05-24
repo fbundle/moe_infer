@@ -4,8 +4,6 @@ High-performance inference engine for Mixture-of-Experts models on Apple Silicon
 
 Supports `mlx-community/Qwen3.5-35B-A3B-4bit` and `mlx-community/Qwen3.6-35B-A3B-4bit`.
 
-The `FusedWoods` pipeline mode is named after Dan Woods, author of the original C/Metal inference engine this project builds upon.
-
 ## Hardware Requirements
 
 - Mac with Apple Silicon (M1/M2/M3/M4)
@@ -14,19 +12,28 @@ The `FusedWoods` pipeline mode is named after Dan Woods, author of the original 
 
 ## Quick Start
 
-### 1. Convert the model
+### 1. Quantize the model
 
 ```bash
-python helpers/convert.py --model hub/models--mlx-community--Qwen3.5-35B-A3B-4bit
+# From HuggingFace unquantized BF16 model:
+python helpers/quantize_from_hf.py \
+    --model hub/models--Qwen--Qwen3.6-35B-A3B \
+    --output data/my-model
 ```
 
-### 2. Build and install Python bindings and Run inference
+Or convert from an MLX-format 4-bit model:
 
 ```bash
-maturin develop --release -m moe_infer_rs/Cargo.toml
+python helpers/convert.py --model hub/models--mlx-community--Qwen3.6-35B-A3B-4bit
+```
+
+### 2. Build and run
+
+```bash
+cd moe_infer_rs
+maturin develop --release
 python chat.py
 ```
-
 
 ## Python API
 
@@ -38,73 +45,57 @@ from moe_infer import Model, Engine, Cache, record_engine_telemetry
 
 | Method | Description |
 |--------|-------------|
-| `model = Model(model_path)` | Load model weights, config, and expert file handles (data only) |
+| `model = Model(model_path)` | Load model weights, config, and expert file handles |
 
 ### Engine
 
 | Method | Description |
 |--------|-------------|
-| `engine = Engine(model, pipeline_mode="FusedExp", k=0)` | Initialize Metal GPU resources. `k` selects active experts per token (0 = model default) |
+| `engine = Engine(model, pipeline_mode="FusedExp", k=0)` | Initialize Metal GPU resources. `k` selects experts per token (0 = model default, 8) |
 | `engine.forward(input_ids, cache)` | Forward pass, returns `[n_tokens, vocab_size]` float32 logits |
-| `engine.stream_generate(input_ids, cache, ...)` | Autoregressive generation, yields `(token_id, logits)` tuples incrementally |
-| `engine.telemetry()` | Returns dict: `prefill_ms`, `total_ms`, `tokens_generated`, `tokens_per_sec`, plus engine-specific metrics |
-
-### Telemetry
-
-| Function | Description |
-|----------|-------------|
-| `record_engine_telemetry(on: bool)` | Enable/disable engine-level timing (e.g. `engine.expert_io_ms`) |
+| `engine.upload_cache(cache)` | Sync CPU cache → GPU buffers |
+| `engine.download_cache(cache)` | Sync GPU buffers → CPU cache |
+| `engine.telemetry()` | Returns dict of per-engine timing metrics |
 
 ### Cache
 
 | Method | Description |
 |--------|-------------|
-| `cache = Cache(model)` | Create KV caches + linear attention state for the given model |
+| `cache = Cache(model)` | Create KV caches + linear attention state |
 | `cache.reset()` | Reset position, KV caches, and linear attention states |
-| `cache.pos` | Current sequence position (read-only) |
+| `cache.save(bin_path, json_path)` | Save cache to flat binary + JSON manifest |
+| `cache.load(bin_path, json_path)` | Load cache from flat binary + JSON manifest |
 
 ### Pipeline Modes
 
 | Mode | Description |
 |------|-------------|
-| `Cpu` | Pure CPU reference. All operations on CPU. Slow but useful for debugging. |
-| `FusedExp` | Linear attention fused into one command buffer. MoE experts dispatched individually. |
-| `FusedWoods` | Full 3-command-buffer pipeline (CMD1 + CMD2 + async CMD3). **Recommended.** |
+| `FusedExp` | Full model: 40 layers, 256 experts, K=8 |
+| `FusedExpStripped` | Stripped model: 4 layers, 4 experts, K=4 (for verification) |
 
-### Sampling Parameters
+### CPU Engine (Rust only)
 
-| Parameter | Default | Description |
-|-----------|---------|-------------|
-| `max_tokens` | 256 | Maximum new tokens to generate |
-| `temperature` | 0.0 | < 0.01 for greedy, > 0 for sampling |
-| `top_k` | 0 | Keep top-k logits (0 = disabled) |
-| `top_p` | 1.0 | Nucleus sampling threshold |
-| `min_p` | 0.0 | Minimum probability relative to max |
-| `eos_token_ids` | [248046, 248044] | Stop tokens |
+A pure-CPU reference engine using `ndarray` that mirrors the GPU pipeline. Not exposed via Python bindings yet.
 
-## Verification
-
-`verify_nway.py` checks numerical correctness across all engines on a stripped 4-layer model:
-
-```bash
-python verify_nway.py
+```rust
+use moe_infer::engine::qwen35_moe::CpuEngine;
+let mut engine = CpuEngine::<FullModel>::new(&model, k)?;
+let logits = engine.forward(&[1, 2, 3], &mut |_| false)?;
 ```
 
-Runs `Cpu`, `FusedWoods`, `FusedExp` (Rust), `C` (C bench), and `mlx-lm` on the same token sequence, then compares logits pairwise. Outputs an N×N `max_diff` matrix with per-engine status (IDENTICAL / MATCH / CLOSE / DIVERGE).
+## Quantization
 
-Expected results: all non-mlx engines agree within `2.6e-05` (ULP-level). mlx-lm diverges at `~0.11` due to bf16 precision. C bench and Rust FusedWoods are byte-for-byte identical.
+Uniform 4-bit affine (group_size=64). All 2D weight matrices are packed as nibbles with per-group bf16 scale + bias. RMS norm weights, conv1d weights, dt_bias, and A_log remain bf16 or f32.
 
-## Benchmarking
+Storage by dtype:
 
-`bench.py` benchmarks C and Rust GPU pipelines on the full 40-layer model:
+| Dtype | Used for |
+|-------|----------|
+| uint32 (packed int4) | All Linear weight matrices: Q/K/V/O projections, expert gate/up/down, shared expert, lm_head, embed |
+| bf16 (uint16) | Per-group quantization scales/biases, RMS norm weights, conv1d weights, dt_bias |
+| f32 | A_log (SSM decay) |
 
-```bash
-python bench.py
-```
-
-Tests forward passes at 100, 200, and 300 tokens across `FusedWoods`, `FusedExp` (Rust) and the C bench. Prints per-engine latency and throughput, plus speedup vs C.
-
-Requires the full model in `data/models--mlx-community--Qwen3.5-35B-A3B-4bit`.
+All compute is f32.
 
 ## Model Format
 
@@ -112,84 +103,99 @@ MoE-Infer expects a model directory with:
 
 ```
 model_dir/
-├── config.json                # HF config (read directly by Rust engine)
-├── model_weights.bin          # Mmap'd: all non-expert weights (embeddings, norms, projections, shared experts)
-├── model_weights.json         # Tensor manifest (name → offset, size, shape, dtype)
-├── packed_experts/            # Per-layer expert files (required)
+├── config.json                 # HF config (read directly by Rust engine)
+├── model_weights.bin           # Mmap'd: all non-expert weights
+├── model_weights.json          # Tensor manifest (name → offset, size, shape, dtype)
+├── packed_experts/             # Per-layer expert files
 │   ├── layer_00.bin
 │   ├── layer_01.bin
 │   └── ...
-├── packed_experts_lz4/        # LZ4-compressed experts (optional, faster SSD I/O)
+├── packed_experts_lz4/         # LZ4-compressed experts (optional, smaller SSD footprint)
 │   ├── layer_00.bin
-│   ├── layer_01.bin
 │   └── ...
-├── tokenizer.json             # HF tokenizer (used by Python bindings)
+├── tokenizer.json
 └── vocab.json
 ```
 
-The engine auto-detects `packed_experts_lz4/` at load time and falls back to `packed_experts/` if not present.
+The engine auto-detects `packed_experts_lz4/` at load time and falls back to `packed_experts/`.
 
-Helper scripts in `helpers/` convert from HuggingFace/MLX format:
-- `convert.py` — One-step conversion: config, weights, and expert repacking
-- `extract_weights.py` — Non-expert weights → `model_weights.bin` + `model_weights.json`
-- `repack_experts_4bit.py` — MLX 4-bit experts → `packed_experts/` per-layer files
-- `compress_experts_lz4.py` — Compress packed experts with LZ4 → `packed_experts_lz4/` (~40-55% smaller)
-- `repack_experts_2bit.py` — Requantize experts to 2-bit → `packed_experts_2bit/` (experimental)
-- `quantize_from_hf.py` — Convert HuggingFace unquantized models → MoE-Infer format
-- `strip_model.py` — Build a small 4-layer model for fast verification
+### Cache Format
+
+Cache files use the same flat binary + JSON manifest format as model_weights:
+
+```
+cache.bin       # Flat concatenation of all cache tensors (f32 + u32 scalars)
+cache.json      # Manifest: name → {offset, size, shape, dtype}
+```
+
+## Verification
+
+`verify_nway.py` checks numerical correctness:
+
+```bash
+python verify_nway.py
+```
+
+Compares `Cpu`, `FusedExp` (Rust), `C` (C bench), and `mlx-lm` on the stripped 4-layer model. Outputs an N×N max_diff matrix.
+
+Expected: all non-mlx engines agree within ULP-level tolerance.
+
+## Benchmarking
+
+```bash
+python bench.py
+```
+
+Tests forward passes across engine variants. Requires the full 40-layer model.
 
 ## Performance
 
-Apple M4, Qwen3.5-35B-A3B-4bit (40 layers, 256 experts, K=8), 32-token prompt, 100-token greedy generation:
+Apple M1 Pro 14 GPUs, Qwen3.5-35B-A3B-4bit (40 layers, 256 experts, K=8), 32-token prompt, 100-token greedy generation:
 
 | Mode | tok/s |
 |------|-------|
-| FusedWoods | 2.69 |
-| FusedExp | 2.14 |
-| Cpu | 0.15 |
+| FusedExp (Rust) | ~10 |
+| Cpu (reference) | ~0.15 |
 
-Expert I/O (SSD reads) dominates at ~72% of per-layer time.
+Expert I/O (SSD reads) dominates at ~70% of per-layer time.
 
 ## Project Structure
 
 ```
-moe_infer_rs/              Rust engine + Python bindings
+moe_infer_rs/                 Rust engine + Python bindings
   src/
-    engine.rs              Engine trait, TelemetryValue, record_engine_telemetry
+    lib.rs                    Module declarations + Python module init
+    engine.rs                 Engine trait, DynEngine, EngineEnum, telemetry
+    model.rs                  Model struct (loads config + weight/expert files)
+    cache.rs                  KV cache + linear attention state (binary I/O format)
+    math_util.rs              CPU math: RMS norm, softmax, RoPE, dequant, SwiGLU, SSM, attention, conv1d
+    constants.rs              Shared constants + backward-compat re-exports
+    error.rs                  Error types
+    python_bindings.rs        PyO3 bindings (Model, Cache, Engine)
     engine/
-      cpu.rs               CPU engine (self-contained, pure f32)
-      fusedexp.rs          FusedExp pipeline (per-phase telemetry, K configurable)
-      fusedwoods.rs        FusedWoods pipeline (3-CMD, recommended)
-    model/
-      mod.rs               Model struct (loads all files at startup)
-      config.rs            ModelConfig derived from HF config.json
-      weights.rs           Mmap'd weight file + tensor lookup
-      expert.rs            ExpertFile enum (Raw pread / Lz4 decompress)
-    math_util.rs           Math utilities (rms_norm, softmax, sigmoid, dequant, RoPE, etc.)
-    metal_util/
-      context.rs           Metal device init, pipeline creation, ExpertCache LRU, scratch bufs
-      kernels.rs           Metal kernel dispatch (matvec, SwiGLU, conv1d, SSM, attention)
-      shaders.metal         Metal compute shaders (embedded at compile time via include_str!)
-    cache.rs               KV cache + linear attention state
-    constants.rs           Architecture constants
-    timer.rs               Wall-clock timer
-    python_bindings.rs     PyO3 bindings (Model, Engine, Cache, stream_generate)
-    lib.rs                 Module declarations + Python module init
-    error.rs               Error types
+      qwen35_moe.rs           Module declarations for qwen35_moe submodules
+      qwen35_moe/
+        constants.rs          ModelConfig trait + FullModel/StrippedModel impls
+        cpu.rs                CPU reference engine (ndarray, pure f32)
+        fusedexp.rs           FusedExp GPU pipeline (3-CMD, Metal)
+        metal_context.rs      Metal device/pipelines, ExpertCache LRU, scratch bufs
+        metal_kernels.rs      Metal kernel dispatch (matvec, SwiGLU, conv1d, SSM, attention)
+        shaders.metal         Metal compute shaders (embedded via include_str!)
   Cargo.toml
+  pyproject.toml
 
-helpers/                   Model conversion scripts
-  convert.py               One-step convert: config + weights + experts
-  extract_weights.py       Non-expert weights → model_weights.bin + model_weights.json
-  repack_experts_4bit.py   MLX 4-bit experts → packed_experts/
-  compress_experts_lz4.py  packed_experts/ → packed_experts_lz4/ (~40-55% compression)
-  repack_experts_2bit.py   packed_experts/ → packed_experts_2bit/ (experimental)
-  strip_model.py           Build 4-layer stripped model for fast verification
-  quantize_from_hf.py      Convert HuggingFace unquantized models → MoE-Infer format
+helpers/                      Model conversion scripts
+  quantize_from_hf.py         HF unquantized → MoE-Infer 4-bit format
+  convert.py                  One-step MLX → MoE-Infer conversion
+  extract_weights.py          Non-expert weights → model_weights.bin + .json
+  repack_experts_4bit.py      MLX 4-bit experts → packed_experts/
+  compress_experts_lz4.py     packed_experts/ → packed_experts_lz4/ (~40-55% compression)
+  repack_experts_2bit.py      packed_experts/ → packed_experts_2bit/ (experimental)
+  strip_model.py              Build 4-layer stripped model for verification
 
-bench.py                   Multi-engine performance benchmark
-verify_nway.py             N-way logit comparison (Cpu, FusedExp, FusedWoods, C, mlx-lm)
-chat.py                    Interactive chat demo
+bench.py                      Multi-engine performance benchmark
+verify_nway.py                N-way logit comparison
+chat.py                       Interactive chat demo
 ```
 
 ## License
