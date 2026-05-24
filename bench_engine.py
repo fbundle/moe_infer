@@ -28,7 +28,7 @@ def main():
     import moe_infer
     from moe_infer import Model, Engine, Cache # type: ignore
 
-    moe_infer.record_telemetry(True) # type: ignore
+    moe_infer.record_engine_telemetry(True) # type: ignore
 
     print(f"\nModel: {MODEL_DIR}")
     print(f"Mode: FusedExp | Runs per config: {N_RUNS}\n")

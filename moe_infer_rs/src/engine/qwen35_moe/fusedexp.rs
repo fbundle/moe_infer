@@ -1,7 +1,8 @@
 /// Qwen3.6-35B-A3B-4bit FusedExp engine — all model dimensions are compile-time constants.
-use crate::constants::qwen35_35b_stripped::*;
+use super::constants::ModelConfig;
 use crate::constants::{MAX_SEQ, RMS_NORM_EPS, FULL_ATTN_INTERVAL, GROUP_SIZE, CONV_KERNEL_SIZE};
 use std::collections::BTreeMap;
+use std::marker::PhantomData;
 use std::ffi::c_void;
 use std::time::Instant;
 
@@ -92,7 +93,7 @@ fn timing_push(tm: &mut BTreeMap<String, TelemetryValue>, key: &str, dt: f64) {
 
 // ─── Execution context ─────────────────────────────────────────────────────
 
-struct ExecCtx<'a> {
+struct ExecCtx<'a, C: ModelConfig> {
     model: &'a Model,
     cache: &'a mut Cache,
     ctx: &'a MetalContext,
@@ -100,13 +101,14 @@ struct ExecCtx<'a> {
     expert_gpu_buffer: Option<&'a mut ExpertBuffer>,
     k: usize,
     timing: BTreeMap<String, TelemetryValue>,
+    _phantom: PhantomData<C>,
 }
 
-impl<'a> ExecCtx<'a> {
+impl<'a, C: ModelConfig> ExecCtx<'a, C> {
     // ── Embedding ──────────────────────────────────────────────────────────
 
     fn embed(&self, token_id: usize, out: &mut [f32]) {
-        embed_lookup(&self.model.wf, token_id, out, HIDDEN_DIM);
+        embed_lookup(&self.model.wf, token_id, out, C::HIDDEN_DIM);
     }
 
     // ── Full attention layer (breaks pipeline) ─────────────────────────────
@@ -115,10 +117,10 @@ impl<'a> ExecCtx<'a> {
         &mut self, layer: usize, hidden: &mut [f32], pos: usize,
     ) -> Option<DeferredExperts> {
         let wf = &self.model.wf;
-        let hd = HIDDEN_DIM;
-        let num_q = NUM_ATTN_HEADS;
-        let num_kv = NUM_KV_HEADS;
-        let head_dim = HEAD_DIM;
+        let hd = C::HIDDEN_DIM;
+        let num_q = C::NUM_ATTN_HEADS;
+        let num_kv = C::NUM_KV_HEADS;
+        let head_dim = C::HEAD_DIM;
         let q_dim = num_q * head_dim;
         let q_proj_dim = q_dim * 2;
         let kv_dim = num_kv * head_dim;
@@ -194,7 +196,7 @@ impl<'a> ExecCtx<'a> {
 
         // RoPE
         apply_rope(&mut q, &mut k, pos, num_q, num_kv, head_dim,
-            ROTARY_DIM, ROPE_THETA);
+            C::ROTARY_DIM, C::ROPE_THETA);
 
         // Append K, V to cache
         let kv_cache = self.cache.kv[layer].as_mut().unwrap();
@@ -235,7 +237,7 @@ impl<'a> ExecCtx<'a> {
             o_prefix: format!("{}.o_proj", prefix),
         };
 
-        moe_layer_forward(
+        moe_layer_forward::<C>(
             wf, layer, hidden, &self.model.expert_files[layer],
             self.ctx, self.gpu_wf, self.k,
             Some(attn), self.expert_gpu_buffer.as_deref_mut(),
@@ -251,16 +253,16 @@ impl<'a> ExecCtx<'a> {
         if m == 0 { return; }
         let last_layer = layers[m - 1];
 
-        let hd = HIDDEN_DIM;
-        let num_experts = NUM_EXPERTS;
-        let moe_inter = MOE_INTERMEDIATE;
-        let shared_inter = SHARED_INTERMEDIATE;
+        let hd = C::HIDDEN_DIM;
+        let num_experts = C::NUM_EXPERTS;
+        let moe_inter = C::MOE_INTERMEDIATE;
+        let shared_inter = C::SHARED_INTERMEDIATE;
         let k = self.k;
-        let qkv_dim = LINEAR_CONV_DIM;
-        let total_key = LINEAR_TOTAL_KEY;
-        let total_val = LINEAR_TOTAL_VALUE;
-        let num_k_heads = LINEAR_NUM_K_HEADS;
-        let num_v_heads = LINEAR_NUM_V_HEADS;
+        let qkv_dim = C::LINEAR_CONV_DIM;
+        let total_key = C::LINEAR_TOTAL_KEY;
+        let total_val = C::LINEAR_TOTAL_VALUE;
+        let num_k_heads = C::LINEAR_NUM_K_HEADS;
+        let num_v_heads = C::LINEAR_NUM_V_HEADS;
         let key_dim = total_key / num_k_heads;
         let val_dim = total_val / num_v_heads;
         let inv_scale = 1.0 / (key_dim as f32).sqrt();
@@ -324,7 +326,7 @@ impl<'a> ExecCtx<'a> {
             let enc = cmd.new_compute_command_encoder();
             {
                 let io = self.expert_gpu_buffer.as_ref().unwrap();
-                encode_post_expert(
+                encode_post_expert::<C>(
                     &self.model.wf, self.gpu_wf, self.ctx, &enc, prev_layer,
                     &prev_weights, prev_gate_score,
                     &io.expert_data, &io.scratch_gate, &io.scratch_up, &io.scratch_act,
@@ -358,7 +360,7 @@ impl<'a> ExecCtx<'a> {
 
         // Last CMD: post_expert(last_layer)
         {
-            let next_norm_info = if last_layer + 1 < NUM_LAYERS {
+            let next_norm_info = if last_layer + 1 < C::NUM_LAYERS {
                 self.model.wf.get_tensor_ptr(
                     &format!("model.layers.{}.input_layernorm.weight", last_layer + 1))
                     .map(|p| (p as *const c_void, self.gpu_wf.base as usize))
@@ -370,7 +372,7 @@ impl<'a> ExecCtx<'a> {
             let enc = cmd.new_compute_command_encoder();
             {
                 let io = self.expert_gpu_buffer.as_ref().unwrap();
-                encode_post_expert(
+                encode_post_expert::<C>(
                     &self.model.wf, self.gpu_wf, self.ctx, &enc, last_layer,
                     &prev_weights, prev_gate_score,
                     &io.expert_data, &io.scratch_gate, &io.scratch_up, &io.scratch_act,
@@ -394,31 +396,31 @@ impl<'a> ExecCtx<'a> {
     // ── Final norm + LM head ───────────────────────────────────────────────
 
     fn final_norm_and_lm_head(&self, hidden: &mut [f32], logits: &mut [f32]) {
-        final_norm(&self.model.wf, hidden, HIDDEN_DIM);
+        final_norm(&self.model.wf, hidden, C::HIDDEN_DIM);
         gpu_lm_head(&self.model.wf, hidden, logits, self.gpu_wf, self.ctx);
     }
 }
 
 // ─── MoE layer forward (local copy, fusedexp-specific) ────────────────────
 
-fn moe_layer_forward(
+fn moe_layer_forward<C: ModelConfig>(
     wf: &WeightFile,
     layer_idx: usize,
     hidden: &mut [f32],
     expert_file: &ExpertFile,
     ctx: &MetalContext,
     gpu_wf: &WeightBuffer,
-    
+
     k: usize,
     attn_state: Option<FullAttnGpuOut>,
     mut expert_gpu_buffer: Option<&mut ExpertBuffer>,
     timing: &mut BTreeMap<String, TelemetryValue>,
 ) -> Option<DeferredExperts> {
-    let hidden_dim = HIDDEN_DIM;
-    let num_experts = NUM_EXPERTS;
-    let moe_inter = MOE_INTERMEDIATE;
-    let shared_inter = SHARED_INTERMEDIATE;
-    let expert_size = EXPERT_SIZE_4BIT;
+    let hidden_dim = C::HIDDEN_DIM;
+    let num_experts = C::NUM_EXPERTS;
+    let moe_inter = C::MOE_INTERMEDIATE;
+    let shared_inter = C::SHARED_INTERMEDIATE;
+    let expert_size = C::EXPERT_SIZE_4BIT;
 
     // Save h_mid (residual)
     let h_mid = hidden.to_vec();
@@ -760,25 +762,25 @@ fn moe_layer_forward(
                 continue;
             };
             metal_kernels::encode_matvec_offset(ctx, &enc,
-                expert_buf, GATE_W_OFF as u64,
-                expert_buf, GATE_S_OFF as u64,
-                expert_buf, GATE_B_OFF as u64,
+                expert_buf, C::GATE_W_OFF as u64,
+                expert_buf, C::GATE_S_OFF as u64,
+                expert_buf, C::GATE_B_OFF as u64,
                 &x_buf, 0, &gate_out, 0,
                 inter_u32, hidden_u32, gs_u32, 3);
 
             metal_kernels::encode_matvec_offset(ctx, &enc,
-                expert_buf, UP_W_OFF as u64,
-                expert_buf, UP_S_OFF as u64,
-                expert_buf, UP_B_OFF as u64,
+                expert_buf, C::UP_W_OFF as u64,
+                expert_buf, C::UP_S_OFF as u64,
+                expert_buf, C::UP_B_OFF as u64,
                 &x_buf, 0, &up_out, 0,
                 inter_u32, hidden_u32, gs_u32, 3);
 
             metal_kernels::encode_swiglu(ctx, &enc, &gate_out, 0, &up_out, 0, &act_out, 0, inter_u32);
 
             metal_kernels::encode_matvec_offset(ctx, &enc,
-                expert_buf, DOWN_W_OFF as u64,
-                expert_buf, DOWN_S_OFF as u64,
-                expert_buf, DOWN_B_OFF as u64,
+                expert_buf, C::DOWN_W_OFF as u64,
+                expert_buf, C::DOWN_S_OFF as u64,
+                expert_buf, C::DOWN_B_OFF as u64,
                 &act_out, 0, &out_bufs[ki], 0,
                 hidden_u32, inter_u32, gs_u32, 3);
         }
@@ -821,7 +823,7 @@ fn moe_layer_forward(
         }
 
         // GPU-side input_norm for next layer
-        let do_gpu_norm = layer_idx + 1 < NUM_LAYERS
+        let do_gpu_norm = layer_idx + 1 < C::NUM_LAYERS
             && ctx.rms_norm_apply_bf16.is_some()
             && wf.get_tensor_ptr(&format!("model.layers.{}.input_layernorm.weight", layer_idx + 1)).is_some();
         if do_gpu_norm {
@@ -890,14 +892,14 @@ fn moe_layer_forward(
     for (&eidx, &ew) in expert_indices.iter().zip(expert_weights.iter()) {
         if expert_file.read_expert(eidx, &mut expert_data).is_err() { continue; }
 
-        let gw = unsafe { std::slice::from_raw_parts(expert_data.as_ptr().add(GATE_W_OFF) as *const u32, GATE_W_SIZE / 4) };
-        let gs = unsafe { std::slice::from_raw_parts(expert_data.as_ptr().add(GATE_S_OFF) as *const u16, GATE_S_SIZE / 2) };
-        let gb = unsafe { std::slice::from_raw_parts(expert_data.as_ptr().add(GATE_B_OFF) as *const u16, GATE_B_SIZE / 2) };
+        let gw = unsafe { std::slice::from_raw_parts(expert_data.as_ptr().add(C::GATE_W_OFF) as *const u32, C::GATE_W_SIZE / 4) };
+        let gs = unsafe { std::slice::from_raw_parts(expert_data.as_ptr().add(C::GATE_S_OFF) as *const u16, C::GATE_S_SIZE / 2) };
+        let gb = unsafe { std::slice::from_raw_parts(expert_data.as_ptr().add(C::GATE_B_OFF) as *const u16, C::GATE_B_SIZE / 2) };
         dequant_matvec_4bit(gw, gs, gb, &h_post, &mut gate_tmp, moe_inter, hidden_dim, GROUP_SIZE);
 
-        let uw = unsafe { std::slice::from_raw_parts(expert_data.as_ptr().add(UP_W_OFF) as *const u32, UP_W_SIZE / 4) };
-        let us = unsafe { std::slice::from_raw_parts(expert_data.as_ptr().add(UP_S_OFF) as *const u16, UP_S_SIZE / 2) };
-        let ub = unsafe { std::slice::from_raw_parts(expert_data.as_ptr().add(UP_B_OFF) as *const u16, UP_B_SIZE / 2) };
+        let uw = unsafe { std::slice::from_raw_parts(expert_data.as_ptr().add(C::UP_W_OFF) as *const u32, C::UP_W_SIZE / 4) };
+        let us = unsafe { std::slice::from_raw_parts(expert_data.as_ptr().add(C::UP_S_OFF) as *const u16, C::UP_S_SIZE / 2) };
+        let ub = unsafe { std::slice::from_raw_parts(expert_data.as_ptr().add(C::UP_B_OFF) as *const u16, C::UP_B_SIZE / 2) };
         dequant_matvec_4bit(uw, us, ub, &h_post, &mut up_tmp, moe_inter, hidden_dim, GROUP_SIZE);
 
         for i in 0..moe_inter {
@@ -906,9 +908,9 @@ fn moe_layer_forward(
             act_tmp[i] = silu_g * up_tmp[i];
         }
 
-        let dw = unsafe { std::slice::from_raw_parts(expert_data.as_ptr().add(DOWN_W_OFF) as *const u32, DOWN_W_SIZE / 4) };
-        let ds = unsafe { std::slice::from_raw_parts(expert_data.as_ptr().add(DOWN_S_OFF) as *const u16, DOWN_S_SIZE / 2) };
-        let db = unsafe { std::slice::from_raw_parts(expert_data.as_ptr().add(DOWN_B_OFF) as *const u16, DOWN_B_SIZE / 2) };
+        let dw = unsafe { std::slice::from_raw_parts(expert_data.as_ptr().add(C::DOWN_W_OFF) as *const u32, C::DOWN_W_SIZE / 4) };
+        let ds = unsafe { std::slice::from_raw_parts(expert_data.as_ptr().add(C::DOWN_S_OFF) as *const u16, C::DOWN_S_SIZE / 2) };
+        let db = unsafe { std::slice::from_raw_parts(expert_data.as_ptr().add(C::DOWN_B_OFF) as *const u16, C::DOWN_B_SIZE / 2) };
         dequant_matvec_4bit(dw, ds, db, &act_tmp, &mut eout, hidden_dim, moe_inter, GROUP_SIZE);
 
         for d in 0..hidden_dim { moe_out[d] += eout[d] * ew; }
@@ -1164,7 +1166,7 @@ fn encode_pre_expert(
     gw.encode_matvec_into(wf, c, enc, &format!("{}.shared_expert_gate", mlp_prefix), post_normed, 0, c.buf_shared_gate_score.as_ref().unwrap(), 0, 1, hidden_dim);
 }
 
-fn encode_post_expert(
+fn encode_post_expert<C: ModelConfig>(
     wf: &WeightFile,
     gpu_wf: &WeightBuffer,
     ctx: &MetalContext,
@@ -1200,16 +1202,16 @@ fn encode_post_expert(
         if expert_buf.length() == 0 { continue; }
 
         metal_kernels::encode_matvec_offset(ctx, enc,
-            expert_buf, GATE_W_OFF as u64,
-            expert_buf, GATE_S_OFF as u64,
-            expert_buf, GATE_B_OFF as u64,
+            expert_buf, C::GATE_W_OFF as u64,
+            expert_buf, C::GATE_S_OFF as u64,
+            expert_buf, C::GATE_B_OFF as u64,
             post_normed, 0, expert_scratch_gate, 0,
             inter_u32, hidden_u32, gs_u32, 3);
 
         metal_kernels::encode_matvec_offset(ctx, enc,
-            expert_buf, UP_W_OFF as u64,
-            expert_buf, UP_S_OFF as u64,
-            expert_buf, UP_B_OFF as u64,
+            expert_buf, C::UP_W_OFF as u64,
+            expert_buf, C::UP_S_OFF as u64,
+            expert_buf, C::UP_B_OFF as u64,
             post_normed, 0, expert_scratch_up, 0,
             inter_u32, hidden_u32, gs_u32, 3);
 
@@ -1217,9 +1219,9 @@ fn encode_post_expert(
             expert_scratch_act, 0, inter_u32);
 
         metal_kernels::encode_matvec_offset(ctx, enc,
-            expert_buf, DOWN_W_OFF as u64,
-            expert_buf, DOWN_S_OFF as u64,
-            expert_buf, DOWN_B_OFF as u64,
+            expert_buf, C::DOWN_W_OFF as u64,
+            expert_buf, C::DOWN_S_OFF as u64,
+            expert_buf, C::DOWN_B_OFF as u64,
             expert_scratch_act, 0, &expert_out_bufs[ki], 0,
             hidden_u32, inter_u32, gs_u32, 3);
     }
@@ -1321,16 +1323,17 @@ fn gpu_lm_head(
 
 // ─── FusedExp ───────────────────────────────────────────────────────
 
-pub struct FusedExp<'a> {
+pub struct FusedExp<'a, C: ModelConfig> {
     pub model: &'a Model,
     pub ctx: &'a MetalContext,
     pub gpu_wf: &'a WeightBuffer,
     pub expert_gpu_buffer: Option<&'a mut ExpertBuffer>,
     pub k: usize,
     pub timing: BTreeMap<String, TelemetryValue>,
+    _phantom: PhantomData<C>,
 }
 
-impl<'a> FusedExp<'a> {
+impl<'a, C: ModelConfig> FusedExp<'a, C> {
     pub fn new(
         model: &'a Model,
         ctx: &'a MetalContext,
@@ -1339,44 +1342,46 @@ impl<'a> FusedExp<'a> {
         k: usize,
     ) -> Result<Self, MoEError> {
         let c = &model.config;
-        validate_config(
-            c.hidden_dim, c.num_layers, c.num_experts,
-            c.num_experts_per_tok, c.moe_intermediate,
-            c.shared_intermediate, c.num_attn_heads,
-            c.num_kv_heads, c.head_dim, c.vocab_size,
-            c.linear_num_v_heads, c.linear_num_k_heads,
-            c.linear_total_key, c.linear_total_value,
+        let get = |k| c.get_usize(k).unwrap_or(0);
+        C::validate_config(
+            get("hidden_dim"), get("num_layers"), get("num_experts"),
+            get("num_experts_per_tok"), get("moe_intermediate"),
+            get("shared_intermediate"), get("num_attn_heads"),
+            get("num_kv_heads"), get("head_dim"), get("vocab_size"),
+            get("linear_num_v_heads"), get("linear_num_k_heads"),
+            get("linear_total_key"), get("linear_total_value"),
         ).map_err(MoEError::Config)?;
         Ok(FusedExp {
             model, ctx, gpu_wf, expert_gpu_buffer, k,
             timing: BTreeMap::new(),
+            _phantom: PhantomData,
         })
     }
 }
 
-impl<'a> Engine for FusedExp<'a> {
+impl<'a, C: ModelConfig> Engine for FusedExp<'a, C> {
     fn forward(
         &mut self,
         input_ids: &[i64],
         cache: &mut Cache,
         check_signal: SignalCheckFn<'_>,
     ) -> Result<Vec<f32>, MoEError> {
-        assert!(self.k <= NUM_EXPERTS_PER_TOK,
+        assert!(self.k <= C::NUM_EXPERTS_PER_TOK,
             "k ({}) must not exceed model's num_experts_per_tok ({})",
-            self.k, NUM_EXPERTS_PER_TOK);
+            self.k, C::NUM_EXPERTS_PER_TOK);
 
         let t0 = Instant::now();
         let n = input_ids.len();
-        let hd = HIDDEN_DIM;
-        let vs = VOCAB_SIZE;
-        let num_layers = NUM_LAYERS;
+        let hd = C::HIDDEN_DIM;
+        let vs = C::VOCAB_SIZE;
+        let num_layers = C::NUM_LAYERS;
 
         let mut logits = vec![0.0f32; n * vs];
         if n == 0 {
             return Ok(logits);
         }
 
-        let mut exec = ExecCtx {
+        let mut exec: ExecCtx<'_, C> = ExecCtx {
             model: self.model,
             cache,
             ctx: self.ctx,
@@ -1384,6 +1389,7 @@ impl<'a> Engine for FusedExp<'a> {
             expert_gpu_buffer: self.expert_gpu_buffer.as_deref_mut(),
             k: self.k,
             timing: BTreeMap::new(),
+            _phantom: PhantomData,
         };
 
         let mut embed = vec![0.0f32; n * hd];

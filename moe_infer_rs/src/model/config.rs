@@ -1,108 +1,61 @@
-use serde::Deserialize;
 use std::path::Path;
 
 const GROUP_SIZE: usize = 64;
 
-/// Raw HuggingFace config.json (with optional text_config for multimodal models).
-#[derive(Debug, Clone, Deserialize)]
-struct HfConfig {
-    text_config: Option<HfTextConfig>,
-}
-
-#[derive(Debug, Clone, Deserialize)]
-struct HfTextConfig {
-    hidden_size: usize,
-    num_hidden_layers: usize,
-    num_attention_heads: usize,
-    num_key_value_heads: usize,
-    head_dim: usize,
-    vocab_size: usize,
-    num_experts: usize,
-    num_experts_per_tok: usize,
-    moe_intermediate_size: usize,
-    shared_expert_intermediate_size: usize,
-    linear_num_value_heads: usize,
-    linear_num_key_heads: usize,
-    linear_key_head_dim: usize,
-    linear_value_head_dim: usize,
-    full_attention_interval: Option<usize>,
-    rope_parameters: Option<HfRopeParams>,
-}
-
-#[derive(Debug, Clone, Deserialize)]
-struct HfRopeParams {
-    #[serde(default = "default_rope_theta")]
-    rope_theta: f64,
-    #[serde(default = "default_partial_rotary")]
-    partial_rotary_factor: f32,
-}
-
-fn default_rope_theta() -> f64 { 10000.0 }
-fn default_partial_rotary() -> f32 { 0.25 }
-
-/// Runtime model configuration — derived from HF config.json.
+/// Runtime model configuration — JSON-like key-value store.
 #[derive(Debug, Clone)]
 pub struct ModelConfig {
-    pub hidden_dim: usize,
-    pub num_layers: usize,
-    pub num_attn_heads: usize,
-    pub num_kv_heads: usize,
-    pub head_dim: usize,
-    pub vocab_size: usize,
-    pub num_experts: usize,
-    pub num_experts_per_tok: usize,
-    pub moe_intermediate: usize,
-    pub shared_intermediate: usize,
-    pub linear_num_v_heads: usize,
-    pub linear_num_k_heads: usize,
-    pub rotary_dim: usize,
-    pub rope_theta: f64,
-    pub linear_total_key: usize,
-    pub linear_total_value: usize,
-    pub linear_conv_dim: usize,
-    pub num_full_attn_layers: usize,
-    pub num_linear_layers: usize,
-    pub expert_size_4bit: usize,
-    pub expert_size_2bit: usize,
-    pub expert_layout_4bit: ExpertLayout,
-    pub expert_layout_2bit: ExpertLayout,
-    pub group_size: usize,
-    pub bits: usize,
-    pub model_path: String,
+    data: serde_json::Map<String, serde_json::Value>,
 }
 
-/// Expert packed binary layout — offsets and sizes for each component.
-#[derive(Debug, Clone)]
-pub struct ExpertLayout {
-    pub gate_w_off: usize,
-    pub gate_s_off: usize,
-    pub gate_b_off: usize,
-    pub up_w_off: usize,
-    pub up_s_off: usize,
-    pub up_b_off: usize,
-    pub down_w_off: usize,
-    pub down_s_off: usize,
-    pub down_b_off: usize,
-    pub gate_w_size: usize,
-    pub gate_s_size: usize,
-    pub gate_b_size: usize,
-    pub up_w_size: usize,
-    pub up_s_size: usize,
-    pub up_b_size: usize,
-    pub down_w_size: usize,
-    pub down_s_size: usize,
-    pub down_b_size: usize,
+impl ModelConfig {
+    pub fn get_usize(&self, key: &str) -> Option<usize> {
+        self.data.get(key).and_then(|v| v.as_u64()).map(|v| v as usize)
+    }
+
+    pub fn get_f64(&self, key: &str) -> Option<f64> {
+        self.data.get(key).and_then(|v| v.as_f64())
+    }
+
+    pub fn get_str(&self, key: &str) -> Option<&str> {
+        self.data.get(key).and_then(|v| v.as_str())
+    }
+
+    pub fn get_object(&self, key: &str) -> Option<&serde_json::Map<String, serde_json::Value>> {
+        self.data.get(key).and_then(|v| v.as_object())
+    }
+
+    /// Convenience: access a nested key like "expert_layout_4bit.gate_w_off".
+    pub fn get_nested_usize(&self, key: &str) -> Option<usize> {
+        let (obj_key, field) = key.split_once('.')?;
+        self.get_object(obj_key)?.get(field)?.as_u64().map(|v| v as usize)
+    }
+
+    pub fn usize_or(&self, key: &str, default: usize) -> usize {
+        self.get_usize(key).unwrap_or(default)
+    }
+
+    pub fn from_map(data: serde_json::Map<String, serde_json::Value>) -> Self {
+        ModelConfig { data }
+    }
+
+    pub fn iter(&self) -> impl Iterator<Item = (&String, &serde_json::Value)> {
+        self.data.iter()
+    }
+
+    pub fn len(&self) -> usize { self.data.len() }
+    pub fn is_empty(&self) -> bool { self.data.is_empty() }
 }
 
-fn compute_expert_layout(hidden_dim: usize, inter_dim: usize) -> (ExpertLayout, ExpertLayout, usize, usize) {
-    let gs = GROUP_SIZE;
+// ─── Expert layout helpers ───────────────────────────────────────────────
 
-    let gate_w = inter_dim * hidden_dim / 2;
-    let gate_sb = inter_dim * (hidden_dim / gs) * 2;
+fn layout_to_json(hd: usize, mi: usize, gs: usize) -> serde_json::Map<String, serde_json::Value> {
+    let gate_w = mi * hd / 2;
+    let gate_sb = mi * (hd / gs) * 2;
     let up_w = gate_w;
     let up_sb = gate_sb;
-    let down_w = hidden_dim * inter_dim / 2;
-    let down_sb = hidden_dim * (inter_dim / gs) * 2;
+    let down_w = hd * mi / 2;
+    let down_sb = hd * (mi / gs) * 2;
 
     let gate_w_off = 0;
     let gate_s_off = gate_w;
@@ -113,96 +66,117 @@ fn compute_expert_layout(hidden_dim: usize, inter_dim: usize) -> (ExpertLayout, 
     let down_w_off = up_b_off + up_sb;
     let down_s_off = down_w_off + down_w;
     let down_b_off = down_s_off + down_sb;
-    let expert_size_4bit = down_b_off + down_sb;
 
-    let gate_w2 = inter_dim * hidden_dim / 4;
-    let up_w2 = gate_w2;
-    let down_w2 = hidden_dim * inter_dim / 4;
+    serde_json::json!({
+        "gate_w_off": gate_w_off,
+        "gate_s_off": gate_s_off,
+        "gate_b_off": gate_b_off,
+        "up_w_off": up_w_off,
+        "up_s_off": up_s_off,
+        "up_b_off": up_b_off,
+        "down_w_off": down_w_off,
+        "down_s_off": down_s_off,
+        "down_b_off": down_b_off,
+        "gate_w_size": gate_w,
+        "gate_s_size": gate_sb,
+        "gate_b_size": gate_sb,
+        "up_w_size": up_w,
+        "up_s_size": up_sb,
+        "up_b_size": up_sb,
+        "down_w_size": down_w,
+        "down_s_size": down_sb,
+        "down_b_size": down_sb,
+    }).as_object().unwrap().clone()
+}
 
-    let gate_w_off_2 = 0;
-    let gate_s_off_2 = gate_w2;
-    let gate_b_off_2 = gate_w2 + gate_sb;
-    let up_w_off_2 = gate_w2 + 2 * gate_sb;
-    let up_s_off_2 = up_w_off_2 + up_w2;
-    let up_b_off_2 = up_s_off_2 + up_sb;
-    let down_w_off_2 = up_b_off_2 + up_sb;
-    let down_s_off_2 = down_w_off_2 + down_w2;
-    let down_b_off_2 = down_s_off_2 + down_sb;
-    let expert_size_2bit = down_b_off_2 + down_sb;
+// ─── Loader ──────────────────────────────────────────────────────────────
 
-    let layout_4bit = ExpertLayout {
-        gate_w_off, gate_s_off, gate_b_off, up_w_off, up_s_off, up_b_off,
-        down_w_off, down_s_off, down_b_off,
-        gate_w_size: gate_w, gate_s_size: gate_sb, gate_b_size: gate_sb,
-        up_w_size: up_w, up_s_size: up_sb, up_b_size: up_sb,
-        down_w_size: down_w, down_s_size: down_sb, down_b_size: down_sb,
-    };
-    let layout_2bit = ExpertLayout {
-        gate_w_off: gate_w_off_2, gate_s_off: gate_s_off_2, gate_b_off: gate_b_off_2,
-        up_w_off: up_w_off_2, up_s_off: up_s_off_2, up_b_off: up_b_off_2,
-        down_w_off: down_w_off_2, down_s_off: down_s_off_2, down_b_off: down_b_off_2,
-        gate_w_size: gate_w2, gate_s_size: gate_sb, gate_b_size: gate_sb,
-        up_w_size: up_w2, up_s_size: up_sb, up_b_size: up_sb,
-        down_w_size: down_w2, down_s_size: down_sb, down_b_size: down_sb,
-    };
-
-    (layout_4bit, layout_2bit, expert_size_4bit, expert_size_2bit)
+fn val_usize(v: &serde_json::Value, key: &str) -> usize {
+    v.get(key).and_then(|x| x.as_u64()).unwrap_or(0) as usize
 }
 
 /// Load model configuration from an HF config.json file.
 pub fn load_model_config(model_path: &Path) -> anyhow::Result<ModelConfig> {
     let config_path = model_path.join("config.json");
     let content = std::fs::read_to_string(&config_path)?;
-    let hf: HfConfig = serde_json::from_str(&content)?;
+    let root: serde_json::Value = serde_json::from_str(&content)?;
 
-    let tc = hf.text_config.as_ref().unwrap_or_else(|| {
-        panic!("config.json missing text_config; multimodal wrapper expected")
-    });
+    // Handle optional text_config wrapper (multimodal models)
+    let tc = root.get("text_config").unwrap_or(&root);
 
-    let full_attn_interval = tc.full_attention_interval.unwrap_or(4);
-    let rp = tc.rope_parameters.as_ref();
-    let rope_theta = rp.map_or(10000.0, |r| r.rope_theta);
-    let partial_rotary = rp.map_or(0.25, |r| r.partial_rotary_factor);
-    let rotary_dim = (tc.head_dim as f32 * partial_rotary) as usize;
+    let hidden_dim = val_usize(tc, "hidden_size");
+    let num_layers = val_usize(tc, "num_hidden_layers");
+    let num_attn_heads = val_usize(tc, "num_attention_heads");
+    let num_kv_heads = val_usize(tc, "num_key_value_heads");
+    let head_dim = val_usize(tc, "head_dim");
+    let vocab_size = val_usize(tc, "vocab_size");
+    let num_experts = val_usize(tc, "num_experts");
+    let num_experts_per_tok = val_usize(tc, "num_experts_per_tok");
+    let moe_intermediate = val_usize(tc, "moe_intermediate_size");
+    let shared_intermediate = val_usize(tc, "shared_expert_intermediate_size");
+    let linear_num_v_heads = val_usize(tc, "linear_num_value_heads");
+    let linear_num_k_heads = val_usize(tc, "linear_num_key_heads");
+    let linear_key_dim = val_usize(tc, "linear_key_head_dim");
+    let linear_value_dim = val_usize(tc, "linear_value_head_dim");
+    let full_attn_interval = val_usize(tc, "full_attention_interval");
+    if full_attn_interval == 0 { /* use default */ }
 
-    let linear_key_dim = tc.linear_key_head_dim;
-    let linear_value_dim = tc.linear_value_head_dim;
-    let linear_total_key = tc.linear_num_key_heads * linear_key_dim;
-    let linear_total_value = tc.linear_num_value_heads * linear_value_dim;
+    let fa_interval = if full_attn_interval > 0 { full_attn_interval } else { 4 };
+
+    // Rope parameters (optional)
+    let rope_theta = tc.get("rope_parameters")
+        .and_then(|r| r.get("rope_theta"))
+        .and_then(|x| x.as_f64())
+        .unwrap_or(10000.0);
+    let partial_rotary = tc.get("rope_parameters")
+        .and_then(|r| r.get("partial_rotary_factor"))
+        .and_then(|x| x.as_f64())
+        .unwrap_or(0.25) as f32;
+    let rotary_dim = (head_dim as f32 * partial_rotary) as usize;
+
+    let linear_total_key = linear_num_k_heads * linear_key_dim;
+    let linear_total_value = linear_num_v_heads * linear_value_dim;
     let linear_conv_dim = linear_total_key * 2 + linear_total_value;
 
-    let num_full_attn_layers = tc.num_hidden_layers / full_attn_interval;
-    let num_linear_layers = tc.num_hidden_layers - num_full_attn_layers;
+    let num_full_attn_layers = num_layers / fa_interval;
+    let num_linear_layers = num_layers - num_full_attn_layers;
 
-    let (layout_4bit, layout_2bit, expert_size_4bit, expert_size_2bit) =
-        compute_expert_layout(tc.hidden_size, tc.moe_intermediate_size);
+    let layout_4bit = layout_to_json(hidden_dim, moe_intermediate, GROUP_SIZE);
+    let expert_size_4bit = layout_4bit.get("down_b_off").unwrap().as_u64().unwrap() as usize
+        + layout_4bit.get("down_b_size").unwrap().as_u64().unwrap() as usize;
 
-    Ok(ModelConfig {
-        hidden_dim: tc.hidden_size,
-        num_layers: tc.num_hidden_layers,
-        num_attn_heads: tc.num_attention_heads,
-        num_kv_heads: tc.num_key_value_heads,
-        head_dim: tc.head_dim,
-        vocab_size: tc.vocab_size,
-        num_experts: tc.num_experts,
-        num_experts_per_tok: tc.num_experts_per_tok,
-        moe_intermediate: tc.moe_intermediate_size,
-        shared_intermediate: tc.shared_expert_intermediate_size,
-        linear_num_v_heads: tc.linear_num_value_heads,
-        linear_num_k_heads: tc.linear_num_key_heads,
-        rotary_dim,
-        rope_theta,
-        linear_total_key,
-        linear_total_value,
-        linear_conv_dim,
-        num_full_attn_layers,
-        num_linear_layers,
-        expert_size_4bit,
-        expert_size_2bit,
-        expert_layout_4bit: layout_4bit,
-        expert_layout_2bit: layout_2bit,
-        group_size: GROUP_SIZE,
-        bits: 4,
-        model_path: model_path.to_string_lossy().to_string(),
-    })
+    let layout_2bit = layout_to_json(hidden_dim, moe_intermediate, GROUP_SIZE);
+    let expert_size_2bit = layout_2bit.get("down_b_off").unwrap().as_u64().unwrap() as usize
+        + layout_2bit.get("down_b_size").unwrap().as_u64().unwrap() as usize;
+
+    let data = serde_json::json!({
+        "hidden_dim": hidden_dim,
+        "num_layers": num_layers,
+        "num_attn_heads": num_attn_heads,
+        "num_kv_heads": num_kv_heads,
+        "head_dim": head_dim,
+        "vocab_size": vocab_size,
+        "num_experts": num_experts,
+        "num_experts_per_tok": num_experts_per_tok,
+        "moe_intermediate": moe_intermediate,
+        "shared_intermediate": shared_intermediate,
+        "linear_num_v_heads": linear_num_v_heads,
+        "linear_num_k_heads": linear_num_k_heads,
+        "rotary_dim": rotary_dim,
+        "rope_theta": rope_theta,
+        "linear_total_key": linear_total_key,
+        "linear_total_value": linear_total_value,
+        "linear_conv_dim": linear_conv_dim,
+        "num_full_attn_layers": num_full_attn_layers,
+        "num_linear_layers": num_linear_layers,
+        "expert_size_4bit": expert_size_4bit,
+        "expert_size_2bit": expert_size_2bit,
+        "expert_layout_4bit": layout_4bit,
+        "expert_layout_2bit": layout_2bit,
+        "group_size": GROUP_SIZE,
+        "bits": 4,
+        "model_path": model_path.to_string_lossy().to_string(),
+    }).as_object().unwrap().clone();
+
+    Ok(ModelConfig { data })
 }

@@ -13,20 +13,29 @@ pub struct Cache {
 
 impl Cache {
     pub fn new(config: &ModelConfig) -> Self {
-        let mut kv = Vec::with_capacity(config.num_layers);
-        let mut lin = Vec::with_capacity(config.num_layers);
-        for layer in 0..config.num_layers {
+        let num_layers = config.get_usize("num_layers").unwrap();
+        let num_kv_heads = config.get_usize("num_kv_heads").unwrap();
+        let head_dim = config.get_usize("head_dim").unwrap();
+        let kv_dim = num_kv_heads * head_dim;
+        let linear_num_v_heads = config.get_usize("linear_num_v_heads").unwrap();
+        let linear_total_key = config.get_usize("linear_total_key").unwrap();
+        let linear_num_k_heads = config.get_usize("linear_num_k_heads").unwrap();
+        let linear_total_value = config.get_usize("linear_total_value").unwrap();
+        let linear_conv_dim = config.get_usize("linear_conv_dim").unwrap();
+
+        let mut kv = Vec::with_capacity(num_layers);
+        let mut lin = Vec::with_capacity(num_layers);
+        for layer in 0..num_layers {
             if (layer + 1) % FULL_ATTN_INTERVAL == 0 {
-                let kv_dim = config.num_kv_heads * config.head_dim;
                 kv.push(Some(FullAttnCache::new(MAX_SEQ, kv_dim)));
                 lin.push(None);
             } else {
                 kv.push(None);
                 lin.push(Some(LinearAttnState::new(
-                    config.linear_num_v_heads,
-                    config.linear_total_key / config.linear_num_k_heads,
-                    config.linear_total_value / config.linear_num_v_heads,
-                    config.linear_conv_dim,
+                    linear_num_v_heads,
+                    linear_total_key / linear_num_k_heads,
+                    linear_total_value / linear_num_v_heads,
+                    linear_conv_dim,
                 )));
             }
         }

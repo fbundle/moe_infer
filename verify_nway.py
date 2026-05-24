@@ -9,7 +9,7 @@ ROOT = os.path.dirname(os.path.abspath(__file__))
 MODEL_DIR = os.path.join(ROOT, "data", "models--mlx-community--Qwen3.6-35B-A3B-4bit-stripped")
 MLX_MODEL_DIR = os.path.join(ROOT, "hub", "models--mlx-community--Qwen3.6-35B-A3B-4bit-stripped")
 
-RUST_ENGINES = ["Cpu", "FusedWoodsStripped", "FusedExpStripped"]
+RUST_ENGINES = ["FusedWoodsStripped", "FusedExpStripped"]
 ENGINES = RUST_ENGINES + ["C", "mlx-lm"]
 
 C_DIR = os.path.join(ROOT, "moe_infer_c")
@@ -277,10 +277,8 @@ def main():
     print("Summary")
     print("=" * 60)
 
-    # Rust internal consistency: Cpu vs FusedWoods, FusedExp
+    # Rust internal consistency: FusedWoods vs FusedExp
     rust_pairs = [
-        ("Cpu", "FusedWoods"),
-        ("Cpu", "FusedExp"),
         ("FusedWoods", "FusedExp"),
     ]
     all_rust_ok = True
@@ -307,14 +305,14 @@ def main():
     else:
         print(f"[verify] WARNING: C bench vs FusedWoods diverge (max_diff={c_fw:.6f})!")
 
-    # Cpu vs mlx-lm: expect ~0.11 max_diff from bf16 vs f32 precision floor
-    cpu_mlx = _lookup_pair(max_diffs, "Cpu", "mlx-lm")
-    if cpu_mlx < 1e-3:
-        print("[verify] Cpu matches mlx-lm — numerical correctness confirmed.")
-    elif cpu_mlx < 0.15:
-        print(f"[verify] Cpu vs mlx-lm max_diff={cpu_mlx:.4f} — within bf16 precision floor (~0.4% relative). OK.")
+    # Rust vs mlx-lm: expect ~0.11 max_diff from bf16 vs f32 precision floor
+    rust_mlx = _lookup_pair(max_diffs, "FusedWoods", "mlx-lm")
+    if rust_mlx < 1e-3:
+        print("[verify] FusedWoods matches mlx-lm — numerical correctness confirmed.")
+    elif rust_mlx < 0.15:
+        print(f"[verify] FusedWoods vs mlx-lm max_diff={rust_mlx:.4f} — within bf16 precision floor (~0.4% relative). OK.")
     else:
-        print(f"[verify] WARNING: Cpu vs mlx-lm max_diff={cpu_mlx:.4f} exceeds bf16 floor — investigate!")
+        print(f"[verify] WARNING: FusedWoods vs mlx-lm max_diff={rust_mlx:.4f} exceeds bf16 floor — investigate!")
 
 
 if __name__ == "__main__":

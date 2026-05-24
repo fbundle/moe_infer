@@ -35,10 +35,11 @@ impl Model {
 
         let packed_dir = dir.join("packed_experts");
         let lz4_dir = dir.join("packed_experts_lz4");
-        let expert_size = config.expert_size_4bit;
+        let expert_size = config.get_usize("expert_size_4bit").unwrap();
+        let num_layers = config.get_usize("num_layers").unwrap();
 
-        let mut expert_files = Vec::with_capacity(config.num_layers);
-        for layer in 0..config.num_layers {
+        let mut expert_files = Vec::with_capacity(num_layers);
+        for layer in 0..num_layers {
             let lz4_path = lz4_dir.join(format!("layer_{:02}.bin", layer));
             if lz4_path.exists() {
                 use std::io::Read;
@@ -52,10 +53,11 @@ impl Model {
                     .map_err(|e| MoEError::Io(io::Error::new(io::ErrorKind::Other,
                         format!("lz4 hdr {}: {}", layer, e))))?;
                 let n = u32::from_le_bytes(hdr4) as usize;
-                if n != config.num_experts {
+                let num_experts = config.get_usize("num_experts").unwrap();
+                if n != num_experts {
                     return Err(MoEError::Io(io::Error::new(io::ErrorKind::InvalidData,
                         format!("lz4 expert {}: header says {} experts, config says {} — file may be corrupted",
-                            layer, n, config.num_experts))));
+                            layer, n, num_experts))));
                 }
                 let off_len = n + 1;
                 let mut off = vec![0u32; off_len];
@@ -81,7 +83,8 @@ impl Model {
         let lz4_count = expert_files.iter().filter(|e| matches!(e, ExpertFile::Lz4 { .. })).count();
         eprintln!(
             "[model] {} layers hidden={} experts={} lz4_layers={}",
-            config.num_layers, config.hidden_dim, config.num_experts, lz4_count
+            num_layers, config.get_usize("hidden_dim").unwrap_or(0),
+            config.get_usize("num_experts").unwrap_or(0), lz4_count
         );
         Ok(Model { config, wf, expert_files })
     }

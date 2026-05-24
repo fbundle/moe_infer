@@ -226,11 +226,17 @@ pub struct MetalContext {
     pub buf_post_sum_sq: Option<Buffer>,
     /// Residual (h_mid) upload buffer [hidden_dim] f32 — used in CMD2 for residual_add
     pub buf_residual: Option<Buffer>,
+    // ── Persistent KV cache buffers for full attention (one per full-attn layer) ──
+    /// K cache buffers: [MAX_SEQ * kv_dim] f32 each, one per full-attention layer
+    pub buf_kv_k: Vec<Buffer>,
+    /// V cache buffers: [MAX_SEQ * kv_dim] f32 each
+    pub buf_kv_v: Vec<Buffer>,
 }
 
 impl MetalContext {
     /// Allocate persistent GPU buffers for fused linear attention.
     /// Must be called after model config is loaded.
+    #[allow(clippy::too_many_arguments)]
     pub fn init_linear_attn_buffers(
         &mut self,
         num_linear_layers: usize,
@@ -242,6 +248,8 @@ impl MetalContext {
         hidden_dim: usize,
         num_experts: usize,
         shared_intermediate: usize,
+        num_full_attn_layers: usize,
+        kv_dim: usize,
     ) {
         self.buf_conv_state.clear();
         self.buf_delta_state.clear();
@@ -278,6 +286,17 @@ impl MetalContext {
         self.buf_temp_residual = Some(metal_buf_shared(&self.device, hidden_dim * 4));
         self.buf_post_sum_sq = Some(metal_buf_shared(&self.device, 4));
         self.buf_residual = Some(metal_buf_shared(&self.device, hidden_dim * 4));
+        // Persistent KV cache buffers for full attention — avoids per-call
+        // allocation and full-history copy.  Matches C's buf_kv_k / buf_kv_v.
+        self.buf_kv_k.clear();
+        self.buf_kv_v.clear();
+        let kv_buf_size = crate::constants::MAX_SEQ * kv_dim * 4;
+        eprintln!("[metal] Allocating {} full-attn KV buffers ({} MB each)",
+            num_full_attn_layers, kv_buf_size / (1024 * 1024));
+        for _ in 0..num_full_attn_layers {
+            self.buf_kv_k.push(metal_buf_shared(&self.device, kv_buf_size));
+            self.buf_kv_v.push(metal_buf_shared(&self.device, kv_buf_size));
+        }
     }
 
     /// Allocate persistent GPU buffers for expert I/O. Returns the state which
@@ -413,6 +432,8 @@ impl MetalContext {
                 buf_temp_residual: None,
                 buf_post_sum_sq: None,
                 buf_residual: None,
+                buf_kv_k: Vec::new(),
+                buf_kv_v: Vec::new(),
             })
         })
     }

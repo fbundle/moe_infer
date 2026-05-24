@@ -9,14 +9,10 @@ use pyo3::types::PyList;
 
 use crate::cache::Cache as CoreCache;
 use crate::model::Model as CoreModel;
-use crate::engine::cpu::EngineCPU;
-use crate::engine::qwen35_35b::fusedexp::FusedExp;
-use crate::engine::qwen35_35b::fusedwoods::{FusedWoods, FusedWoodsScratch};
-use crate::engine::qwen35_35b_stripped::fusedexp::FusedExp as FusedExpStripped;
-use crate::engine::qwen35_35b_stripped::fusedwoods::FusedWoods as FusedWoodsStripped;
+use crate::engine::qwen35_moe::{FusedExp, FusedExpStripped, FusedWoods, FusedWoodsStripped, FullModel, StrippedModel};
 use crate::constants::{qwen35_35b, qwen35_35b_stripped};
 use crate::error::MoEError;
-use crate::engine::{Engine as EngineTrait, SignalCheckFn, TelemetryValue, set_record_telemetry};
+use crate::engine::{SignalCheckFn, TelemetryValue, set_record_telemetry, Engine as _};
 use crate::metal_context::{ExpertBuffer, WeightBuffer, MetalContext};
 
 // ─── Module-level functions ──────────────────────────────────────────────────
@@ -45,7 +41,8 @@ impl Model {
 
     fn __repr__(&self) -> String {
         format!("Model({} layers, hidden={})",
-            self.inner.config.num_layers, self.inner.config.hidden_dim)
+            self.inner.config.get_usize("num_layers").unwrap_or(0),
+            self.inner.config.get_usize("hidden_dim").unwrap_or(0))
     }
 }
 
@@ -77,7 +74,6 @@ impl Cache {
 
 #[derive(Clone, Copy)]
 enum PipelineMode {
-    Cpu,
     FusedExp,
     FusedWoods,
     FusedExpStripped,
@@ -92,11 +88,10 @@ enum PipelineMode {
 /// - The inner engine is lazily created on first forward() call (post-move).
 /// - Engine::drop manually drops the correct variant before the owned fields.
 union EngineInner {
-    cpu: ManuallyDrop<EngineCPU<'static>>,
-    fused_exp: ManuallyDrop<FusedExp<'static>>,
-    fused_woods: ManuallyDrop<FusedWoods<'static>>,
-    fused_exp_stripped: ManuallyDrop<FusedExpStripped<'static>>,
-    fused_woods_stripped: ManuallyDrop<FusedWoodsStripped<'static>>,
+    fused_exp: ManuallyDrop<FusedExp<'static, FullModel>>,
+    fused_woods: ManuallyDrop<FusedWoods<'static, FullModel>>,
+    fused_exp_stripped: ManuallyDrop<FusedExp<'static, StrippedModel>>,
+    fused_woods_stripped: ManuallyDrop<FusedWoods<'static, StrippedModel>>,
 }
 
 // ─── Engine (owns GPU resources, holds the inner engine) ────────────────────
@@ -122,34 +117,38 @@ impl Engine {
     #[pyo3(signature = (model, pipeline_mode="FusedExp", k=0))]
     fn new(model: &Model, pipeline_mode: &str, k: usize) -> PyResult<Self> {
         let mode = match pipeline_mode {
-            "Cpu" | "CpuOnly" => PipelineMode::Cpu,
             "FusedExp" => PipelineMode::FusedExp,
             "FusedWoods" => PipelineMode::FusedWoods,
             "FusedExpStripped" => PipelineMode::FusedExpStripped,
             "FusedWoodsStripped" => PipelineMode::FusedWoodsStripped,
             _ => return Err(pyo3::exceptions::PyValueError::new_err(format!(
-                "Unknown pipeline_mode: {}. Use Cpu|FusedExp|FusedWoods|FusedExpStripped|FusedWoodsStripped", pipeline_mode
+                "Unknown pipeline_mode: {}. Use FusedExp|FusedWoods|FusedExpStripped|FusedWoodsStripped", pipeline_mode
             ))),
         };
 
         let is_stripped = matches!(mode, PipelineMode::FusedExpStripped | PipelineMode::FusedWoodsStripped);
         let (num_layers, num_experts, num_experts_per_tok, num_linear_layers, linear_conv_dim,
              linear_num_v_heads, linear_total_value, linear_key_dim, linear_value_dim,
-             hidden_dim, shared_intermediate, moe_intermediate, expert_size_4bit) =
+             hidden_dim, shared_intermediate, moe_intermediate, expert_size_4bit,
+             num_full_attn_layers, kv_dim) =
             if is_stripped {
                 (qwen35_35b_stripped::NUM_LAYERS, qwen35_35b_stripped::NUM_EXPERTS, qwen35_35b_stripped::NUM_EXPERTS_PER_TOK,
                  qwen35_35b_stripped::NUM_LINEAR_LAYERS, qwen35_35b_stripped::LINEAR_CONV_DIM,
                  qwen35_35b_stripped::LINEAR_NUM_V_HEADS, qwen35_35b_stripped::LINEAR_TOTAL_VALUE,
                  qwen35_35b_stripped::LINEAR_KEY_DIM, qwen35_35b_stripped::LINEAR_VALUE_DIM,
                  qwen35_35b_stripped::HIDDEN_DIM, qwen35_35b_stripped::SHARED_INTERMEDIATE,
-                 qwen35_35b_stripped::MOE_INTERMEDIATE, qwen35_35b_stripped::EXPERT_SIZE_4BIT)
+                 qwen35_35b_stripped::MOE_INTERMEDIATE, qwen35_35b_stripped::EXPERT_SIZE_4BIT,
+                 qwen35_35b_stripped::NUM_FULL_ATTN_LAYERS,
+                 qwen35_35b_stripped::NUM_KV_HEADS * qwen35_35b_stripped::HEAD_DIM)
             } else {
                 (qwen35_35b::NUM_LAYERS, qwen35_35b::NUM_EXPERTS, qwen35_35b::NUM_EXPERTS_PER_TOK,
                  qwen35_35b::NUM_LINEAR_LAYERS, qwen35_35b::LINEAR_CONV_DIM,
                  qwen35_35b::LINEAR_NUM_V_HEADS, qwen35_35b::LINEAR_TOTAL_VALUE,
                  qwen35_35b::LINEAR_KEY_DIM, qwen35_35b::LINEAR_VALUE_DIM,
                  qwen35_35b::HIDDEN_DIM, qwen35_35b::SHARED_INTERMEDIATE,
-                 qwen35_35b::MOE_INTERMEDIATE, qwen35_35b::EXPERT_SIZE_4BIT)
+                 qwen35_35b::MOE_INTERMEDIATE, qwen35_35b::EXPERT_SIZE_4BIT,
+                 qwen35_35b::NUM_FULL_ATTN_LAYERS,
+                 qwen35_35b::NUM_KV_HEADS * qwen35_35b::HEAD_DIM)
             };
 
         let k = if k == 0 { num_experts_per_tok } else { k };
@@ -164,6 +163,7 @@ impl Engine {
             num_linear_layers, linear_conv_dim, linear_num_v_heads,
             linear_total_value, linear_key_dim, linear_value_dim,
             hidden_dim, num_experts, shared_intermediate,
+            num_full_attn_layers, kv_dim,
         );
         let expert_gpu_buffer = Some(ctx.init_expert_buffers(
             expert_size_4bit, hidden_dim, moe_intermediate, shared_intermediate,
@@ -194,7 +194,7 @@ impl Engine {
         let start = if cache.inner.pos < ids.len() { cache.inner.pos } else { 0 };
         let new_ids = &ids[start..];
         let n = new_ids.len();
-        let vs = self.model.config.vocab_size;
+        let vs = self.model.config.get_usize("vocab_size").unwrap();
 
         let logits = self.forward_impl(new_ids, &mut cache.inner, &mut || py.check_signals().is_err())
             .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))?;
@@ -223,7 +223,8 @@ impl Engine {
 
     fn __repr__(&self) -> String {
         format!("Engine(loaded: {} layers, hidden={})",
-            self.model.config.num_layers, self.model.config.hidden_dim)
+            self.model.config.get_usize("num_layers").unwrap_or(0),
+            self.model.config.get_usize("hidden_dim").unwrap_or(0))
     }
 }
 
@@ -240,10 +241,6 @@ impl Engine {
         let k = self.k;
 
         self.inner = Some(match self.mode {
-            PipelineMode::Cpu => {
-                let e = EngineCPU { model: model_ref };
-                EngineInner { cpu: ManuallyDrop::new(e) }
-            }
             PipelineMode::FusedExp => {
                 let expert_buf: Option<&mut ExpertBuffer> =
                     unsafe { (&mut self.expert_gpu_buffer as *mut Option<ExpertBuffer>)
@@ -289,11 +286,6 @@ impl Engine {
         // SAFETY: the variant matches self.mode, set in init_inner.
         unsafe {
             match self.mode {
-                PipelineMode::Cpu => {
-                    let logits = inner.cpu.forward(input_ids, cache, check_signal);
-                    self.telemetry = inner.cpu.telemetry();
-                    logits
-                }
                 PipelineMode::FusedExp => {
                     let logits = inner.fused_exp.forward(input_ids, cache, check_signal);
                     self.telemetry = inner.fused_exp.telemetry();
@@ -326,14 +318,11 @@ impl Drop for Engine {
         if let Some(mut inner) = self.inner.take() {
             unsafe {
                 match self.mode {
-                    PipelineMode::Cpu => {
-                        std::ptr::drop_in_place(&mut inner.cpu as *mut ManuallyDrop<EngineCPU>);
-                    }
                     PipelineMode::FusedExp => {
-                        std::ptr::drop_in_place(&mut inner.fused_exp as *mut ManuallyDrop<FusedExp>);
+                        std::ptr::drop_in_place(&mut inner.fused_exp as *mut ManuallyDrop<FusedExp<'static, FullModel>>);
                     }
                     PipelineMode::FusedWoods => {
-                        std::ptr::drop_in_place(&mut inner.fused_woods as *mut ManuallyDrop<FusedWoods>);
+                        std::ptr::drop_in_place(&mut inner.fused_woods as *mut ManuallyDrop<FusedWoods<'static, FullModel>>);
                     }
                     PipelineMode::FusedExpStripped => {
                         std::ptr::drop_in_place(&mut inner.fused_exp_stripped as *mut ManuallyDrop<FusedExpStripped>);
