@@ -7,7 +7,7 @@ use std::collections::HashMap;
 use crate::cache::Cache;
 use crate::constants::FULL_ATTN_INTERVAL;
 use crate::error::MoEError;
-use crate::metal_kernels;
+use crate::engine::qwen35_moe::metal_kernels;
 use crate::model::weights::WeightFile;
 
 // ─── Expert I/O pre-allocation & LRU cache ───────────────────────────────────
@@ -254,6 +254,10 @@ pub struct MetalContext {
     pub buf_qkv_k: Option<Buffer>,
     /// V projection output [kv_dim] f32
     pub buf_qkv_v: Option<Buffer>,
+    // ── Cache sync metadata ──
+    pub pos: std::cell::Cell<usize>,
+    kv_dim: usize,
+    num_layers: usize,
 }
 
 impl MetalContext {
@@ -317,6 +321,8 @@ impl MetalContext {
         self.buf_kv_k.clear();
         self.buf_kv_v.clear();
         let kv_buf_size = crate::constants::MAX_SEQ * kv_dim * 4;
+        self.kv_dim = kv_dim;
+        self.num_layers = num_full_attn_layers + num_linear_layers;
         eprintln!("[metal] Allocating {} full-attn KV buffers ({} MB each)",
             num_full_attn_layers, kv_buf_size / (1024 * 1024));
         for _ in 0..num_full_attn_layers {
@@ -487,6 +493,9 @@ impl MetalContext {
                 buf_qkv_q: None,
                 buf_qkv_k: None,
                 buf_qkv_v: None,
+                pos: std::cell::Cell::new(0),
+                kv_dim: 0,
+                num_layers: 0,
             })
         })
     }
@@ -496,13 +505,15 @@ impl MetalContext {
 
 impl MetalContext {
     /// Upload CPU cache state → GPU buffers (restoring from persistent state).
-    pub fn upload_cache(&self, cache: &Cache, num_layers: usize, kv_dim: usize) {
+    pub fn upload_cache(&self, cache: &Cache) {
+        assert!(self.num_layers > 0, "upload_cache called before init_linear_attn_buffers");
+        self.pos.set(cache.pos);
         if cache.pos == 0 { return; }
-        for layer in 0..num_layers {
+        for layer in 0..self.num_layers {
             if (layer + 1) % FULL_ATTN_INTERVAL == 0 {
                 let fa_idx = layer / FULL_ATTN_INTERVAL;
                 let kv = cache.full(layer);
-                let n = kv.len * kv_dim;
+                let n = kv.len * self.kv_dim;
                 unsafe {
                     std::ptr::copy_nonoverlapping(
                         kv.k_cache.as_ptr(),
@@ -534,14 +545,17 @@ impl MetalContext {
         }
     }
 
-    /// Download GPU state → CPU cache (for persistence).
-    pub fn download_cache(&self, cache: &mut Cache, num_layers: usize, kv_dim: usize) {
-        for layer in 0..num_layers {
+    /// Download GPU state → CPU cache (for persistence). Sets cache.pos.
+    pub fn download_cache(&self, cache: &mut Cache) {
+        assert!(self.num_layers > 0, "download_cache called before init_linear_attn_buffers");
+        let pos = self.pos.get();
+        cache.set_pos(pos);
+        for layer in 0..self.num_layers {
             if (layer + 1) % FULL_ATTN_INTERVAL == 0 {
                 let fa_idx = layer / FULL_ATTN_INTERVAL;
                 unsafe {
                     let kv = cache.full_mut(layer);
-                    let n = kv.len * kv_dim;
+                    let n = kv.len * self.kv_dim;
                     std::ptr::copy_nonoverlapping(
                         self.buf_kv_k[fa_idx].contents() as *const f32,
                         kv.k_cache.as_mut_ptr(),

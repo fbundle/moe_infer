@@ -5,8 +5,6 @@ pub mod model;
 mod cache;
 mod constants;
 mod error;
-#[path = "metal_util/kernels.rs"] mod metal_kernels;
-#[path = "metal_util/context.rs"] mod metal_context;
 mod timer;
 
 #[cfg(feature = "python-bindings")]

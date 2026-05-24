@@ -3,7 +3,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use crate::cache::Cache;
 use crate::error::MoEError;
-use crate::metal_context::{WeightBuffer, MetalContext, ExpertBuffer};
+use crate::engine::qwen35_moe::metal_context::{WeightBuffer, MetalContext, ExpertBuffer};
 use crate::model::Model;
 
 pub mod qwen35_moe;
@@ -32,11 +32,14 @@ pub enum TelemetryValue {
 }
 
 pub trait Engine {
+    /// Upload CPU cache → GPU buffers before forward. No-op if pos == 0.
+    fn upload_cache(&self, cache: &Cache);
+    /// Download GPU buffers → CPU cache after forward.
+    fn download_cache(&self, cache: &mut Cache);
+
     /// Process `input_ids` through all layers. Returns logits [n, vocab_size].
-    /// `cache` is mutated in place.
     fn forward(
         &mut self,
-        cache: &mut Cache,
         input_ids: &[i64],
         check_signal: SignalCheckFn<'_>,
     ) -> Result<Vec<f32>, MoEError>;
@@ -53,22 +56,17 @@ pub trait Engine {
 #[derive(Clone, Copy)]
 pub enum PipelineMode {
     FusedExp,
-    FusedWoods,
     FusedExpStripped,
-    FusedWoodsStripped,
 }
 
 // ─── Type-erased engine ─────────────────────────────────────────────────────
 
-use qwen35_moe::{FullModel, StrippedModel, FusedExp, FusedWoods};
+use qwen35_moe::{FullModel, StrippedModel, FusedExp};
 
-/// Type-erased engine holding one of the four engine variants.
-/// Drop is derived — no manual drop needed (unlike a union).
+/// Type-erased engine holding one of the engine variants.
 pub enum ErasedEngine {
     FusedExp(FusedExp<'static, FullModel>),
-    FusedWoods(FusedWoods<'static, FullModel>),
     FusedExpStripped(FusedExp<'static, StrippedModel>),
-    FusedWoodsStripped(FusedWoods<'static, StrippedModel>),
 }
 
 impl ErasedEngine {
@@ -100,13 +98,6 @@ impl ErasedEngine {
                 )?;
                 ErasedEngine::FusedExp(e)
             }
-            PipelineMode::FusedWoods => {
-                let e = FusedWoods::new(
-                    model_ref, ctx_ref, gpu_wf_ref,
-                    expert_gpu_buffer.map(|b| &mut *(b as *mut ExpertBuffer)),
-                )?;
-                ErasedEngine::FusedWoods(e)
-            }
             PipelineMode::FusedExpStripped => {
                 let e = FusedExp::new(
                     model_ref, ctx_ref, gpu_wf_ref,
@@ -115,36 +106,38 @@ impl ErasedEngine {
                 )?;
                 ErasedEngine::FusedExpStripped(e)
             }
-            PipelineMode::FusedWoodsStripped => {
-                let e = FusedWoods::new(
-                    model_ref, ctx_ref, gpu_wf_ref,
-                    expert_gpu_buffer.map(|b| &mut *(b as *mut ExpertBuffer)),
-                )?;
-                ErasedEngine::FusedWoodsStripped(e)
-            }
         })
+    }
+
+    pub fn upload_cache(&self, cache: &Cache) {
+        match self {
+            ErasedEngine::FusedExp(e) => Engine::upload_cache(e, cache),
+            ErasedEngine::FusedExpStripped(e) => Engine::upload_cache(e, cache),
+        }
+    }
+
+    pub fn download_cache(&self, cache: &mut Cache) {
+        match self {
+            ErasedEngine::FusedExp(e) => Engine::download_cache(e, cache),
+            ErasedEngine::FusedExpStripped(e) => Engine::download_cache(e, cache),
+        }
     }
 
     pub fn forward(
         &mut self,
-        cache: &mut Cache,
         input_ids: &[i64],
         check_signal: SignalCheckFn<'_>,
     ) -> Result<Vec<f32>, MoEError> {
         match self {
-            ErasedEngine::FusedExp(e) => Engine::forward(e, cache, input_ids, check_signal),
-            ErasedEngine::FusedWoods(e) => Engine::forward(e, cache, input_ids, check_signal),
-            ErasedEngine::FusedExpStripped(e) => Engine::forward(e, cache, input_ids, check_signal),
-            ErasedEngine::FusedWoodsStripped(e) => Engine::forward(e, cache, input_ids, check_signal),
+            ErasedEngine::FusedExp(e) => Engine::forward(e, input_ids, check_signal),
+            ErasedEngine::FusedExpStripped(e) => Engine::forward(e, input_ids, check_signal),
         }
     }
 
     pub fn telemetry(&self) -> BTreeMap<String, TelemetryValue> {
         match self {
             ErasedEngine::FusedExp(e) => Engine::telemetry(e),
-            ErasedEngine::FusedWoods(e) => Engine::telemetry(e),
             ErasedEngine::FusedExpStripped(e) => Engine::telemetry(e),
-            ErasedEngine::FusedWoodsStripped(e) => Engine::telemetry(e),
         }
     }
 }

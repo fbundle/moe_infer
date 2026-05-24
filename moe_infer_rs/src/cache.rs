@@ -92,6 +92,25 @@ impl Cache {
         }
     }
 
+    /// Copy state vectors from another cache (requires matching layer count).
+    pub fn copy_from(&mut self, other: &Cache) {
+        self.pos = other.pos;
+        for (s, o) in self.states.iter_mut().zip(other.states.iter()) {
+            match (s, o) {
+                (State::Full(s), State::Full(o)) => {
+                    s.k_cache.copy_from_slice(&o.k_cache);
+                    s.v_cache.copy_from_slice(&o.v_cache);
+                    s.len = o.len;
+                }
+                (State::Linear(s), State::Linear(o)) => {
+                    s.conv_state.copy_from_slice(&o.conv_state);
+                    s.ssm_state.copy_from_slice(&o.ssm_state);
+                }
+                _ => panic!("cache layer type mismatch"),
+            }
+        }
+    }
+
     /// Serialize cache to a JSON file (for persistence across restarts).
     pub fn save(&self, path: impl AsRef<Path>) -> Result<(), Box<dyn std::error::Error>> {
         let file = File::create(path)?;

@@ -11,7 +11,7 @@ use crate::model::Model as CoreModel;
 use crate::constants::{qwen35_35b, qwen35_35b_stripped};
 use crate::error::MoEError;
 use crate::engine::{SignalCheckFn, TelemetryValue, set_record_telemetry, PipelineMode, ErasedEngine};
-use crate::metal_context::{ExpertBuffer, WeightBuffer, MetalContext};
+use crate::engine::qwen35_moe::metal_context::{ExpertBuffer, WeightBuffer, MetalContext};
 
 // ─── Module-level functions ──────────────────────────────────────────────────
 
@@ -92,15 +92,13 @@ impl Engine {
     fn new(model: &Model, pipeline_mode: &str, k: usize) -> PyResult<Self> {
         let mode = match pipeline_mode {
             "FusedExp" => PipelineMode::FusedExp,
-            "FusedWoods" => PipelineMode::FusedWoods,
             "FusedExpStripped" => PipelineMode::FusedExpStripped,
-            "FusedWoodsStripped" => PipelineMode::FusedWoodsStripped,
             _ => return Err(pyo3::exceptions::PyValueError::new_err(format!(
-                "Unknown pipeline_mode: {}. Use FusedExp|FusedWoods|FusedExpStripped|FusedWoodsStripped", pipeline_mode
+                "Unknown pipeline_mode: {}. Use FusedExp|FusedExpStripped", pipeline_mode
             ))),
         };
 
-        let is_stripped = matches!(mode, PipelineMode::FusedExpStripped | PipelineMode::FusedWoodsStripped);
+        let is_stripped = matches!(mode, PipelineMode::FusedExpStripped);
         let (num_layers, num_experts, num_experts_per_tok, num_linear_layers, linear_conv_dim,
              linear_num_v_heads, linear_total_value, linear_key_dim, linear_value_dim,
              hidden_dim, shared_intermediate, moe_intermediate, expert_size_4bit,
@@ -185,6 +183,19 @@ impl Engine {
         Ok(arr.into_pyobject(py)?.into_any().into())
     }
 
+    /// Expose upload/download for callers that manage cache persistence.
+    fn upload_cache(&self, cache: &Cache) {
+        if let Some(ref eng) = self.engine {
+            eng.upload_cache(&cache.inner);
+        }
+    }
+
+    fn download_cache(&self, cache: &mut Cache) {
+        if let Some(ref eng) = self.engine {
+            eng.download_cache(&mut cache.inner);
+        }
+    }
+
     /// Engine-level telemetry (only populated when record_engine_telemetry(true)).
     fn telemetry(&self, py: Python<'_>) -> PyResult<PyObject> {
         let dict = pyo3::types::PyDict::new(py);
@@ -226,7 +237,9 @@ impl Engine {
             });
         }
         let eng = self.engine.as_mut().unwrap();
-        let logits = eng.forward(cache, input_ids, check_signal)?;
+        eng.upload_cache(cache);
+        let logits = eng.forward(input_ids, check_signal)?;
+        eng.download_cache(cache);
         self.telemetry = eng.telemetry();
         Ok(logits)
     }

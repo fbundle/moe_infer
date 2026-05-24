@@ -8,8 +8,8 @@ use std::time::Instant;
 
 use metal::{Buffer, CommandBuffer, ComputeCommandEncoderRef, MTLSize};
 
-use crate::metal_kernels;
-use crate::metal_context::{metal_buf_shared, WeightBuffer, MetalContext, ExpertBuffer, MAX_K};
+use crate::engine::qwen35_moe::metal_kernels;
+use crate::engine::qwen35_moe::metal_context::{metal_buf_shared, WeightBuffer, MetalContext, ExpertBuffer, MAX_K};
 use crate::cache::Cache;
 use crate::engine::Engine;
 use crate::model::Model;
@@ -901,9 +901,16 @@ impl<'a, C: ModelConfig> FusedExp<'a, C> {
 }
 
 impl<'a, C: ModelConfig> Engine for FusedExp<'a, C> {
+    fn upload_cache(&self, cache: &Cache) {
+        self.ctx.upload_cache(cache);
+    }
+
+    fn download_cache(&self, cache: &mut Cache) {
+        self.ctx.download_cache(cache);
+    }
+
     fn forward(
         &mut self,
-        cache: &mut Cache,
         input_ids: &[i64],
         check_signal: SignalCheckFn<'_>,
     ) -> Result<Vec<f32>, MoEError> {
@@ -922,9 +929,7 @@ impl<'a, C: ModelConfig> Engine for FusedExp<'a, C> {
             return Ok(logits);
         }
 
-        self.ctx.upload_cache(cache, C::NUM_LAYERS, C::NUM_KV_HEADS * C::HEAD_DIM);
-
-        let mut pos = cache.pos;
+        let mut pos = self.ctx.pos.get();
         {
             let mut exec = ExecCtx { engine: self, pending: None };
 
@@ -948,13 +953,10 @@ impl<'a, C: ModelConfig> Engine for FusedExp<'a, C> {
 
                 let mut hidden = exec.hidden_wait();
                 pos += 1;
+                exec.engine.ctx.pos.set(pos);
                 exec.final_norm_and_lm_head(&mut hidden, &mut logits[ti * vs..(ti + 1) * vs]);
             }
         } // exec dropped — ends borrow of self
-
-        cache.set_pos(pos);
-
-        self.ctx.download_cache(cache, C::NUM_LAYERS, C::NUM_KV_HEADS * C::HEAD_DIM);
 
         timing_add(&mut self.timing, "engine.total_ms", t0.elapsed().as_secs_f64() * 1000.0);
         Ok(logits)
