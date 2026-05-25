@@ -5,9 +5,9 @@ import numpy as np
 from tqdm import tqdm
 
 ROOT = os.path.dirname(os.path.abspath(__file__))
-MODEL_DIR = os.path.join(ROOT, "data", "models--mlx-community--Qwen3.6-35B-A3B-4bit")
-C_DIR = os.path.join(ROOT, "moe_infer_c")
-RS_DIR = os.path.join(ROOT, "moe_infer_rs")
+MODEL_DIR = "data/models--Qwen--Qwen3.6-35B-A3B-bq4"
+C_DIR = "moe_infer_c"
+RS_DIR = "moe_infer_rs"
 
 TOKEN_COUNTS = [20, 50, 100, 200, 500]
 from helpers.avail_models import ACTIVE_ENGINES as RUST_MODES
