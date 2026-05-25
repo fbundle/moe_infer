@@ -174,6 +174,7 @@ pub struct MetalContext {
     pub matvec_fast: ComputePipelineState,
     pub matvec_v3: ComputePipelineState,
     pub matvec_bf16: ComputePipelineState,
+    pub matvec_int8: ComputePipelineState,
     pub swiglu: ComputePipelineState,
     pub swiglu_vec4: Option<ComputePipelineState>,
     pub rms_norm_sum: ComputePipelineState,
@@ -456,6 +457,7 @@ impl MetalContext {
             let matvec_naive = make_pipeline("dequant_matvec_4bit")?;
             let matvec_v3 = make_pipeline("dequant_matvec_4bit_v3")?;
             let matvec_bf16 = make_pipeline("matvec_bf16")?;
+            let matvec_int8 = make_pipeline("matvec_int8")?;
             let swiglu = make_pipeline("swiglu_fused")?;
             let rms_norm_sum = make_pipeline("rms_norm_sum_sq")?;
 
@@ -495,6 +497,7 @@ impl MetalContext {
                 matvec_fast,
                 matvec_v3: matvec_v3.clone(),
                 matvec_bf16,
+                matvec_int8,
                 swiglu,
                 swiglu_vec4,
                 rms_norm_sum,
@@ -703,10 +706,29 @@ impl WeightBuffer {
             .unwrap_or("u32");
 
         if dtype == "bf16" {
-            // Direct BF16 matvec (attention, routers, lm_head — no dequant)
+            // Direct BF16 matvec (attention, routers — no dequant)
             metal_kernels::encode_matvec_bf16_offset(
                 ctx, encoder,
                 &self.buf, w_off,
+                x_buf, x_offset, out_buf, out_offset,
+                out_dim as u32, in_dim as u32,
+            );
+            return true;
+        }
+
+        if dtype == "u8" {
+            // INT8 per-channel symmetric matvec (lm_head)
+            let s_ptr = match wf.get_tensor_ptr(&format!("{}.scales", prefix)) {
+                Some(p) => p,
+                None => {
+                    eprintln!("[encode_matvec_into] WARNING: tensor not found: {}.scales", prefix);
+                    return false;
+                }
+            };
+            let s_off = (s_ptr as usize - self.base as usize) as u64;
+            metal_kernels::encode_matvec_int8_offset(
+                ctx, encoder,
+                &self.buf, w_off, &self.buf, s_off,
                 x_buf, x_offset, out_buf, out_offset,
                 out_dim as u32, in_dim as u32,
             );

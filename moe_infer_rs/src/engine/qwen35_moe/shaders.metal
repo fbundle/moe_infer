@@ -1935,3 +1935,48 @@ kernel void matvec_bf16(
         out[row] = sum;
     }
 }
+
+// ============================================================================
+// Kernel 21: INT8 per-channel symmetric matrix-vector multiply
+// ============================================================================
+// For BQ4: lm_head stored as int8 weights + f32 per-channel scales.
+// Dequant: w_f32 = int8(w_q) * scale[row], then dot product.
+// Dispatch: ceil(out_dim / ROWS_PER_TG) threadgroups, 256 threads each.
+
+kernel void matvec_int8(
+    device const char*      W_i8    [[buffer(0)]],  // [out_dim, in_dim]
+    device const float*     scales  [[buffer(1)]],  // [out_dim] per-channel
+    device const float*     x       [[buffer(2)]],  // [in_dim]
+    device float*           out     [[buffer(3)]],  // [out_dim]
+    constant uint&          out_dim [[buffer(4)]],
+    constant uint&          in_dim  [[buffer(5)]],
+    uint tgid   [[threadgroup_position_in_grid]],
+    uint lid    [[thread_position_in_threadgroup]],
+    uint simd_lane  [[thread_index_in_simdgroup]],
+    uint simd_group [[simdgroup_index_in_threadgroup]]
+) {
+    uint row = tgid * ROWS_PER_TG + simd_group;
+
+    threadgroup float x_shared[4096];
+
+    for (uint i = lid; i < in_dim; i += 256) {
+        x_shared[i] = x[i];
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    if (row >= out_dim) return;
+
+    float scale = scales[row];
+    device const char* w_row = W_i8 + row * in_dim;
+
+    float acc = 0.0f;
+    for (uint col = simd_lane; col < in_dim; col += 32) {
+        acc += float(w_row[col]) * scale * x_shared[col];
+    }
+
+    float sum = simd_sum(acc);
+
+    if (simd_lane == 0) {
+        out[row] = sum;
+    }
+}

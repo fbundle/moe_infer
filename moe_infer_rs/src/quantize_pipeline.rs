@@ -2,14 +2,21 @@
 //
 // Called from Python via a single `moe_infer.quantize()` function.
 
+use crate::quantize::{self, bq4, Quant, GROUP_SIZE};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs;
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 
-use crate::quantize::{self, bq4, Quant, GROUP_SIZE};
-
 const ALIGN: u64 = 64;
+
+/// Check for Python Ctrl-C signal.  No-op when built without python-bindings.
+fn check_interrupt() -> Result<(), String> {
+    #[cfg(feature = "python-bindings")]
+    pyo3::Python::with_gil(|py| py.check_signals())
+        .map_err(|e| format!("interrupted: {}", e))?;
+    Ok(())
+}
 
 /// Extract layer index from tensor name.  Looks for `layers.{N}.` pattern.
 fn extract_layer(name: &str) -> Option<usize> {
@@ -580,8 +587,14 @@ pub fn run(
     let mut quant_summary: HashMap<String, usize> = HashMap::new();
 
     let t0 = std::time::Instant::now();
+    let mut t_count: usize = 0;
 
     for (hf_name, shard_name) in &non_expert {
+        // Check for Ctrl-C every 50 tensors
+        t_count += 1;
+        if t_count % 50 == 0 {
+            check_interrupt()?;
+        }
         let header = header_cache
             .get(shard_name)
             .ok_or_else(|| format!("header not cached for {}", shard_name))?;
@@ -721,6 +734,46 @@ pub fn run(
                 total_bytes += dlen;
                 tensor_count += 1;
             }
+            Quant::Int8 => {
+                let (packed, scales) =
+                    quantize::quant_f32_to_int8(&f32_padded, out_dim, in_dim);
+
+                // Convert Vec<i8> → bytes (safe: transmute is fine for i8)
+                let packed_bytes: Vec<u8> = unsafe {
+                    std::slice::from_raw_parts(
+                        packed.as_ptr() as *const u8,
+                        packed.len(),
+                    ).to_vec()
+                };
+                let scales_bytes: Vec<u8> =
+                    scales.iter().flat_map(|v| v.to_le_bytes()).collect();
+
+                for (data, suffix, data_shape, data_dtype) in [
+                    (packed_bytes, ".weight", vec![out_dim, in_dim], "u8"),
+                    (scales_bytes, ".scales", vec![out_dim], "f32"),
+                ] {
+                    let tname = format!("{}{}", base, suffix);
+                    let dlen = data.len() as u64;
+                    out_f.write_all(&data).map_err(|e| e.to_string())?;
+                    let mut entry = serde_json::Map::new();
+                    entry.insert("offset".into(), serde_json::Value::from(offset));
+                    entry.insert("size".into(), serde_json::Value::from(dlen));
+                    entry.insert(
+                        "shape".into(),
+                        serde_json::Value::Array(
+                            data_shape
+                                .iter()
+                                .map(|&n| serde_json::Value::from(n as u64))
+                                .collect(),
+                        ),
+                    );
+                    entry.insert("dtype".into(), serde_json::Value::String(data_dtype.into()));
+                    tensors_map.insert(tname, serde_json::Value::Object(entry));
+                    offset += dlen;
+                    total_bytes += dlen;
+                    tensor_count += 1;
+                }
+            }
             Quant::Bf16 | Quant::Bf16Pass => {
                 let bf16 = quantize::f32_to_bf16_u16(&f32_padded);
                 let data: Vec<u8> = bf16.iter().flat_map(|v| v.to_le_bytes()).collect();
@@ -798,6 +851,8 @@ pub fn run(
     let mut expert_layers_done = 0usize;
 
     for (layer_idx, (gate_up_key, down_key)) in &expert_layers {
+        // Check for Ctrl-C on each layer
+        check_interrupt()?;
         if gate_up_key.is_empty() || down_key.is_empty() {
             eprintln!("  Layer {} SKIPPED (missing keys)", layer_idx);
             continue;

@@ -23,6 +23,8 @@ pub enum Quant {
     Bf16Pass,
     /// 4-bit affine quantization: weight (packed u32) + scales (bf16) + biases (bf16).
     Int4,
+    /// 8-bit per-channel symmetric quantization: weight (i8) + scales (f32 per channel).
+    Int8,
 }
 
 impl Quant {
@@ -32,6 +34,7 @@ impl Quant {
             Quant::Fp32 => "f32",
             Quant::Bf16 | Quant::Bf16Pass => "bf16",
             Quant::Int4 => "u32",
+            Quant::Int8 => "u8",
         }
     }
 
@@ -61,6 +64,7 @@ impl Quant {
     pub fn encode(self, f32_vals: &[f32], out_dim: usize, in_dim: usize) -> Vec<EncodedTensor> {
         match self {
             Quant::Int4 => encode_int4(f32_vals, out_dim, in_dim),
+            Quant::Int8 => encode_int8(f32_vals, out_dim, in_dim),
             Quant::Bf16 | Quant::Bf16Pass => encode_bf16(f32_vals),
             Quant::Fp32 => encode_fp32(f32_vals),
         }
@@ -120,7 +124,19 @@ pub fn strip_layer_prefix(name: &str) -> &str {
 /// Map a relative block name (after stripping layer prefix) to its Quant variant.
 /// Anything not listed falls through to INT4.
 ///
-/// Edit this table to change which matrices stay full-precision.
+/// ```haskell
+/// matrixTable "self_attn.q_proj" = BF16Pass
+/// matrixTable "self_attn.k_proj" = BF16Pass
+/// matrixTable "self_attn.v_proj" = BF16Pass
+/// matrixTable "self_attn.o_proj" = BF16Pass
+/// matrixTable "mlp.gate"         = BF16Pass
+/// matrixTable "attn.qkv"         = BF16Pass
+/// matrixTable "attn.proj"        = BF16Pass
+/// matrixTable "patch_embed.proj" = BF16Pass
+/// matrixTable "pos_embed"        = BF16Pass
+/// matrixTable "lm_head"          = INT8
+/// matrixTable _                  = INT4
+/// ```
 pub fn matrix_table(block: &str) -> Quant {
     match block {
         "self_attn.q_proj"
@@ -128,11 +144,11 @@ pub fn matrix_table(block: &str) -> Quant {
         | "self_attn.v_proj"
         | "self_attn.o_proj"
         | "mlp.gate"
-        | "lm_head"
         | "attn.qkv"
         | "attn.proj"
         | "patch_embed.proj"
         | "pos_embed" => Quant::Bf16Pass,
+        "lm_head" => Quant::Int8,
         _ => Quant::Int4,
     }
 }
@@ -141,34 +157,42 @@ pub fn matrix_table(block: &str) -> Quant {
 
 /// Classify a tensor by its MLX name and shape → Quant variant.
 ///
-/// Rules:
-///   1. kind == "A_log"            → FP32   (scalar, exact)
-///   2. kind ∈ {scales,biases,bias,dt_bias} → BF16
-///   3. kind == "weight", ndim ≠ 2 → BF16   (1D vector passthrough)
-///   4. kind == "weight", ndim = 2 → matrix_table(block)
+/// ```haskell
+/// bq4 name
+///   | kind == "A_log"   = FP32
+///   | kind == "weight"  = matrixTable block
+///   | kind == "scales"  = BF16
+///   | kind == "biases"  = BF16
+///   | kind == "bias"    = BF16
+///   | kind == "dt_bias" = BF16
+///   where
+///     (prefix, kind) = splitOnLastDot name
+///     block          = stripLayerPrefix prefix
+/// ```
+///
+/// Within the `"weight"` arm: ndim ≠ 2 (1D vector) → BF16, ndim = 2 (matrix) → matrix_table.
 pub fn bq4(mlx_name: &str, shape: &[usize]) -> Quant {
     let (prefix, kind) = split_on_last_dot(mlx_name);
-    let ndim = shape.len();
 
-    if kind == "A_log" {
-        debug_assert!(ndim <= 1, "A_log must be scalar/vector, got ndim={}: {}", ndim, mlx_name);
-        return Quant::Fp32;
-    }
-
-    if matches!(kind, "scales" | "biases" | "bias" | "dt_bias") {
-        debug_assert!(ndim <= 2, "{} must be vector, got ndim={}: {}", kind, ndim, mlx_name);
-        return Quant::Bf16;
-    }
-
-    if kind == "weight" {
-        if ndim != 2 {
-            return Quant::Bf16;
+    match kind {
+        "A_log" => {
+            debug_assert!(shape.len() <= 1, "A_log must be scalar/vector, got ndim={}: {}", shape.len(), mlx_name);
+            Quant::Fp32
         }
-        let block = strip_layer_prefix(prefix);
-        return matrix_table(block);
+        "scales" | "biases" | "bias" | "dt_bias" => {
+            debug_assert!(shape.len() <= 2, "{} must be vector, got ndim={}: {}", kind, shape.len(), mlx_name);
+            Quant::Bf16
+        }
+        "weight" => {
+            if shape.len() != 2 {
+                Quant::Bf16                          // 1D vector passthrough
+            } else {
+                let block = strip_layer_prefix(prefix);
+                matrix_table(block)                  // 2D matrix → table lookup
+            }
+        }
+        _ => panic!("unknown kind: {:?} in {}", kind, mlx_name),
     }
-
-    panic!("unknown kind: {:?} in {}", kind, mlx_name);
 }
 
 /// Convenience: return the manifest dtype string for a weight tensor.
@@ -378,6 +402,101 @@ fn encode_fp32(f32_vals: &[f32]) -> Vec<EncodedTensor> {
     }]
 }
 
+// ─── INT8 per-channel symmetric quantization ─────────────────────────────────
+
+/// Quantize f32 [out_dim, in_dim] row-major → (packed_i8, scales_f32).
+///
+/// Per-channel symmetric: each output channel gets one f32 scale.
+///   scale[i] = max(|w[i,:]|) / 127
+///   w_q[i,j] = round(w_f32[i,j] / scale[i])  clamped to [-127, 127]
+///
+/// The packed i8 bytes use row-major layout, two's complement signed int8.
+pub fn quant_f32_to_int8(
+    f32_vals: &[f32],
+    out_dim: usize,
+    in_dim: usize,
+) -> (Vec<i8>, Vec<f32>) {
+    let mut packed = vec![0i8; out_dim * in_dim];
+    let mut scales = vec![0.0f32; out_dim];
+
+    for row in 0..out_dim {
+        let row_slice = &f32_vals[row * in_dim..(row + 1) * in_dim];
+
+        // Find max absolute value
+        let mut max_abs = 0.0f32;
+        for &v in row_slice {
+            let a = v.abs();
+            if a > max_abs { max_abs = a; }
+        }
+
+        let scale = if max_abs > 0.0 {
+            max_abs / 127.0
+        } else {
+            1.0 / 127.0 // degenerate case: all zeros
+        };
+        scales[row] = scale;
+
+        let inv_scale = 1.0 / scale;
+        let dst = &mut packed[row * in_dim..(row + 1) * in_dim];
+        for (j, &v) in row_slice.iter().enumerate() {
+            let q = (v * inv_scale).round() as i32;
+            dst[j] = q.clamp(-127, 127) as i8;
+        }
+    }
+
+    (packed, scales)
+}
+
+/// Dequantize INT8 per-channel symmetric weights back to f32 [out_dim, in_dim].
+pub fn int8_to_f32(
+    packed: &[i8],
+    scales: &[f32],
+    out_dim: usize,
+    in_dim: usize,
+) -> Vec<f32> {
+    let mut result = vec![0.0f32; out_dim * in_dim];
+    for row in 0..out_dim {
+        let scale = scales[row];
+        let src = &packed[row * in_dim..(row + 1) * in_dim];
+        let dst = &mut result[row * in_dim..(row + 1) * in_dim];
+        for (j, &q) in src.iter().enumerate() {
+            dst[j] = (q as f32) * scale;
+        }
+    }
+    result
+}
+
+fn encode_int8(f32_vals: &[f32], out_dim: usize, in_dim: usize) -> Vec<EncodedTensor> {
+    let (packed, scales) = quant_f32_to_int8(f32_vals, out_dim, in_dim);
+
+    // Convert Vec<i8> → bytes
+    let packed_bytes: Vec<u8> = unsafe {
+        let ptr = packed.as_ptr() as *const u8;
+        let len = packed.len();
+        std::slice::from_raw_parts(ptr, len).to_vec()
+    };
+    let scales_bytes: Vec<u8> = unsafe {
+        let ptr = scales.as_ptr() as *const u8;
+        let len = scales.len() * 4;
+        std::slice::from_raw_parts(ptr, len).to_vec()
+    };
+
+    vec![
+        EncodedTensor {
+            data: packed_bytes,
+            suffix: ".weight",
+            shape: vec![out_dim, in_dim],
+            dtype: "u8",
+        },
+        EncodedTensor {
+            data: scales_bytes,
+            suffix: ".scales",
+            shape: vec![out_dim],
+            dtype: "f32",
+        },
+    ]
+}
+
 // ─── Tests ───────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -434,7 +553,7 @@ mod tests {
         assert_eq!(matrix_table("self_attn.v_proj"), Quant::Bf16Pass);
         assert_eq!(matrix_table("self_attn.o_proj"), Quant::Bf16Pass);
         assert_eq!(matrix_table("mlp.gate"), Quant::Bf16Pass);
-        assert_eq!(matrix_table("lm_head"), Quant::Bf16Pass);
+        assert_eq!(matrix_table("lm_head"), Quant::Int8);
         assert_eq!(matrix_table("attn.qkv"), Quant::Bf16Pass);
         assert_eq!(matrix_table("attn.proj"), Quant::Bf16Pass);
         assert_eq!(matrix_table("patch_embed.proj"), Quant::Bf16Pass);
@@ -501,7 +620,7 @@ mod tests {
             "language_model.lm_head.weight",
             &[248320, 2048],
         );
-        assert_eq!(q, Quant::Bf16Pass);
+        assert_eq!(q, Quant::Int8);
     }
 
     #[test]
@@ -591,5 +710,41 @@ mod tests {
             ),
             "f32"
         );
+        assert_eq!(
+            classify_weight(
+                "language_model.lm_head.weight",
+                &[248320, 2048]
+            ),
+            "u8"
+        );
+    }
+
+    #[test]
+    fn test_int8_roundtrip() {
+        let out_dim = 4;
+        let in_dim = 128;
+        let vals: Vec<f32> = (0..(out_dim * in_dim))
+            .map(|i| ((i as f32) * 0.1).sin() * 3.0)
+            .collect();
+
+        let (packed, scales) = quant_f32_to_int8(&vals, out_dim, in_dim);
+        let recon = int8_to_f32(&packed, &scales, out_dim, in_dim);
+
+        // Per-channel max error should be within ~1% of channel range
+        for row in 0..out_dim {
+            let range = vals[row * in_dim..(row + 1) * in_dim].iter()
+                .fold(f32::NEG_INFINITY, |a, &b| a.max(b))
+                - vals[row * in_dim..(row + 1) * in_dim].iter()
+                    .fold(f32::INFINITY, |a, &b| a.min(b));
+            let max_err = vals[row * in_dim..(row + 1) * in_dim].iter()
+                .zip(recon[row * in_dim..(row + 1) * in_dim].iter())
+                .map(|(a, b)| (a - b).abs())
+                .fold(0.0f32, f32::max);
+            if range > 0.01 {
+                assert!(max_err / range < 0.02,
+                    "row {}: max_err={} range={} rel_err={}",
+                    row, max_err, range, max_err / range);
+            }
+        }
     }
 }

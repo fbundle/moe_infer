@@ -97,6 +97,33 @@ pub fn encode_matvec_bf16_offset(
     );
 }
 
+/// Encode INT8 per-channel symmetric matvec (lm_head).
+pub fn encode_matvec_int8_offset(
+    ctx: &MetalContext,
+    encoder: &ComputeCommandEncoderRef,
+    w_i8: &BufferRef, w_offset: u64,
+    scales: &BufferRef, s_offset: u64,
+    x: &BufferRef, x_offset: u64,
+    out: &BufferRef, o_offset: u64,
+    out_dim: u32,
+    in_dim: u32,
+) {
+    encoder.set_compute_pipeline_state(&ctx.matvec_int8);
+    encoder.set_buffer(0, Some(w_i8), w_offset);
+    encoder.set_buffer(1, Some(scales), s_offset);
+    encoder.set_buffer(2, Some(x), x_offset);
+    encoder.set_buffer(3, Some(out), o_offset);
+    unsafe {
+        set_u32(encoder, 4, out_dim);
+        set_u32(encoder, 5, in_dim);
+    }
+    let num_tgs = (out_dim + ROWS_PER_TG - 1) / ROWS_PER_TG;
+    encoder.dispatch_thread_groups(
+        MTLSize::new(num_tgs as u64, 1, 1),
+        MTLSize::new(TG_SIZE as u64, 1, 1),
+    );
+}
+
 // ---------------------------------------------------------------------------
 // SwiGLU
 // ---------------------------------------------------------------------------
