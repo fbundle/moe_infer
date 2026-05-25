@@ -68,6 +68,23 @@ pub enum EngineEnum {
 }
 
 impl EngineEnum {
+    /// Resolve (engine_name, architecture) → EngineEnum.
+    pub fn resolve(engine_type: &str, arch: &str) -> Result<Self, MoEError> {
+        match (engine_type, arch) {
+            ("Fused4bit", "Qwen3_5MoeForConditionalGeneration") => Ok(EngineEnum::Fused4bit),
+            ("Fused4bit", "Qwen3_5MoeForConditionalGeneration_Stripped") => Ok(EngineEnum::Fused4bitStripped),
+            ("Fused4bitExp1", "Qwen3_5MoeForConditionalGeneration") => Ok(EngineEnum::Fused4bitExp1),
+            ("Fused4bitExp1", "Qwen3_5MoeForConditionalGeneration_Stripped") => Ok(EngineEnum::Fused4bitExp1Stripped),
+            ("Fused4bitExp2", "Qwen3_5MoeForConditionalGeneration") => Ok(EngineEnum::Fused4bitExp2),
+            ("Fused4bitExp2", "Qwen3_5MoeForConditionalGeneration_Stripped") => Ok(EngineEnum::Fused4bitExp2Stripped),
+            ("Fused4bitExp3", "Qwen3_5MoeForConditionalGeneration") => Ok(EngineEnum::Fused4bitExp3),
+            ("Fused4bitExp3", "Qwen3_5MoeForConditionalGeneration_Stripped") => Ok(EngineEnum::Fused4bitExp3Stripped),
+            _ => Err(MoEError::Config(format!(
+                "Unknown engine: engine_type={:?}, arch={:?}", engine_type, arch
+            ))),
+        }
+    }
+
     /// Initialize GPU resources (Metal context, weight buffer, expert buffer)
     /// for this engine type on the given model.
     pub fn init_gpu(

@@ -101,19 +101,13 @@ impl Engine {
     #[new]
     #[pyo3(signature = (model, pipeline_mode="Fused4bit", k=0))]
     fn new(model: &Model, pipeline_mode: &str, k: usize) -> PyResult<Self> {
-        let engine_type = match pipeline_mode {
-            "Fused4bit" => EngineEnum::Fused4bit,
-            "Fused4bitStripped" => EngineEnum::Fused4bitStripped,
-            "Fused4bitExp1" => EngineEnum::Fused4bitExp1,
-            "Fused4bitExp1Stripped" => EngineEnum::Fused4bitExp1Stripped,
-            "Fused4bitExp2" => EngineEnum::Fused4bitExp2,
-            "Fused4bitExp2Stripped" => EngineEnum::Fused4bitExp2Stripped,
-            "Fused4bitExp3" => EngineEnum::Fused4bitExp3,
-            "Fused4bitExp3Stripped" => EngineEnum::Fused4bitExp3Stripped,
-            _ => return Err(pyo3::exceptions::PyValueError::new_err(format!(
-                "Unknown pipeline_mode: {}. Use Fused4bit|Fused4bitStripped|Fused4bitExp1|Fused4bitExp1Stripped|Fused4bitExp2|Fused4bitExp2Stripped|Fused4bitExp3|Fused4bitExp3Stripped", pipeline_mode
-            ))),
-        };
+        let arch = model.inner.config.resolve("architectures")
+            .and_then(|v| v.as_array())
+            .and_then(|arr| arr.first())
+            .and_then(|v| v.as_str())
+            .unwrap_or_default();
+        let engine_type = EngineEnum::resolve(pipeline_mode, &arch)
+            .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))?;
 
         let (ctx, weight_buffer, expert_buffer) = engine_type.init_gpu(&model.inner, k)
             .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))?;

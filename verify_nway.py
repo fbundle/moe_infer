@@ -11,7 +11,7 @@ MLX_MODEL_DIR = os.path.join(ROOT, "hub", "models--mlx-community--Qwen3.6-35B-A3
 
 from helpers.avail_models import ACTIVE_ENGINES
 
-RUST_ENGINES = [f"{e}Stripped" for e in ACTIVE_ENGINES]
+RUST_ENGINES = ACTIVE_ENGINES  # "Stripped" suffix auto-selected from model architecture
 ENGINES = RUST_ENGINES + ["C", "mlx-lm"]
 
 C_DIR = os.path.join(ROOT, "moe_infer_c")
