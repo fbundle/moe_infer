@@ -10,7 +10,8 @@ use crate::cache::Cache as CoreCache;
 use crate::model::Model as CoreModel;
 use crate::error::MoEError;
 use crate::engine::{SignalCheckFn, TelemetryValue, set_record_telemetry, EngineEnum, DynEngine};
-use crate::engine::qwen35_moe::metal_context::{ExpertBuffer, WeightBuffer, MetalContext};
+use crate::engine::qwen35_moe::metal_context::{ExpertBuffer, WeightBuffer};
+use crate::engine::qwen35_moe::Qwen35MoEMetalContext;
 
 // ─── Module-level functions ──────────────────────────────────────────────────
 
@@ -87,7 +88,7 @@ impl Cache {
 pub struct Engine {
     engine: Option<DynEngine>,
     model: Arc<CoreModel>,
-    ctx: MetalContext,
+    ctx: Qwen35MoEMetalContext,
     weight_buffer: WeightBuffer,
     expert_buffer: Option<ExpertBuffer>,
     engine_type: EngineEnum,
@@ -99,18 +100,11 @@ pub struct Engine {
 #[pymethods]
 impl Engine {
     #[new]
-    #[pyo3(signature = (model, pipeline_mode="Fused4bit", k=0))]
+    #[pyo3(signature = (model, pipeline_mode="Qwen35MoEFused4bit", k=0))]
     fn new(model: &Model, pipeline_mode: &str, k: usize) -> PyResult<Self> {
-        let arch = model.inner.config.resolve("architectures")
-            .and_then(|v| v.as_array())
-            .and_then(|arr| arr.first())
-            .and_then(|v| v.as_str())
-            .unwrap_or_default();
-        let engine_type = EngineEnum::resolve(pipeline_mode, &arch)
-            .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))?;
-
-        let (ctx, weight_buffer, expert_buffer) = engine_type.init_gpu(&model.inner, k)
-            .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))?;
+        let (engine_type, ctx, weight_buffer, expert_buffer) =
+            EngineEnum::resolve_and_init(pipeline_mode, &model.inner, k)
+                .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))?;
 
         Ok(Engine {
             engine: None,

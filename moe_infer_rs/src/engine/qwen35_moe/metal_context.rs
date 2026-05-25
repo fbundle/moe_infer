@@ -376,6 +376,44 @@ impl MetalContext {
     }
 }
 
+impl MetalContext {
+    /// One-shot initialization: create MetalContext, init buffers, wrap weight file.
+    /// Returns (ctx, weight_buffer, expert_buffer) ready for engine construction.
+    pub fn init_gpu<C: super::constants::ModelConfig>(
+        weight_file: &WeightFile,
+        k: usize,
+        label: &str,
+    ) -> Result<(Self, WeightBuffer, ExpertBuffer), MoEError> {
+        let k = if k == 0 { C::NUM_EXPERTS_PER_TOK } else { k };
+        if k > C::NUM_EXPERTS_PER_TOK {
+            return Err(MoEError::Config(format!(
+                "k ({}) must not exceed model's num_experts_per_tok ({})", k, C::NUM_EXPERTS_PER_TOK
+            )));
+        }
+
+        let mut ctx = Self::init()?;
+        ctx.init_linear_attn_buffers(
+            C::NUM_LINEAR_LAYERS, C::LINEAR_CONV_DIM, C::LINEAR_NUM_V_HEADS,
+            C::LINEAR_TOTAL_VALUE, C::LINEAR_KEY_DIM, C::LINEAR_VALUE_DIM,
+            C::HIDDEN_DIM, C::NUM_EXPERTS, C::SHARED_INTERMEDIATE,
+            C::NUM_FULL_ATTN_LAYERS, C::KV_DIM,
+            C::NUM_ATTN_HEADS, C::HEAD_DIM,
+            C::NUM_ATTN_HEADS * 2 * C::HEAD_DIM,
+        );
+        let expert_buffer = ctx.init_expert_buffers(
+            C::EXPERT_SIZE_4BIT, C::HIDDEN_DIM, C::MOE_INTERMEDIATE, C::SHARED_INTERMEDIATE,
+        );
+        let weight_buffer = WeightBuffer::new(&ctx.device, weight_file);
+
+        eprintln!(
+            "[engine] {} layers hidden={} experts={} mode={}",
+            C::NUM_LAYERS, C::HIDDEN_DIM, C::NUM_EXPERTS, label
+        );
+
+        Ok((ctx, weight_buffer, expert_buffer))
+    }
+}
+
 /// Embed the shaders.metal source at compile time.
 const SHADER_SOURCE: &str = include_str!("shaders.metal");
 

@@ -15,17 +15,23 @@ pub mod metal_context;
 #[path = "qwen35_moe/metal_kernels.rs"]
 pub mod metal_kernels;
 
+pub use metal_context::MetalContext as Qwen35MoEMetalContext;
+
 pub use constants::{ModelConfig, FullModel, StrippedModel};
+pub use constants::{ModelConfig as Qwen35MoEModelConfig, FullModel as Qwen35MoEFullModel, StrippedModel as Qwen35MoEStrippedModel};
+
 pub use cpu::CpuEngine;
+pub use cpu::CpuEngine as Qwen35MoECpuEngine;
 pub use fused_4bit::Fused4bit;
+pub use fused_4bit::Fused4bit as Qwen35MoEFused4bit;
 pub use fused_4bit_exp1::Fused4bitExp1;
+pub use fused_4bit_exp1::Fused4bitExp1 as Qwen35MoEFused4bitExp1;
 pub use fused_4bit_exp2::Fused4bitExp2;
+pub use fused_4bit_exp2::Fused4bitExp2 as Qwen35MoEFused4bitExp2;
 pub use fused_4bit_exp3::Fused4bitExp3;
+pub use fused_4bit_exp3::Fused4bitExp3 as Qwen35MoEFused4bitExp3;
 
-/// Type alias for stripped model variant.
-pub type Fused4bitStripped<'a> = Fused4bit<'a, StrippedModel>;
-
-/// Type alias for experimental stripped model variants.
-pub type Fused4bitExp1Stripped<'a> = Fused4bitExp1<'a, StrippedModel>;
-pub type Fused4bitExp2Stripped<'a> = Fused4bitExp2<'a, StrippedModel>;
-pub type Fused4bitExp3Stripped<'a> = Fused4bitExp3<'a, StrippedModel>;
+pub type Qwen35MoEFused4bitStripped<'a> = Fused4bit<'a, StrippedModel>;
+pub type Qwen35MoEFused4bitExp1Stripped<'a> = Fused4bitExp1<'a, StrippedModel>;
+pub type Qwen35MoEFused4bitExp2Stripped<'a> = Fused4bitExp2<'a, StrippedModel>;
+pub type Qwen35MoEFused4bitExp3Stripped<'a> = Fused4bitExp3<'a, StrippedModel>;
