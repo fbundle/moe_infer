@@ -181,6 +181,8 @@ pub struct MetalContext {
     pub sigmoid_gate: Option<ComputePipelineState>,
     pub moe_combine_residual: Option<ComputePipelineState>,
     pub attn_sdpa_fused: Option<ComputePipelineState>,        // fused online-softmax SDPA
+    pub attn_sdpa_block: Option<ComputePipelineState>,       // 2-pass SDPA: block pass
+    pub attn_sdpa_reduce: Option<ComputePipelineState>,      // 2-pass SDPA: reduce pass
     pub attn_scores_batched: Option<ComputePipelineState>,
     pub attn_softmax_batched: Option<ComputePipelineState>,
     pub attn_values_batched: Option<ComputePipelineState>,
@@ -425,6 +427,8 @@ impl MetalContext {
             let sigmoid_gate = make_pipeline("sigmoid_gate").ok();
             let moe_combine_residual = make_pipeline("moe_combine_residual").ok();
             let attn_sdpa_fused = make_pipeline("attn_sdpa_fused").ok();
+            let attn_sdpa_block  = make_pipeline("attn_sdpa_block").ok();
+            let attn_sdpa_reduce = make_pipeline("attn_sdpa_reduce").ok();
             let attn_scores_batched = make_pipeline("attn_scores_batched").ok();
             let attn_softmax_batched = make_pipeline("attn_softmax_batched").ok();
             let attn_values_batched = make_pipeline("attn_values_batched").ok();
@@ -458,6 +462,8 @@ impl MetalContext {
                 sigmoid_gate,
                 moe_combine_residual,
                 attn_sdpa_fused,
+                attn_sdpa_block,
+                attn_sdpa_reduce,
                 attn_scores_batched,
                 attn_softmax_batched,
                 attn_values_batched,

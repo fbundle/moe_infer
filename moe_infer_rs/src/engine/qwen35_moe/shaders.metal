@@ -1056,7 +1056,224 @@ kernel void attn_sdpa_fused(
 
 
 // ============================================================================
-// Kernel 6b: Batched GPU attention scores (Q @ K^T, scaled) — all heads at once
+// Kernel 6a: Fused SDPA — block pass (KV-sequence tiled into 32-pos blocks)
+// ============================================================================
+//
+// One threadgroup per (query head, KV block).  The KV sequence is split into
+// blocks of 32 positions; each TG processes one block with online softmax,
+// then writes partial results (max, sum, output[HEAD_DIM]) to an intermediate
+// buffer.  A second reduce kernel merges across blocks per head.
+//
+// Grid: 2D [num_q, num_blocks] where num_blocks = (seq_len + 31) / 32.
+// TG:   256 threads (8 SIMD groups x 32 lanes).
+
+kernel void attn_sdpa_block(
+    device const float* Q          [[buffer(0)]],   // [num_heads, HEAD_DIM]
+    device const float* K_cache    [[buffer(1)]],   // [max_seq, KV_DIM]
+    device const float* V_cache    [[buffer(2)]],   // [max_seq, KV_DIM]
+    device float*       partials   [[buffer(3)]],   // [num_q * num_blocks * stride]
+    constant uint&      seq_len    [[buffer(4)]],
+    constant uint&      num_blocks [[buffer(5)]],
+    constant float&     scale      [[buffer(6)]],
+    uint2 tid   [[threadgroup_position_in_grid]],    // (head, block)
+    uint simd_lane  [[thread_index_in_simdgroup]],
+    uint simd_group [[simdgroup_index_in_threadgroup]]
+) {
+    constexpr uint BD = 32;
+    constexpr uint BN = 8;
+    constexpr uint V  = HEAD_DIM / BD;       // 8
+    constexpr uint STRIDE = 2 + HEAD_DIM;     // max, sum + 256 output = 258
+
+    uint h     = tid.x;
+    uint block = tid.y;
+    uint kv_h  = h / HEADS_PER_KV;
+
+    // Range of KV positions for this block
+    uint block_start = block * 32;
+    uint block_end   = min(block_start + 32, seq_len);
+    if (block_start >= seq_len) return;
+
+    device const float* qh = Q + h * HEAD_DIM;
+    device const float* k_base = K_cache + kv_h * HEAD_DIM;
+    device const float* v_base = V_cache + kv_h * HEAD_DIM;
+
+    float q_vals[V];
+    float o_vals[V] = {0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f};
+
+    constexpr float log2_e = 1.442695041f;
+    float q_scale = scale * log2_e;
+    uint elem_base = simd_lane * V;
+    for (uint j = 0; j < V; j++) {
+        q_vals[j] = q_scale * qh[elem_base + j];
+    }
+
+    float max_score = -1e30f;
+    float sum_exp   = 0.0f;
+
+    // KV loop over this block — each SIMD group handles strided positions
+    for (uint pos = block_start + simd_group; pos < block_end; pos += BN) {
+        device const float* kp = k_base + pos * KV_DIM + elem_base;
+        device const float* vp = v_base + pos * KV_DIM + elem_base;
+
+        float score = 0.0f;
+        for (uint j = 0; j < V; j++) {
+            score += q_vals[j] * kp[j];
+        }
+        score = simd_sum(score);
+
+        float new_max   = max(max_score, score);
+        float factor    = fast::exp2(max_score - new_max);
+        float exp_score = fast::exp2(score - new_max);
+
+        max_score = new_max;
+        sum_exp   = sum_exp * factor + exp_score;
+
+        for (uint j = 0; j < V; j++) {
+            o_vals[j] = o_vals[j] * factor + exp_score * vp[j];
+        }
+    }
+
+    // ── Merge across SIMD groups within the TG ──
+    threadgroup float sg_max[BD];
+    threadgroup float sg_sum[BN];
+    threadgroup float sg_partial[BN * BD * V];  // 8 * 256 = 2048
+
+    sg_max[simd_lane] = -1e30f;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    if (simd_lane == 0) {
+        sg_max[simd_group] = max_score;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    float local_max  = sg_max[simd_lane];
+    float global_max = simd_max(local_max);
+
+    float group_max    = simd_broadcast_first(max_score);
+    float group_sum    = simd_broadcast_first(sum_exp);
+    float rescale      = fast::exp2(group_max - global_max);
+    float rescaled_sum = group_sum * rescale;
+
+    for (uint j = 0; j < V; j++) {
+        o_vals[j] *= rescale;
+    }
+
+    for (uint j = 0; j < V; j++) {
+        sg_partial[simd_group * HEAD_DIM + elem_base + j] = o_vals[j];
+    }
+    if (simd_lane == 0) {
+        sg_sum[simd_group] = rescaled_sum;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    for (uint j = 0; j < V; j++) {
+        float sum = 0.0f;
+        for (uint g = 0; g < BN; g++) {
+            sum += sg_partial[g * HEAD_DIM + elem_base + j];
+        }
+        o_vals[j] = sum;
+    }
+
+    float local_sum  = (simd_lane < BN) ? sg_sum[simd_lane] : 0.0f;
+    float tg_sum     = simd_sum(local_sum);
+
+    // Write partial results: {max, sum, output[HEAD_DIM]}
+    uint p_base = (h * num_blocks + block) * STRIDE;
+    if (simd_lane == 0 && simd_group == 0) {
+        partials[p_base]     = global_max;
+        partials[p_base + 1] = tg_sum;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint j = 0; j < V; j++) {
+        partials[p_base + 2 + elem_base + j] = o_vals[j];
+    }
+}
+
+
+// ============================================================================
+// Kernel 6b: Fused SDPA — reduce pass (merge block partials per head)
+// ============================================================================
+//
+// One threadgroup per query head.  Reads block-pass partials, finds the global
+// max across all blocks, rescales each block's output, sums them, normalizes,
+// and writes the final attention output.
+//
+// Grid: 1D [num_q, 1].
+// TG:   256 threads (8 SIMD groups x 32 lanes).
+
+kernel void attn_sdpa_reduce(
+    device const float* partials   [[buffer(0)]],   // [num_q * num_blocks * stride]
+    device float*       output     [[buffer(1)]],   // [num_q, HEAD_DIM]
+    constant uint&      num_blocks [[buffer(2)]],
+    uint tgid   [[threadgroup_position_in_grid]],
+    uint simd_lane  [[thread_index_in_simdgroup]],
+    uint simd_group [[simdgroup_index_in_threadgroup]]
+) {
+    constexpr uint BD = 32;
+    constexpr uint BN = 8;
+    constexpr uint V  = HEAD_DIM / BD;       // 8
+    constexpr uint STRIDE = 2 + HEAD_DIM;     // 258
+
+    uint h = tgid;
+    uint elem_base = simd_lane * V;
+
+    // Pass 1: find global max across all blocks
+    float global_max = -1e30f;
+    for (uint b = simd_group * BD + simd_lane; b < num_blocks; b += BN * BD) {
+        float b_max = partials[(h * num_blocks + b) * STRIDE];
+        global_max = max(global_max, b_max);
+    }
+    float simd_global = simd_max(global_max);
+    // Reduce across SIMD groups
+    threadgroup float tg_max[BD];
+    tg_max[simd_lane] = -1e30f;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    tg_max[simd_group] = simd_global;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    global_max = simd_max(tg_max[simd_lane]);
+
+    // Pass 2: rescale and sum block partials
+    float o_vals[V] = {0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f};
+    float global_sum = 0.0f;
+
+    for (uint b = simd_group; b < num_blocks; b += BN) {
+        uint p_base = (h * num_blocks + b) * STRIDE;
+        float b_max = partials[p_base];
+        float b_sum = partials[p_base + 1];
+
+        float rescale = fast::exp2(b_max - global_max);
+        global_sum += b_sum * rescale;
+
+        for (uint j = 0; j < V; j++) {
+            o_vals[j] += partials[p_base + 2 + elem_base + j] * rescale;
+        }
+    }
+
+    // Sum global_sum across SIMD groups via shared memory.
+    // All lanes in a SIMD group processed the same blocks, so global_sum
+    // is identical across lanes — no simd_sum needed for per-group sum.
+    threadgroup float tg_sum[BN];
+    if (simd_lane == 0) {
+        tg_sum[simd_group] = global_sum;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    float lane_sum = (simd_lane < BN) ? tg_sum[simd_lane] : 0.0f;
+    global_sum = simd_sum(lane_sum);
+
+    // Normalize and write
+    for (uint j = 0; j < V; j++) {
+        o_vals[j] = (global_sum == 0.0f) ? 0.0f : (o_vals[j] / global_sum);
+    }
+
+    device float* out_ptr = output + h * HEAD_DIM + elem_base;
+    for (uint j = 0; j < V; j++) {
+        out_ptr[j] = o_vals[j];
+    }
+}
+
+
+// ============================================================================
+// Kernel 6c: Batched GPU attention scores (Q @ K^T, scaled) — all heads at once
 // ============================================================================
 //
 // Computes scores[h, p] = sum_d(Q[h, d] * K[p, kv_h*head_dim + d]) * scale
