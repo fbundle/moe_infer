@@ -579,7 +579,11 @@ fn encode_pre_expert_full(
 
     // ── 2-pass Fused SDPA (block + reduce) ──
     {
-        let num_blocks: u32 = (seq_len as u32 + 31) / 32;
+        // Block size = 32 (matches SIMD width BD).  Smaller blocks → more TGs,
+        // better occupancy on GPUs with many cores.  Larger blocks (64, 128) → fewer
+        // TGs, less reduce overhead, better for weaker GPUs or short sequences.
+        // Must be a multiple of 32 (SIMD width) for lane-parallel score reduction.
+        let num_blocks: u32 = (seq_len as u32 + 31) / 32;  // ceil(seq_len / 32)
         let stride: usize = 2 + head_dim;  // max, sum + output
 
         // Allocate partials buffer: [num_q * num_blocks * stride] f32
