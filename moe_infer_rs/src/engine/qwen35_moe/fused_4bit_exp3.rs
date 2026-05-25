@@ -12,6 +12,8 @@ use crate::constants::{MAX_SEQ, RMS_NORM_EPS, FULL_ATTN_INTERVAL, GROUP_SIZE};
 use std::collections::BTreeMap;
 use std::marker::PhantomData;
 use std::ffi::c_void;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Instant;
 
 use metal::{Buffer, CommandBuffer, ComputeCommandEncoderRef, MTLSize};
@@ -78,6 +80,8 @@ struct ExecCtx<'b, 'a, C: ModelConfig> {
     pending: Option<DeferredExperts>,
     /// Spare expert info from the previous layer — loaded while GPU runs op1.
     pending_spare: Option<SpareInfo>,
+    /// Active spare-read thread with cancel flag (at most one at a time).
+    spare_thread: Option<(Arc<AtomicBool>, std::thread::JoinHandle<()>)>,
 }
 
 impl<'b, 'a, C: ModelConfig> ExecCtx<'b, 'a, C> {
@@ -144,8 +148,9 @@ impl<'b, 'a, C: ModelConfig> ExecCtx<'b, 'a, C> {
             }
         }
 
-        // Wait for GPU to finish
+        // Wait for GPU to finish, then cancel any still-running spare reads
         cmd.wait_until_completed();
+        self.stop_spare_reads();
         drop(keep_alive);
         self.pending = None;
 
@@ -352,15 +357,15 @@ impl<'b, 'a, C: ModelConfig> ExecCtx<'b, 'a, C> {
     /// cache buffers.  These reads overlap with the GPU running op2 for this
     /// layer.  Errors are silently ignored (best-effort prefetch).
 
-    fn spawn_spare_reads(&self, layer: usize, spare_info: &SpareInfo) {
+    fn spawn_spare_reads(&mut self, layer: usize, spare_info: &SpareInfo) {
         if spare_info.miss_indices.is_empty() {
             return;
         }
 
-        // Raw pointer to ExpertFile is safe because the model (and its expert files)
-        // live for 'a which outlives the engine and any spawned threads.
         let ef_addr = &self.engine.model.expert_files[layer] as *const _ as usize;
         let expert_size = self.engine.model.expert_files[layer].expert_size();
+        let cancel = Arc::new(AtomicBool::new(false));
+        let cancel_flag = cancel.clone();
 
         let mut reads: Vec<(usize, usize)> = Vec::with_capacity(spare_info.miss_indices.len());
         for i in 0..spare_info.miss_indices.len() {
@@ -370,16 +375,28 @@ impl<'b, 'a, C: ModelConfig> ExecCtx<'b, 'a, C> {
             ));
         }
 
-        std::thread::spawn(move || {
-            // SAFETY: ef_addr was derived from a &'a ExpertFile. The model
-            // outlives the engine, so this pointer remains valid for the
-            // lifetime of this background thread.
+        let handle = std::thread::spawn(move || {
             let ef: &crate::model::ExpertFileType = unsafe { &*(ef_addr as *const _) };
             for (eidx, ptr_u) in &reads {
+                if cancel_flag.load(Ordering::Relaxed) {
+                    break;
+                }
                 let dst = unsafe { std::slice::from_raw_parts_mut(*ptr_u as *mut u8, expert_size) };
                 ef.read_expert(*eidx, dst).ok();
             }
         });
+        // Replace any previous spare thread (should already be stopped)
+        self.stop_spare_reads();
+        self.spare_thread = Some((cancel, handle));
+    }
+
+    /// Signal the outstanding spare-read thread to stop, then detach it.
+    /// Does NOT block — the thread exits on its next loop iteration.
+    fn stop_spare_reads(&mut self) {
+        if let Some((cancel, _handle)) = self.spare_thread.take() {
+            cancel.store(true, Ordering::Relaxed);
+            // handle dropped → thread detached, finishes on its own
+        }
     }
 
     // ── Commit final pending work & read hidden from GPU ──────────────────
@@ -956,6 +973,7 @@ impl<'a, C: ModelConfig> Fused4bitExp3<'a, C> {
             get("num_kv_heads"), get("head_dim"), get("vocab_size"),
             get("linear_num_v_heads"), get("linear_num_k_heads"),
             get("linear_total_key"), get("linear_total_value"),
+            c.get_str("architectures").unwrap_or(""),
         ).map_err(MoEError::Config)?;
         let k = if k == 0 { C::NUM_EXPERTS_PER_TOK } else { k };
         Ok(Fused4bitExp3 {
@@ -1001,6 +1019,7 @@ impl<'a, C: ModelConfig> Engine for Fused4bitExp3<'a, C> {
                 engine: self,
                 pending: None,
                 pending_spare: None,
+                spare_thread: None,
             };
 
             let mut embed = vec![0.0f32; n_tokens * hidden_dim];

@@ -52,6 +52,7 @@ pub trait ModelConfig: 'static {
     const DOWN_W_SIZE: usize;
     const DOWN_S_SIZE: usize;
     const DOWN_B_SIZE: usize;
+    const EXPECTED_ARCHITECTURE: &'static str;
 
     fn validate_config(hidden_dim: usize, num_layers: usize, num_experts: usize,
                        num_experts_per_tok: usize, moe_intermediate: usize,
@@ -59,8 +60,16 @@ pub trait ModelConfig: 'static {
                        num_kv_heads: usize, head_dim: usize, vocab_size: usize,
                        linear_num_v_heads: usize, linear_num_k_heads: usize,
                        linear_total_key: usize, linear_total_value: usize,
+                       architectures_str: &str,
     ) -> Result<(), String> {
         let mut errs = Vec::new();
+        if !architectures_str.is_empty()
+            && !architectures_str.split(',').any(|a| a.trim() == Self::EXPECTED_ARCHITECTURE)
+        {
+            errs.push(format!(
+                "architecture mismatch: config={:?}, expected=\"{}\"",
+                architectures_str, Self::EXPECTED_ARCHITECTURE));
+        }
         if hidden_dim != Self::HIDDEN_DIM { errs.push(format!("hidden_dim: config={}, const={}", hidden_dim, Self::HIDDEN_DIM)); }
         if num_layers != Self::NUM_LAYERS { errs.push(format!("num_layers: config={}, const={}", num_layers, Self::NUM_LAYERS)); }
         if num_experts != Self::NUM_EXPERTS { errs.push(format!("num_experts: config={}, const={}", num_experts, Self::NUM_EXPERTS)); }
@@ -177,6 +186,7 @@ impl ModelConfig for FullModel {
     const DOWN_W_SIZE: usize = L.down_w_size;
     const DOWN_S_SIZE: usize = L.down_s_size;
     const DOWN_B_SIZE: usize = L.down_b_size;
+    const EXPECTED_ARCHITECTURE: &'static str = "Qwen3_5MoeForConditionalGeneration";
 }
 
 /// Stripped model: 4 layers, 4 experts, 4 experts-per-tok (test model).
@@ -225,4 +235,5 @@ impl ModelConfig for StrippedModel {
     const DOWN_W_SIZE: usize = L.down_w_size;
     const DOWN_S_SIZE: usize = L.down_s_size;
     const DOWN_B_SIZE: usize = L.down_b_size;
+    const EXPECTED_ARCHITECTURE: &'static str = "Qwen3_5MoeForConditionalGeneration_Stripped";
 }

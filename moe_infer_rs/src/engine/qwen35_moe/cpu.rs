@@ -74,6 +74,7 @@ impl<'a, C: ModelConfig> CpuEngine<'a, C> {
             get("num_kv_heads"), get("head_dim"), get("vocab_size"),
             get("linear_num_v_heads"), get("linear_num_k_heads"),
             get("linear_total_key"), get("linear_total_value"),
+            c.get_str("architectures").unwrap_or(""),
         ).map_err(MoEError::Config)?;
         let k = if k == 0 { C::NUM_EXPERTS_PER_TOK } else { k };
         let cache = RefCell::new(Cache::new(c));

@@ -2,7 +2,7 @@ use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use crate::cache::Cache;
-use crate::constants::{qwen35_35b, qwen35_35b_stripped};
+use crate::engine::qwen35_moe::constants::{FullModel, StrippedModel, ModelConfig};
 use crate::error::MoEError;
 use crate::engine::qwen35_moe::metal_context::{WeightBuffer, MetalContext, ExpertBuffer};
 use crate::model::Model;
@@ -81,25 +81,25 @@ impl EngineEnum {
              hidden_dim, shared_intermediate, moe_intermediate, expert_size_4bit,
              num_full_attn_layers, kv_dim, num_attn_heads, head_dim) =
             if is_stripped {
-                (qwen35_35b_stripped::NUM_LAYERS, qwen35_35b_stripped::NUM_EXPERTS, qwen35_35b_stripped::NUM_EXPERTS_PER_TOK,
-                 qwen35_35b_stripped::NUM_LINEAR_LAYERS, qwen35_35b_stripped::LINEAR_CONV_DIM,
-                 qwen35_35b_stripped::LINEAR_NUM_V_HEADS, qwen35_35b_stripped::LINEAR_TOTAL_VALUE,
-                 qwen35_35b_stripped::LINEAR_KEY_DIM, qwen35_35b_stripped::LINEAR_VALUE_DIM,
-                 qwen35_35b_stripped::HIDDEN_DIM, qwen35_35b_stripped::SHARED_INTERMEDIATE,
-                 qwen35_35b_stripped::MOE_INTERMEDIATE, qwen35_35b_stripped::EXPERT_SIZE_4BIT,
-                 qwen35_35b_stripped::NUM_FULL_ATTN_LAYERS,
-                 qwen35_35b_stripped::NUM_KV_HEADS * qwen35_35b_stripped::HEAD_DIM,
-                 qwen35_35b_stripped::NUM_ATTN_HEADS, qwen35_35b_stripped::HEAD_DIM)
+                (StrippedModel::NUM_LAYERS, StrippedModel::NUM_EXPERTS, StrippedModel::NUM_EXPERTS_PER_TOK,
+                 StrippedModel::NUM_LINEAR_LAYERS, StrippedModel::LINEAR_CONV_DIM,
+                 StrippedModel::LINEAR_NUM_V_HEADS, StrippedModel::LINEAR_TOTAL_VALUE,
+                 StrippedModel::LINEAR_KEY_DIM, StrippedModel::LINEAR_VALUE_DIM,
+                 StrippedModel::HIDDEN_DIM, StrippedModel::SHARED_INTERMEDIATE,
+                 StrippedModel::MOE_INTERMEDIATE, StrippedModel::EXPERT_SIZE_4BIT,
+                 StrippedModel::NUM_FULL_ATTN_LAYERS,
+                 StrippedModel::NUM_KV_HEADS * StrippedModel::HEAD_DIM,
+                 StrippedModel::NUM_ATTN_HEADS, StrippedModel::HEAD_DIM)
             } else {
-                (qwen35_35b::NUM_LAYERS, qwen35_35b::NUM_EXPERTS, qwen35_35b::NUM_EXPERTS_PER_TOK,
-                 qwen35_35b::NUM_LINEAR_LAYERS, qwen35_35b::LINEAR_CONV_DIM,
-                 qwen35_35b::LINEAR_NUM_V_HEADS, qwen35_35b::LINEAR_TOTAL_VALUE,
-                 qwen35_35b::LINEAR_KEY_DIM, qwen35_35b::LINEAR_VALUE_DIM,
-                 qwen35_35b::HIDDEN_DIM, qwen35_35b::SHARED_INTERMEDIATE,
-                 qwen35_35b::MOE_INTERMEDIATE, qwen35_35b::EXPERT_SIZE_4BIT,
-                 qwen35_35b::NUM_FULL_ATTN_LAYERS,
-                 qwen35_35b::NUM_KV_HEADS * qwen35_35b::HEAD_DIM,
-                 qwen35_35b::NUM_ATTN_HEADS, qwen35_35b::HEAD_DIM)
+                (FullModel::NUM_LAYERS, FullModel::NUM_EXPERTS, FullModel::NUM_EXPERTS_PER_TOK,
+                 FullModel::NUM_LINEAR_LAYERS, FullModel::LINEAR_CONV_DIM,
+                 FullModel::LINEAR_NUM_V_HEADS, FullModel::LINEAR_TOTAL_VALUE,
+                 FullModel::LINEAR_KEY_DIM, FullModel::LINEAR_VALUE_DIM,
+                 FullModel::HIDDEN_DIM, FullModel::SHARED_INTERMEDIATE,
+                 FullModel::MOE_INTERMEDIATE, FullModel::EXPERT_SIZE_4BIT,
+                 FullModel::NUM_FULL_ATTN_LAYERS,
+                 FullModel::NUM_KV_HEADS * FullModel::HEAD_DIM,
+                 FullModel::NUM_ATTN_HEADS, FullModel::HEAD_DIM)
             };
 
         let k = if k == 0 { num_experts_per_tok } else { k };
@@ -134,7 +134,7 @@ impl EngineEnum {
 
 // ─── Type-erased engine ─────────────────────────────────────────────────────
 
-use qwen35_moe::{FullModel, StrippedModel, Fused4bit, Fused4bitExp1, Fused4bitExp2, Fused4bitExp3};
+use qwen35_moe::{Fused4bit, Fused4bitExp1, Fused4bitExp2, Fused4bitExp3};
 
 /// Type-erased engine holding one of the engine variants.
 pub enum DynEngine {

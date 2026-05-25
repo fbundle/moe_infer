@@ -89,11 +89,86 @@ fn layout_to_json(hd: usize, mi: usize, gs: usize) -> serde_json::Map<String, se
     }).as_object().unwrap().clone()
 }
 
-// ─── Loader ──────────────────────────────────────────────────────────────
+// ─── Derived field computation ───────────────────────────────────────────
 
-fn val_usize(v: &serde_json::Value, key: &str) -> usize {
-    v.get(key).and_then(|x| x.as_u64()).unwrap_or(0) as usize
+fn add_derived_fields(root: &serde_json::Value, data: &mut serde_json::Map<String, serde_json::Value>) {
+    let hd = data.get("hidden_size").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
+    let mi = data.get("moe_intermediate_size").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
+    let num_layers = data.get("num_hidden_layers").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
+    let num_kv_heads = data.get("num_key_value_heads").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
+    let head_dim = data.get("head_dim").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
+    let lnum_k = data.get("linear_num_key_heads").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
+    let lnum_v = data.get("linear_num_value_heads").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
+    let lkey_dim = data.get("linear_key_head_dim").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
+    let lval_dim = data.get("linear_value_head_dim").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
+    let fa_interval = data.get("full_attention_interval").and_then(|v| v.as_u64()).unwrap_or(4) as usize;
+    let rope_theta = root.get("rope_parameters")
+        .and_then(|r| r.get("rope_theta"))
+        .and_then(|x| x.as_f64())
+        .unwrap_or(10000.0);
+    let partial_rotary = root.get("rope_parameters")
+        .and_then(|r| r.get("partial_rotary_factor"))
+        .and_then(|x| x.as_f64())
+        .unwrap_or(0.25) as f32;
+    let rotary_dim = (head_dim as f32 * partial_rotary) as usize;
+
+    let linear_total_key = lnum_k * lkey_dim;
+    let linear_total_value = lnum_v * lval_dim;
+    let linear_conv_dim = linear_total_key * 2 + linear_total_value;
+    let num_full_attn_layers = num_layers / fa_interval;
+    let num_linear_layers = num_layers - num_full_attn_layers;
+    let kv_dim = num_kv_heads * head_dim;
+
+    let layout_4bit = layout_to_json(hd, mi, GROUP_SIZE);
+    let expert_size_4bit = layout_4bit.get("down_b_off").unwrap().as_u64().unwrap() as usize
+        + layout_4bit.get("down_b_size").unwrap().as_u64().unwrap() as usize;
+    let layout_2bit = layout_to_json(hd, mi, GROUP_SIZE);
+    let expert_size_2bit = layout_2bit.get("down_b_off").unwrap().as_u64().unwrap() as usize
+        + layout_2bit.get("down_b_size").unwrap().as_u64().unwrap() as usize;
+
+    let extras = serde_json::json!({
+        "linear_total_key": linear_total_key,
+        "linear_total_value": linear_total_value,
+        "linear_conv_dim": linear_conv_dim,
+        "num_full_attn_layers": num_full_attn_layers,
+        "num_linear_layers": num_linear_layers,
+        "rotary_dim": rotary_dim,
+        "rope_theta": rope_theta,
+        "kv_dim": kv_dim,
+        "expert_size_4bit": expert_size_4bit,
+        "expert_size_2bit": expert_size_2bit,
+        "expert_layout_4bit": layout_4bit,
+        "expert_layout_2bit": layout_2bit,
+        "group_size": GROUP_SIZE,
+        "bits": 4,
+    });
+    if let Some(obj) = extras.as_object() {
+        for (k, v) in obj {
+            data.insert(k.clone(), v.clone());
+        }
+    }
+
+    // Backward-compat aliases (normalized names → raw JSON names)
+    let aliases: &[(&str, &str)] = &[
+        ("hidden_dim", "hidden_size"),
+        ("num_layers", "num_hidden_layers"),
+        ("moe_intermediate", "moe_intermediate_size"),
+        ("shared_intermediate", "shared_expert_intermediate_size"),
+        ("num_attn_heads", "num_attention_heads"),
+        ("num_kv_heads", "num_key_value_heads"),
+        ("linear_num_v_heads", "linear_num_value_heads"),
+        ("linear_num_k_heads", "linear_num_key_heads"),
+        ("linear_key_dim", "linear_key_head_dim"),
+        ("linear_value_dim", "linear_value_head_dim"),
+    ];
+    for (alias, raw) in aliases {
+        if let Some(v) = data.get(*raw) {
+            data.insert(alias.to_string(), v.clone());
+        }
+    }
 }
+
+// ─── Loader ──────────────────────────────────────────────────────────────
 
 /// Load model configuration from an HF config.json file.
 pub fn load_model_config(model_path: &Path) -> anyhow::Result<ModelConfig> {
@@ -101,82 +176,21 @@ pub fn load_model_config(model_path: &Path) -> anyhow::Result<ModelConfig> {
     let content = std::fs::read_to_string(&config_path)?;
     let root: serde_json::Value = serde_json::from_str(&content)?;
 
-    // Handle optional text_config wrapper (multimodal models)
+    // Resolve text_config
     let tc = root.get("text_config").unwrap_or(&root);
+    let mut data = tc.as_object().cloned().unwrap_or_default();
 
-    let hidden_dim = val_usize(tc, "hidden_size");
-    let num_layers = val_usize(tc, "num_hidden_layers");
-    let num_attn_heads = val_usize(tc, "num_attention_heads");
-    let num_kv_heads = val_usize(tc, "num_key_value_heads");
-    let head_dim = val_usize(tc, "head_dim");
-    let vocab_size = val_usize(tc, "vocab_size");
-    let num_experts = val_usize(tc, "num_experts");
-    let num_experts_per_tok = val_usize(tc, "num_experts_per_tok");
-    let moe_intermediate = val_usize(tc, "moe_intermediate_size");
-    let shared_intermediate = val_usize(tc, "shared_expert_intermediate_size");
-    let linear_num_v_heads = val_usize(tc, "linear_num_value_heads");
-    let linear_num_k_heads = val_usize(tc, "linear_num_key_heads");
-    let linear_key_dim = val_usize(tc, "linear_key_head_dim");
-    let linear_value_dim = val_usize(tc, "linear_value_head_dim");
-    let full_attn_interval = val_usize(tc, "full_attention_interval");
-    if full_attn_interval == 0 { /* use default */ }
+    // Add root-level keys that aren't in text_config (architectures, etc.)
+    if let Some(root_obj) = root.as_object() {
+        for (k, v) in root_obj {
+            if k != "text_config" && !data.contains_key(k) {
+                data.insert(k.clone(), v.clone());
+            }
+        }
+    }
 
-    let fa_interval = if full_attn_interval > 0 { full_attn_interval } else { 4 };
-
-    // Rope parameters (optional)
-    let rope_theta = tc.get("rope_parameters")
-        .and_then(|r| r.get("rope_theta"))
-        .and_then(|x| x.as_f64())
-        .unwrap_or(10000.0);
-    let partial_rotary = tc.get("rope_parameters")
-        .and_then(|r| r.get("partial_rotary_factor"))
-        .and_then(|x| x.as_f64())
-        .unwrap_or(0.25) as f32;
-    let rotary_dim = (head_dim as f32 * partial_rotary) as usize;
-
-    let linear_total_key = linear_num_k_heads * linear_key_dim;
-    let linear_total_value = linear_num_v_heads * linear_value_dim;
-    let linear_conv_dim = linear_total_key * 2 + linear_total_value;
-
-    let num_full_attn_layers = num_layers / fa_interval;
-    let num_linear_layers = num_layers - num_full_attn_layers;
-
-    let layout_4bit = layout_to_json(hidden_dim, moe_intermediate, GROUP_SIZE);
-    let expert_size_4bit = layout_4bit.get("down_b_off").unwrap().as_u64().unwrap() as usize
-        + layout_4bit.get("down_b_size").unwrap().as_u64().unwrap() as usize;
-
-    let layout_2bit = layout_to_json(hidden_dim, moe_intermediate, GROUP_SIZE);
-    let expert_size_2bit = layout_2bit.get("down_b_off").unwrap().as_u64().unwrap() as usize
-        + layout_2bit.get("down_b_size").unwrap().as_u64().unwrap() as usize;
-
-    let data = serde_json::json!({
-        "hidden_dim": hidden_dim,
-        "num_layers": num_layers,
-        "num_attn_heads": num_attn_heads,
-        "num_kv_heads": num_kv_heads,
-        "head_dim": head_dim,
-        "vocab_size": vocab_size,
-        "num_experts": num_experts,
-        "num_experts_per_tok": num_experts_per_tok,
-        "moe_intermediate": moe_intermediate,
-        "shared_intermediate": shared_intermediate,
-        "linear_num_v_heads": linear_num_v_heads,
-        "linear_num_k_heads": linear_num_k_heads,
-        "rotary_dim": rotary_dim,
-        "rope_theta": rope_theta,
-        "linear_total_key": linear_total_key,
-        "linear_total_value": linear_total_value,
-        "linear_conv_dim": linear_conv_dim,
-        "num_full_attn_layers": num_full_attn_layers,
-        "num_linear_layers": num_linear_layers,
-        "expert_size_4bit": expert_size_4bit,
-        "expert_size_2bit": expert_size_2bit,
-        "expert_layout_4bit": layout_4bit,
-        "expert_layout_2bit": layout_2bit,
-        "group_size": GROUP_SIZE,
-        "bits": 4,
-        "model_path": model_path.to_string_lossy().to_string(),
-    }).as_object().unwrap().clone();
+    add_derived_fields(&root, &mut data);
+    data.insert("model_path".to_string(), model_path.to_string_lossy().to_string().into());
 
     Ok(ModelConfig { data })
 }

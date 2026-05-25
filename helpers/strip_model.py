@@ -91,6 +91,11 @@ def run(input_dir, output_dir, num_layers, num_experts):
     hidden = cfg["hidden_size"]
     moe_inter = cfg["moe_intermediate_size"]
 
+    # Validate architecture
+    archs = full_config.get("architectures", [])
+    assert "Qwen3_5MoeForConditionalGeneration" in archs, \
+        f"Expected architectures to contain 'Qwen3_5MoeForConditionalGeneration', got {archs}"
+
     print(f"Original: {full_layers} layers, {full_experts} experts, hidden={hidden}")
     print(f"Stripped: {num_layers} layers, {num_experts} experts")
 
@@ -103,6 +108,7 @@ def run(input_dir, output_dir, num_layers, num_experts):
         new_config["text_config"]["num_experts_per_tok"] = min(
             cfg.get("num_experts_per_tok", 8), num_experts
         )
+        new_config["architectures"] = ["Qwen3_5MoeForConditionalGeneration_Stripped"]
         # Update layer_types
         interval = new_config["text_config"].get("full_attention_interval", 4)
         new_config["text_config"]["layer_types"] = [
@@ -115,6 +121,7 @@ def run(input_dir, output_dir, num_layers, num_experts):
         new_config["num_experts_per_tok"] = min(
             cfg.get("num_experts_per_tok", 8), num_experts
         )
+        new_config["architectures"] = ["Qwen3_5MoeForConditionalGeneration_Stripped"]
         interval = new_config.get("full_attention_interval", 4)
         new_config["layer_types"] = [
             "full_attention" if (i + 1) % interval == 0 else "linear_attention"
