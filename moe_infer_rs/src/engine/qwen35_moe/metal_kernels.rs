@@ -72,6 +72,31 @@ pub fn encode_matvec_offset(
     }
 }
 
+/// Encode a BF16 matvec with buffer offsets (for BQ4: attention, routers, lm_head).
+pub fn encode_matvec_bf16_offset(
+    ctx: &MetalContext,
+    encoder: &ComputeCommandEncoderRef,
+    w_bf16: &BufferRef, w_offset: u64,
+    x: &BufferRef, x_offset: u64,
+    out: &BufferRef, o_offset: u64,
+    out_dim: u32,
+    in_dim: u32,
+) {
+    encoder.set_compute_pipeline_state(&ctx.matvec_bf16);
+    encoder.set_buffer(0, Some(w_bf16), w_offset);
+    encoder.set_buffer(1, Some(x), x_offset);
+    encoder.set_buffer(2, Some(out), o_offset);
+    unsafe {
+        set_u32(encoder, 3, out_dim);
+        set_u32(encoder, 4, in_dim);
+    }
+    let num_tgs = (out_dim + ROWS_PER_TG - 1) / ROWS_PER_TG;
+    encoder.dispatch_thread_groups(
+        MTLSize::new(num_tgs as u64, 1, 1),
+        MTLSize::new(TG_SIZE as u64, 1, 1),
+    );
+}
+
 // ---------------------------------------------------------------------------
 // SwiGLU
 // ---------------------------------------------------------------------------

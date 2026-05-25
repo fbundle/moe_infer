@@ -172,6 +172,7 @@ pub struct MetalContext {
     pub matvec_naive: ComputePipelineState,
     pub matvec_fast: ComputePipelineState,
     pub matvec_v3: ComputePipelineState,
+    pub matvec_bf16: ComputePipelineState,
     pub swiglu: ComputePipelineState,
     pub swiglu_vec4: Option<ComputePipelineState>,
     pub rms_norm_sum: ComputePipelineState,
@@ -453,6 +454,7 @@ impl MetalContext {
 
             let matvec_naive = make_pipeline("dequant_matvec_4bit")?;
             let matvec_v3 = make_pipeline("dequant_matvec_4bit_v3")?;
+            let matvec_bf16 = make_pipeline("matvec_bf16")?;
             let swiglu = make_pipeline("swiglu_fused")?;
             let rms_norm_sum = make_pipeline("rms_norm_sum_sq")?;
 
@@ -491,6 +493,7 @@ impl MetalContext {
                 matvec_naive,
                 matvec_fast,
                 matvec_v3: matvec_v3.clone(),
+                matvec_bf16,
                 swiglu,
                 swiglu_vec4,
                 rms_norm_sum,
@@ -683,13 +686,33 @@ impl WeightBuffer {
         out_dim: usize,
         in_dim: usize,
     ) -> bool {
-        let w_ptr = match wf.get_tensor_ptr(&format!("{}.weight", prefix)) {
+        let weight_name = format!("{}.weight", prefix);
+        let w_ptr = match wf.get_tensor_ptr(&weight_name) {
             Some(p) => p,
             None => {
                 eprintln!("[encode_matvec_into] WARNING: tensor not found: {}.weight", prefix);
                 return false;
             }
         };
+        let w_off = (w_ptr as usize - self.base as usize) as u64;
+
+        // BQ4 dispatch: check dtype to choose kernel
+        let dtype = wf.get_tensor_info(&weight_name)
+            .map(|info| info.dtype.as_str())
+            .unwrap_or("u32");
+
+        if dtype == "bf16" {
+            // Direct BF16 matvec (attention, routers, lm_head — no dequant)
+            metal_kernels::encode_matvec_bf16_offset(
+                ctx, encoder,
+                &self.buf, w_off,
+                x_buf, x_offset, out_buf, out_offset,
+                out_dim as u32, in_dim as u32,
+            );
+            return true;
+        }
+
+        // Default: INT4 dequant matvec
         let s_ptr = match wf.get_tensor_ptr(&format!("{}.scales", prefix)) {
             Some(p) => p,
             None => {
@@ -705,7 +728,6 @@ impl WeightBuffer {
             }
         };
 
-        let w_off = (w_ptr as usize - self.base as usize) as u64;
         let s_off = (s_ptr as usize - self.base as usize) as u64;
         let b_off = (b_ptr as usize - self.base as usize) as u64;
 

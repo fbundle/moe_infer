@@ -3,7 +3,7 @@
 quantize.py — Quantize HF BF16 Qwen3.5/3.6 MoE model using BQ4.
 
 Applies the BQ4 block→format classification from quant/README.md:
-  - FP16: attention projections, routers, lm_head, patch_embed.proj
+  - BF16 passthrough: attention projections, routers, lm_head, patch_embed.proj
   - wint4:  all other matrices (experts, linear attention, embeddings, etc.)
   - BF16: all metadata/auxiliary tensors (norms, scales, biases, etc.)
   - FP32: A_log scalars
@@ -41,7 +41,7 @@ from tqdm import tqdm
 class Quant(Enum):
     FP32 = "f32"
     BF16 = "bf16"
-    FP16 = "f16"
+    BF16_PASS = "bf16"
     INT4 = "u32"
 
     def __str__(self) -> str:
@@ -273,8 +273,8 @@ def load_name_mapping(mapping_path: Path, num_layers: int,
 
 # ─── BQ4 classification ──────────────────────────────────────────────────
 
-# Blocks kept in FP16 (from quant/README.md matrixTable)
-FP16_BLOCKS = {
+# Blocks kept as BF16 passthrough (no quantization)
+BF16_PASS_BLOCKS = {
     "self_attn.q_proj",
     "self_attn.k_proj",
     "self_attn.v_proj",
@@ -328,8 +328,8 @@ def bq4(mlx_name: str, shape: list[int]) -> Quant:
         if ndim != 2:               # matrix = exactly 2D
             return Quant.BF16
         block = _strip_layer_prefix(prefix)
-        if block in FP16_BLOCKS:
-            return Quant.FP16
+        if block in BF16_PASS_BLOCKS:
+            return Quant.BF16_PASS
         return Quant.INT4
 
     assert False, f"unknown kind: {kind!r} in {mlx_name}"
@@ -475,10 +475,9 @@ def _run_verify(model_path: Path, header_cache: dict,
                            verify(source_vals, recon,
                                   in_dim if padded_in != in_dim else None)))
 
-        elif q == Quant.FP16:
-            f16_data = f32_to_f16(source)
-            recon = f16_data.view(np.float16).astype(np.float32).reshape(shape)
-            results.append((mlx_name, q.value, verify(source, recon)))
+        elif q == Quant.BF16_PASS:
+            # BF16 passthrough — no conversion, zero error
+            pass
 
         elif q == Quant.BF16:
             # Passthrough — no quantization error
@@ -804,19 +803,22 @@ def run(model_path_str: str, output_dir_str: str, *, strip: bool = False,
 
                 quant_summary[q.value] += 1
 
-            elif q == Quant.FP16:
-                # Convert BF16 → FP16
-                f32_vals = bf16_bytes_to_f32(raw_data, shape)
-                f16_data = f32_to_f16(f32_vals)
-                raw_out = f16_data.tobytes()
-
-                out_f.write(raw_out)
+            elif q == Quant.BF16_PASS:
+                # BF16 passthrough — keep full precision
+                if dtype == 'F32':
+                    f32_vals = np.frombuffer(raw_data, dtype=np.float32).reshape(shape)
+                    raw_data = f32_to_bf16_u16(f32_vals).tobytes()
+                elif dtype == 'F16':
+                    f16_vals = np.frombuffer(raw_data, dtype=np.float16).reshape(shape)
+                    raw_data = f32_to_bf16_u16(f16_vals.astype(np.float32)).tobytes()
+                # BF16 source: write unchanged
+                out_f.write(raw_data)
                 manifest["tensors"][mlx_name] = {
-                    "offset": offset, "size": len(raw_out),
-                    "shape": shape, "dtype": "f16",
+                    "offset": offset, "size": len(raw_data),
+                    "shape": shape, "dtype": "bf16",
                 }
-                offset += len(raw_out)
-                total_bytes += len(raw_out)
+                offset += len(raw_data)
+                total_bytes += len(raw_data)
                 tensor_count += 1
                 quant_summary[q.value] += 1
 
@@ -920,12 +922,12 @@ def run(model_path_str: str, output_dir_str: str, *, strip: bool = False,
         info = categories[cat]
         print(f"  {cat:25s}: {info['count']:4d} tensors, {info['bytes'] / 1e6:8.1f} MB")
 
-    # Copy config.json
-    src_config = model_path / "config.json"
+    # Write config.json (use modified hf_config if strip mode altered it)
     dst_config = output_dir / "config.json"
-    if src_config.exists():
-        shutil.copy2(src_config, dst_config)
-        print(f"  Copied config.json")
+    with open(dst_config, "w") as f:
+        json.dump(hf_config, f, indent=2)
+    extra = " (strip)" if strip else ""
+    print(f"  Wrote config.json{extra}")
 
     # ══════════════════════════════════════════════════════════════════════
     # PART 2: Expert weights → packed_experts/layer_XX.bin

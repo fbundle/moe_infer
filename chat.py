@@ -145,8 +145,8 @@ def main():
         help=f"Path to MoE-Infer model directory (default: {default_model})",
     )
     parser.add_argument(
-        "--mode", default="Fused4bitExp2",
-        choices=["Cpu", "Fused4bit"],
+        "--mode", default="Qwen35MoEBq4Exp2",
+        choices=["Cpu", "Qwen35MoEBq4Exp2"],
         help="Pipeline mode",
     )
     parser.add_argument(

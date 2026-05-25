@@ -1892,3 +1892,46 @@ kernel void kv_cache_append(
     k_cache[dst] = k[tid];
     v_cache[dst] = v[tid];
 }
+
+// ============================================================================
+// Kernel 20: BF16 matrix-vector multiply (direct, no dequant)
+// ============================================================================
+// For BQ4: sensitive blocks (attention, routers, lm_head) stay in BF16 and
+// use a direct bf16→f32 matvec instead of 4-bit dequant.
+// Dispatch: ceil(out_dim / ROWS_PER_TG) threadgroups, 256 threads each.
+
+kernel void matvec_bf16(
+    device const uint16_t* W_bf16 [[buffer(0)]],  // [out_dim, in_dim]
+    device const float*    x      [[buffer(1)]],  // [in_dim]
+    device float*          out    [[buffer(2)]],  // [out_dim]
+    constant uint&         out_dim [[buffer(3)]],
+    constant uint&         in_dim  [[buffer(4)]],
+    uint tgid   [[threadgroup_position_in_grid]],
+    uint lid    [[thread_position_in_threadgroup]],
+    uint simd_lane  [[thread_index_in_simdgroup]],
+    uint simd_group [[simdgroup_index_in_threadgroup]]
+) {
+    uint row = tgid * ROWS_PER_TG + simd_group;
+
+    threadgroup float x_shared[4096];
+
+    for (uint i = lid; i < in_dim; i += 256) {
+        x_shared[i] = x[i];
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    if (row >= out_dim) return;
+
+    device const uint16_t* w_row = W_bf16 + row * in_dim;
+
+    float acc = 0.0f;
+    for (uint col = simd_lane; col < in_dim; col += 32) {
+        acc += bf16_to_f32(w_row[col]) * x_shared[col];
+    }
+
+    float sum = simd_sum(acc);
+
+    if (simd_lane == 0) {
+        out[row] = sum;
+    }
+}
