@@ -63,6 +63,8 @@ pub enum EngineEnum {
     Fused4bitExp1Stripped,
     Fused4bitExp2,
     Fused4bitExp2Stripped,
+    Fused4bitExp3,
+    Fused4bitExp3Stripped,
 }
 
 impl EngineEnum {
@@ -73,7 +75,7 @@ impl EngineEnum {
         model: &Model,
         k: usize,
     ) -> Result<(MetalContext, WeightBuffer, ExpertBuffer), MoEError> {
-        let is_stripped = matches!(self, EngineEnum::Fused4bitStripped | EngineEnum::Fused4bitExp1Stripped | EngineEnum::Fused4bitExp2Stripped);
+        let is_stripped = matches!(self, EngineEnum::Fused4bitStripped | EngineEnum::Fused4bitExp1Stripped | EngineEnum::Fused4bitExp2Stripped | EngineEnum::Fused4bitExp3Stripped);
         let (num_layers, num_experts, num_experts_per_tok, num_linear_layers, linear_conv_dim,
              linear_num_v_heads, linear_total_value, linear_key_dim, linear_value_dim,
              hidden_dim, shared_intermediate, moe_intermediate, expert_size_4bit,
@@ -132,7 +134,7 @@ impl EngineEnum {
 
 // ─── Type-erased engine ─────────────────────────────────────────────────────
 
-use qwen35_moe::{FullModel, StrippedModel, Fused4bit, Fused4bitExp1, Fused4bitExp2};
+use qwen35_moe::{FullModel, StrippedModel, Fused4bit, Fused4bitExp1, Fused4bitExp2, Fused4bitExp3};
 
 /// Type-erased engine holding one of the engine variants.
 pub enum DynEngine {
@@ -142,6 +144,8 @@ pub enum DynEngine {
     Fused4bitExp1Stripped(Fused4bitExp1<'static, StrippedModel>),
     Fused4bitExp2(Fused4bitExp2<'static, FullModel>),
     Fused4bitExp2Stripped(Fused4bitExp2<'static, StrippedModel>),
+    Fused4bitExp3(Fused4bitExp3<'static, FullModel>),
+    Fused4bitExp3Stripped(Fused4bitExp3<'static, StrippedModel>),
 }
 
 impl DynEngine {
@@ -213,6 +217,22 @@ impl DynEngine {
                 )?;
                 DynEngine::Fused4bitExp2Stripped(e)
             }
+            EngineEnum::Fused4bitExp3 => {
+                let e = Fused4bitExp3::new(
+                    model_ref, ctx_ref, weight_buffer_ref,
+                    expert_buffer.map(|b| &mut *(b as *mut ExpertBuffer)),
+                    k,
+                )?;
+                DynEngine::Fused4bitExp3(e)
+            }
+            EngineEnum::Fused4bitExp3Stripped => {
+                let e = Fused4bitExp3::new(
+                    model_ref, ctx_ref, weight_buffer_ref,
+                    expert_buffer.map(|b| &mut *(b as *mut ExpertBuffer)),
+                    k,
+                )?;
+                DynEngine::Fused4bitExp3Stripped(e)
+            }
         })
     }
 
@@ -224,6 +244,8 @@ impl DynEngine {
             DynEngine::Fused4bitExp1Stripped(e) => Engine::upload_cache(e, cache),
             DynEngine::Fused4bitExp2(e) => Engine::upload_cache(e, cache),
             DynEngine::Fused4bitExp2Stripped(e) => Engine::upload_cache(e, cache),
+            DynEngine::Fused4bitExp3(e) => Engine::upload_cache(e, cache),
+            DynEngine::Fused4bitExp3Stripped(e) => Engine::upload_cache(e, cache),
         }
     }
 
@@ -235,6 +257,8 @@ impl DynEngine {
             DynEngine::Fused4bitExp1Stripped(e) => Engine::download_cache(e, cache),
             DynEngine::Fused4bitExp2(e) => Engine::download_cache(e, cache),
             DynEngine::Fused4bitExp2Stripped(e) => Engine::download_cache(e, cache),
+            DynEngine::Fused4bitExp3(e) => Engine::download_cache(e, cache),
+            DynEngine::Fused4bitExp3Stripped(e) => Engine::download_cache(e, cache),
         }
     }
 
@@ -250,6 +274,8 @@ impl DynEngine {
             DynEngine::Fused4bitExp1Stripped(e) => Engine::forward(e, input_ids, check_signal),
             DynEngine::Fused4bitExp2(e) => Engine::forward(e, input_ids, check_signal),
             DynEngine::Fused4bitExp2Stripped(e) => Engine::forward(e, input_ids, check_signal),
+            DynEngine::Fused4bitExp3(e) => Engine::forward(e, input_ids, check_signal),
+            DynEngine::Fused4bitExp3Stripped(e) => Engine::forward(e, input_ids, check_signal),
         }
     }
 
@@ -261,6 +287,8 @@ impl DynEngine {
             DynEngine::Fused4bitExp1Stripped(e) => Engine::telemetry(e),
             DynEngine::Fused4bitExp2(e) => Engine::telemetry(e),
             DynEngine::Fused4bitExp2Stripped(e) => Engine::telemetry(e),
+            DynEngine::Fused4bitExp3(e) => Engine::telemetry(e),
+            DynEngine::Fused4bitExp3Stripped(e) => Engine::telemetry(e),
         }
     }
 }

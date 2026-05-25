@@ -108,8 +108,10 @@ impl Engine {
             "Fused4bitExp1Stripped" => EngineEnum::Fused4bitExp1Stripped,
             "Fused4bitExp2" => EngineEnum::Fused4bitExp2,
             "Fused4bitExp2Stripped" => EngineEnum::Fused4bitExp2Stripped,
+            "Fused4bitExp3" => EngineEnum::Fused4bitExp3,
+            "Fused4bitExp3Stripped" => EngineEnum::Fused4bitExp3Stripped,
             _ => return Err(pyo3::exceptions::PyValueError::new_err(format!(
-                "Unknown pipeline_mode: {}. Use Fused4bit|Fused4bitStripped|Fused4bitExp1|Fused4bitExp1Stripped|Fused4bitExp2|Fused4bitExp2Stripped", pipeline_mode
+                "Unknown pipeline_mode: {}. Use Fused4bit|Fused4bitStripped|Fused4bitExp1|Fused4bitExp1Stripped|Fused4bitExp2|Fused4bitExp2Stripped|Fused4bitExp3|Fused4bitExp3Stripped", pipeline_mode
             ))),
         };
 
