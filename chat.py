@@ -26,42 +26,7 @@ def _get_response_extractor(model_name: str):
     return _RESPONSE_EXTRACTORS["raw"]
 
 
-def _softmax(x: np.ndarray) -> np.ndarray:
-    x = x - x.max()
-    e = np.exp(x)
-    return e / e.sum()
-
-
-def _sample(logits: np.ndarray, temperature: float,
-            top_k: int, top_p: float, min_p: float) -> int:
-    """Sample a token from logits. Modifies logits in-place."""
-    n = len(logits)
-    if abs(temperature - 1.0) > 1e-7:
-        logits /= max(temperature, 1e-8)
-    if temperature < 0.01:
-        return int(np.argmax(logits))
-    probs = _softmax(logits)
-
-    if top_k > 0 and top_k < n:
-        indices = np.argpartition(probs, -top_k)[-top_k:]
-        mask = np.ones(n, dtype=bool)
-        mask[indices] = False
-        probs[mask] = 0.0
-    if top_p < 1.0:
-        sorted_idx = np.argsort(probs)[::-1]
-        cumsum = np.cumsum(probs[sorted_idx])
-        cutoff_idx = np.searchsorted(cumsum, top_p)
-        if cutoff_idx < n:
-            probs[sorted_idx[cutoff_idx + 1:]] = 0.0
-    if min_p > 0.0:
-        threshold = probs.max() * min_p
-        probs[probs < threshold] = 0.0
-
-    total = probs.sum()
-    if total <= 0:
-        return 0
-    probs /= total
-    return int(np.random.choice(n, p=probs))
+from helpers.generate import generate_from
 
 
 class Conversation:
@@ -100,33 +65,26 @@ class Conversation:
         logits = self.engine.forward(input_ids, self.cache)
         prefill_ms = (time.time() - t0) * 1000.0
 
-        last_logits = np.asarray(logits[-1])
-        completion_ids: list[int] = []
-
-        for _ in range(max_tokens):
-            token = _sample(last_logits, temperature, top_k, top_p, min_p)
-            if token in eos_token_ids:
-                break
-            completion_ids.append(token)
-            print(self.tokenizer.decode([token]), end="", flush=True)
-            logits = self.engine.forward(
-                np.array([token], dtype=np.int64), self.cache)
-            last_logits = np.asarray(logits[0])
-
+        completion_text, gen_stats = generate_from(
+            logits[-1], self.engine, self.cache, self.tokenizer,
+            max_tokens=max_tokens, temperature=temperature,
+            top_k=top_k, top_p=top_p, min_p=min_p,
+            eos_ids=tuple(eos_token_ids),
+            on_token=lambda tok: print(self.tokenizer.decode([tok]), end="", flush=True),
+        )
         print()
-        total_ms = (time.time() - t0) * 1000.0
-        n_tokens = len(completion_ids) + 1
-        gen_ms = total_ms - prefill_ms
-        tps = (n_tokens - 1) / (gen_ms / 1000.0) if gen_ms > 0 else 0.0
 
-        response = self.extract_response(self.tokenizer.decode(completion_ids))
+        total_ms = (time.time() - t0) * 1000.0
+        n_tokens = gen_stats["tokens"] + 1  # +1 for prefill
+
+        response = self.extract_response(completion_text)
         self.messages.append({"role": "assistant", "content": response})
 
         self._last_chat_tlm = {
             "prefill_ms": prefill_ms,
             "total_ms": total_ms,
             "tokens_generated": n_tokens,
-            "tokens_per_sec": tps,
+            "tokens_per_sec": gen_stats["tok_per_s"],
         }
         return response
 
