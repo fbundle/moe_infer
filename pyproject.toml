@@ -1,9 +1,9 @@
-[build-system]
-requires = ["maturin>=1.0,<2.0"]
-build-backend = "maturin"
+# [build-system]
+# requires = ["maturin>=1.0,<2.0"]
+# build-backend = "maturin"
 
-[tool.maturin]
-manifest-path = "moe_infer_rs/Cargo.toml"
+# [tool.maturin]
+# manifest-path = "moe_infer_rs/Cargo.toml"
 
 [project]
 name = "moe-infer"
@@ -17,5 +17,6 @@ dependencies = [
    "mlx-lm>=0.31.3",
    "numpy>=2.2.6",
    "openai>=2.38.0",
+   "torch>=2.12.0",
    "transformers>=5.9.0",
 ]
