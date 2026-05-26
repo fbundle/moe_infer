@@ -58,8 +58,8 @@ def main():
     parser.add_argument("--max-tokens", type=int, default=128)
     parser.add_argument("--hub", default=HUB)
     parser.add_argument("--temperature", type=float, default=0.0)
-    parser.add_argument("--max-pixels", type=int, default=0,
-                        help="Max pixels for image processor (0 = no limit, smaller = fewer tokens)")
+    parser.add_argument("--max-edge", type=int, default=0,
+                        help="Max image dimension in pixels (0 = default, smaller = fewer vision tokens)")
     args = parser.parse_args()
 
     hub = args.hub
@@ -69,8 +69,8 @@ def main():
     proc = AutoImageProcessor.from_pretrained(hub)
     img = Image.open(args.image).convert("RGB")
     proc_kwargs = {"images": img, "return_tensors": "pt"}
-    if args.max_pixels > 0:
-        proc_kwargs["max_pixels"] = args.max_pixels
+    if args.max_edge > 0:
+        proc_kwargs["size"] = {"shortest_edge": args.max_edge ** 2, "longest_edge": args.max_edge ** 2}
     inputs = proc(**proc_kwargs)
     pixel_values = inputs["pixel_values"]                            # [N, 1536]
     grid_thw = inputs["image_grid_thw"]                              # [[1, H, W]]
@@ -93,7 +93,7 @@ def main():
 
     # 4. Build input with vision tokens: embed text parts, splice in vision features
     before = tokenizer.encode(f"<|im_start|>user\n<|vision_start|>", add_special_tokens=False)
-    after  = tokenizer.encode(f"<|vision_end|>\n{args.question}<|im_end|>\n<|im_start|>assistant\n", add_special_tokens=False)
+    after  = tokenizer.encode(f"<|vision_end|>\n{args.question}<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n", add_special_tokens=False)
 
     print(f"[demo] Building embeddings ({len(before)} + {n_merged} + {len(after)} tokens)...")
     embeds = np.concatenate([
