@@ -514,6 +514,11 @@ wheels = [
 name = "moe-infer"
 version = "0.1.0"
 source = { editable = "." }
+dependencies = [
+    { name = "numpy", version = "2.2.6", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.11'" },
+    { name = "numpy", version = "2.4.6", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.11'" },
+    { name = "tqdm" },
+]
 
 [package.optional-dependencies]
 all = [
@@ -547,9 +552,11 @@ requires-dist = [
     { name = "lz4", marker = "extra == 'all'", specifier = ">=4.4.5" },
     { name = "mlx-lm", marker = "extra == 'mlx'", specifier = ">=0.31.3" },
     { name = "moe-infer", extras = ["serve", "mlx", "torch"], marker = "extra == 'all'" },
+    { name = "numpy", specifier = ">=2.2.6" },
     { name = "numpy", marker = "extra == 'all'", specifier = ">=2.2.6" },
     { name = "torch", marker = "extra == 'torch'", specifier = ">=2.12.0" },
     { name = "torchvision", marker = "extra == 'torch'", specifier = ">=0.27.0" },
+    { name = "tqdm", specifier = ">=4.67.3" },
     { name = "transformers", marker = "extra == 'torch'", specifier = ">=5.9.0" },
 ]
 provides-extras = ["serve", "mlx", "torch", "all"]

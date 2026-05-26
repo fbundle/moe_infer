@@ -9,6 +9,10 @@ features = ["python-bindings"]
 name = "moe_infer"
 version = "0.1.0"
 requires-python = ">=3.10"
+dependencies = [
+    "numpy>=2.2.6",
+    "tqdm>=4.67.3",
+]
 
 [project.optional-dependencies]
 serve = [
