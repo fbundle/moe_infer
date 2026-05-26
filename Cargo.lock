@@ -3,6 +3,25 @@
 version = 4
 
 [[package]]
+name = "_moe_infer_rs"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "libc",
+ "lz4_flex",
+ "memmap2",
+ "metal",
+ "ndarray",
+ "numpy",
+ "objc",
+ "pyo3",
+ "rand",
+ "rayon",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "anyhow"
 version = "1.0.102"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -226,25 +245,6 @@ dependencies = [
  "log",
  "objc",
  "paste",
-]
-
-[[package]]
-name = "moe_infer_rs"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "libc",
- "lz4_flex",
- "memmap2",
- "metal",
- "ndarray",
- "numpy",
- "objc",
- "pyo3",
- "rand",
- "rayon",
- "serde",
- "serde_json",
 ]
 
 [[package]]

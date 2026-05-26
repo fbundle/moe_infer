@@ -1,11 +1,10 @@
 """
 MoE-Infer: High-performance MoE inference engine for Apple Silicon.
 
-This package wraps the native Rust module (moe_infer_rs) and re-exports
-all public symbols for convenience.
+Re-exports the native _moe_infer_rs module as a clean public API.
 """
 
-from moe_infer_rs import (  # type: ignore
+from _moe_infer_rs import (  # type: ignore
     Model,
     Engine,
     Cache,

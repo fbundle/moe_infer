@@ -35,7 +35,7 @@ hub
 output
 vendor
 build/
-moe_infer_rs/target/
+target/
 moe_infer_c/bench-stripped
 moe_infer_c/bench
 moe_infer_mlx/core.c
