@@ -150,7 +150,7 @@ def main():
         help="Pipeline mode",
     )
     parser.add_argument(
-        "--k", type=int, default=4,
+        "--k", type=int, default=0,
         help="Active experts per token (0 = model default)",
     )
     parser.add_argument(

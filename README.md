@@ -1,198 +1,194 @@
 # MoE-Infer
 
-High-performance inference engine for Mixture-of-Experts models on Apple Silicon. Streams expert weights from SSD on demand — no Python ML frameworks at runtime, just Rust and hand-tuned Metal shaders.
-
-Supports `mlx-community/Qwen3.5-35B-A3B-4bit` and `mlx-community/Qwen3.6-35B-A3B-4bit`.
-
-## Hardware Requirements
-
-- Mac with Apple Silicon (M1/M2/M3/M4)
-- ~20 GB free SSD space for model weights
-- macOS 14+ (for Metal 3)
+Fast Mixture-of-Experts inference on Apple Silicon.  Pure Rust engine with
+hand-tuned Metal shaders — no Python ML frameworks at runtime.  Expert
+weights stream from SSD on demand via mmap.
 
 ## Quick Start
 
-### 1. Quantize the model
-
-```bash
-# From HuggingFace unquantized BF16 model:
-python helpers/quantize_from_hf.py \
-    --model hub/models--Qwen--Qwen3.6-35B-A3B \
-    --output data/my-model
-```
-
-Or convert from an MLX-format 4-bit model:
-
-```bash
-python helpers/convert.py --model hub/models--mlx-community--Qwen3.6-35B-A3B-4bit
-```
-
-### 2. Build and run
+### 1. Build
 
 ```bash
 maturin develop --release -m moe_infer_rs/Cargo.toml
-python chat.py
+```
+
+### 2. Quantize
+
+Download the HF model to `hub/models--Qwen--Qwen3.6-35B-A3B`, then:
+
+```bash
+python quantize.py \
+    --model hub/models--Qwen--Qwen3.6-35B-A3B \
+    --output data/models--Qwen--Qwen3.6-35B-A3B-bq4 \
+    --qwen36
+```
+
+The `--qwen36` flag corrects Qwen3.6 norm weights to the Qwen3.5 convention
+used by the engine.  Quantization takes ~10 minutes and produces:
+
+```
+data/models--Qwen--Qwen3.6-35B-A3B-bq4/
+├── config.json
+├── model_weights.bin       # ~2 GB (mmap'd)
+├── model_weights.json      # tensor manifest
+├── packed_experts/          # 40 × layer_NN.bin (~4.5 GB total)
+└── tokenizer.json -> ...    # symlink to hub tokenizer
+```
+
+### 3. Chat
+
+```bash
+python chat.py --model data/models--Qwen--Qwen3.6-35B-A3B-bq4
 ```
 
 ## Python API
 
 ```python
-from moe_infer import Model, Engine, Cache, record_engine_telemetry
+from moe_infer import Model, Engine, Cache
 ```
 
 ### Model
 
-| Method | Description |
-|--------|-------------|
-| `model = Model(model_path)` | Load model weights, config, and expert file handles |
+```python
+model = Model("data/models--Qwen--Qwen3.6-35B-A3B-bq4")
+```
 
 ### Engine
 
+```python
+engine = Engine(model, pipeline_mode="Qwen35MoEBq4Exp2", k=0)
+```
+
+`k=0` uses the model default (8 experts per token).  Set `k=4` for lower
+expert I/O at a small quality cost.
+
 | Method | Description |
 |--------|-------------|
-| `engine = Engine(model, pipeline_mode="Fused4bit", k=0)` | Initialize Metal GPU resources. `k` selects experts per token (0 = model default, 8) |
-| `engine.forward(input_ids, cache)` | Forward pass, returns `[n_tokens, vocab_size]` float32 logits |
-| `engine.upload_cache(cache)` | Sync CPU cache → GPU buffers |
-| `engine.download_cache(cache)` | Sync GPU buffers → CPU cache |
-| `engine.telemetry()` | Returns dict of per-engine timing metrics |
+| `engine.embed_lookup(token_ids)` | Token IDs → embeddings `[N, hidden]` |
+| `engine.forward_hidden(embeddings, cache)` | Embeddings → logits `[N, vocab]` |
+| `engine.forward(token_ids, cache)` | Convenience: `embed_lookup` + `forward_hidden` |
+| `engine.upload_cache(cache)` | CPU cache → GPU buffers |
+| `engine.download_cache(cache)` | GPU buffers → CPU cache |
+| `engine.telemetry()` | Per-layer timing dict |
 
 ### Cache
 
+```python
+cache = Cache(model)
+```
+
 | Method | Description |
 |--------|-------------|
-| `cache = Cache(model)` | Create KV caches + linear attention state |
-| `cache.reset()` | Reset position, KV caches, and linear attention states |
-| `cache.save(bin_path, json_path)` | Save cache to flat binary + JSON manifest |
-| `cache.load(bin_path, json_path)` | Load cache from flat binary + JSON manifest |
+| `cache.pos` | Current sequence position |
+| `cache.reset()` | Clear KV cache and linear attention state |
+| `cache.save(bin, json)` | Persist to disk |
+| `Cache.load(bin, json)` | Restore from disk |
 
-### Pipeline Modes
+### Pipeline modes
 
 | Mode | Description |
 |------|-------------|
-| `Fused4bit` | Full model: 40 layers, 256 experts, K=8 |
-| `Fused4bitStripped` | Stripped model: 4 layers, 4 experts, K=4 (for verification) |
+| `Qwen35MoEBq4Exp1` | 40 layers, 256 experts |
+| `Qwen35MoEBq4Exp2` | 40 layers, 256 experts (newer kernel) |
 
-### CPU Engine (Rust only)
+Architecture suffix `_Stripped` (4 layers, 4 experts) auto-detected from
+`config.json` for verification models built with `--strip`.
 
-A pure-CPU reference engine using `ndarray` that mirrors the GPU pipeline. Not exposed via Python bindings yet.
-
-```rust
-use moe_infer::engine::qwen35_moe::CpuEngine;
-let mut engine = CpuEngine::<FullModel>::new(&model, k)?;
-let logits = engine.forward(&[1, 2, 3], &mut |_| false)?;
-```
-
-## Quantization
-
-See [`quant/README.md`](quant/README.md) for the BQ4 quantization scheme. Tensor names follow the MLX convention described in [`quant/name_mapping.json`](quant/name_mapping.json).
-
-## Model Format
-
-MoE-Infer expects a model directory with:
-
-```
-model_dir/
-├── config.json                 # HF config (read directly by Rust engine)
-├── model_weights.bin           # Mmap'd: all non-expert weights (MLX naming)
-├── model_weights.json          # Tensor manifest (name → offset, size, shape, dtype)
-├── packed_experts/             # Per-layer expert files
-│   ├── layer_00.bin
-│   ├── layer_01.bin
-│   └── ...
-├── packed_experts_lz4/         # LZ4-compressed experts (optional, smaller SSD footprint)
-│   ├── layer_00.bin
-│   └── ...
-├── tokenizer.json
-└── vocab.json
-```
-
-Tensor names use the MLX convention: `language_model.model.layers.{L}.{block}.{kind}`.
-An HF→MLX name mapping is provided in [`quant/name_mapping.json`](quant/name_mapping.json).
-
-The engine auto-detects `packed_experts_lz4/` at load time and falls back to `packed_experts/`.
-
-### Cache Format
-
-Cache files use the same flat binary + JSON manifest format as model_weights:
-
-```
-cache.bin       # Flat concatenation of all cache tensors (f32 + u32 scalars)
-cache.json      # Manifest: name → {offset, size, shape, dtype}
-```
-
-## Verification
-
-`verify_nway.py` checks numerical correctness:
-
-```bash
-python verify_nway.py
-```
-
-Compares `Cpu`, `Fused4bit` (Rust), `C` (C bench), and `mlx-lm` on the stripped 4-layer model. Outputs an N×N max_diff matrix.
-
-Expected: all non-mlx engines agree within ULP-level tolerance.
-
-## Benchmarking
+## Benchmarks
 
 ```bash
 python bench.py
 ```
 
-Tests forward passes across engine variants. Requires the full 40-layer model.
-
-## Performance
-
-Apple M1 Pro 14 GPUs, Qwen3.5-35B-A3B-4bit (40 layers, 256 experts, K=8), 32-token prompt, 100-token greedy generation:
+M1 Pro 14 GPU, Qwen3.6-35B-A3B-BQ4, 32-token prompt, 100-token greedy decode:
 
 | Mode | tok/s |
 |------|-------|
-| Fused4bit (Rust) | ~10 |
-| Cpu (reference) | ~0.15 |
+| Qwen35MoEBq4Exp2 | ~10 |
+| CPU (reference) | ~0.15 |
 
-Expert I/O (SSD reads) dominates at ~70% of per-layer time.
+Expert I/O dominates at ~70% of per-layer time.  LZ4 compression cuts SSD
+reads by 40–55% with negligible decompression overhead:
 
-## Project Structure
+```bash
+python helpers/compress_experts_lz4.py data/models--Qwen--Qwen3.6-35B-A3B-bq4
+```
+
+The engine auto-detects `packed_experts_lz4/` at load time.
+
+## Verification
+
+```bash
+python verify_nway.py
+```
+
+Cross-checks logits across CPU, Metal, and reference implementations on the
+stripped 4-layer model.
+
+## Quantization
+
+See [`quant/README.md`](quant/README.md) for the BQ4 scheme.  Quick summary:
+
+| Block | Format | Why |
+|-------|--------|-----|
+| `self_attn.{q,k,v,o}_proj` | BF16 | Q·Kᵀ amplifies noise quadratically |
+| `mlp.gate` | BF16 | Router error misroutes tokens |
+| `attn.qkv`, `attn.proj` | BF16 | Attention projections |
+| `patch_embed.proj`, `pos_embed` | BF16 | Vision encoder sensitivity |
+| `lm_head` | INT8 | Per-channel symmetric, 49% size reduction |
+| Everything else | INT4 | 64-group affine, 4.5 bits/weight |
+| Norm weights, biases | BF16 | Vectors, sensitive to error |
+
+Vision encoder weights (`vision_tower.*`) are excluded from the main pipeline
+and extracted separately (see [`quant/README.md`](quant/README.md)).
+
+## Model format
 
 ```
-moe_infer_rs/                 Rust engine + Python bindings
-  src/
-    lib.rs                    Module declarations + Python module init
-    engine.rs                 Engine trait, DynEngine, EngineEnum, telemetry
-    model.rs                  Model struct (loads config + weight/expert files)
-    cache.rs                  KV cache + linear attention state (binary I/O format)
-    math_util.rs              CPU math: RMS norm, softmax, RoPE, dequant, SwiGLU, SSM, attention, conv1d
-    constants.rs              Shared constants + backward-compat re-exports
-    error.rs                  Error types
-    python_bindings.rs        PyO3 bindings (Model, Cache, Engine)
-    engine/
-      qwen35_moe.rs           Module declarations for qwen35_moe submodules
-      qwen35_moe/
-        constants.rs          ModelConfig trait + FullModel/StrippedModel impls
-        cpu.rs                CPU reference engine (ndarray, pure f32)
-        fused_4bit.rs           Fused4bit GPU pipeline (3-CMD, Metal)
-        metal_context.rs      Metal device/pipelines, ExpertCache LRU, scratch bufs
-        metal_kernels.rs      Metal kernel dispatch (matvec, SwiGLU, conv1d, SSM, attention)
-        shaders.metal         Metal compute shaders (embedded via include_str!)
-  Cargo.toml
-  pyproject.toml
+model_dir/
+├── config.json
+├── model_weights.bin           # mmap'd non-expert weights
+├── model_weights.json          # tensor manifest
+├── packed_experts/             # layer_00.bin … layer_39.bin
+├── packed_experts_lz4/         # optional LZ4-compressed experts
+├── tokenizer.json
+└── vocab.json
+```
 
-quant/                        BQ4 quantization scheme and name mapping
-  README.md                   Block→format quantization policy
-  name_mapping.json           HF → MLX tensor name mapping (177 patterns)
-  verify_name_mapping.py      Check mapping covers all HF tensors
+Tensor names use the MLX convention: `language_model.model.layers.{L}.{block}.{kind}`.
+HF → MLX mapping: [`quant/name_mapping.json`](quant/name_mapping.json).
 
-helpers/                      Model conversion scripts
-  quantize_from_hf.py         HF unquantized → MoE-Infer 4-bit format
-  convert.py                  One-step MLX → MoE-Infer conversion
-  extract_weights.py          Non-expert weights → model_weights.bin + .json
-  repack_experts_4bit.py      MLX 4-bit experts → packed_experts/
-  compress_experts_lz4.py     packed_experts/ → packed_experts_lz4/ (~40-55% compression)
-  repack_experts_2bit.py      packed_experts/ → packed_experts_2bit/ (experimental)
-  strip_model.py              Build 4-layer stripped model for verification
+## Project layout
 
-bench.py                      Multi-engine performance benchmark
-verify_nway.py                N-way logit comparison
-chat.py                       Interactive chat demo
+```
+moe_infer_rs/src/
+  engine.rs                   Engine trait + DynEngine
+  engine/qwen35_moe/
+    constants.rs              ModelConfig trait + FullModel/StrippedModel
+    fused_bq4_exp1.rs         Metal GPU engine (variant 1)
+    fused_bq4_exp2.rs         Metal GPU engine (variant 2, current)
+    metal_context.rs          Metal device, pipelines, expert LRU cache
+    metal_kernels.rs          Kernel dispatch helpers
+    shaders.metal             Compute shaders
+    cpu.rs                    Pure-CPU reference engine
+  model.rs                    Model loading (config + weights + experts)
+  model/config.rs             Runtime config store
+  model/weights.rs            Mmap'd weight file + manifest
+  model/expert.rs             Per-layer expert file I/O
+  cache.rs                    KV cache + linear attention state
+  quant.rs                    Quant enum + BF16/INT4/INT8 encode/decode
+  quantize/qwen35_moe/bq4.rs  HF → BQ4 quantization pipeline
+  python_bindings.rs          PyO3 bindings
+
+quant/
+  README.md                   BQ4 quantization reference
+  name_mapping.json           HF → MLX tensor name mapping
+
+helpers/
+  quantize_from_hf.py         HF BF16 → MoE-Infer conversion (calls Rust)
+  convert.py                  MLX 4-bit → MoE-Infer conversion
+  compress_experts_lz4.py     LZ4-compress packed experts
+  strip_model.py              Build stripped model for verification
 ```
 
 ## License
