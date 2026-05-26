@@ -58,8 +58,10 @@ def main():
     parser.add_argument("--max-tokens", type=int, default=128)
     parser.add_argument("--hub", default=HUB)
     parser.add_argument("--temperature", type=float, default=0.0)
-    parser.add_argument("--max-edge", type=int, default=0,
-                        help="Max image dimension in pixels (0 = default, smaller = fewer vision tokens)")
+    parser.add_argument("--min-pixels", type=int, default=0,
+                        help="Lower bound on total image pixels (0 = default: 65536)")
+    parser.add_argument("--max-pixels", type=int, default=0,
+                        help="Upper bound on total image pixels (0 = default: 16777216)")
     args = parser.parse_args()
 
     hub = args.hub
@@ -69,8 +71,13 @@ def main():
     proc = AutoImageProcessor.from_pretrained(hub)
     img = Image.open(args.image).convert("RGB")
     proc_kwargs = {"images": img, "return_tensors": "pt"}
-    if args.max_edge > 0:
-        proc_kwargs["size"] = {"shortest_edge": args.max_edge ** 2, "longest_edge": args.max_edge ** 2}
+    size = {}
+    if args.min_pixels > 0:
+        size["shortest_edge"] = args.min_pixels
+    if args.max_pixels > 0:
+        size["longest_edge"] = args.max_pixels
+    if size:
+        proc_kwargs["size"] = size
     inputs = proc(**proc_kwargs)
     pixel_values = inputs["pixel_values"]                            # [N, 1536]
     grid_thw = inputs["image_grid_thw"]                              # [[1, H, W]]
