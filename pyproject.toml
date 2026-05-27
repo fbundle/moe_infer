@@ -10,25 +10,26 @@ name = "moe_infer"
 version = "0.1.0"
 requires-python = ">=3.10"
 dependencies = [
+    "jinja2>=3.1.6",
     "numpy>=2.2.6",
+    "safetensors>=0.4",
+    "torch>=2.12.0",
     "tqdm>=4.67.3",
+    "transformers>=5.9.0",
 ]
 
 [project.optional-dependencies]
+vision = [
+    "Pillow>=10.0",
+    "torchvision>=0.27.0",
+]
 serve = [
-   "fastapi>=0.136.3",
-   "jinja2>=3.1.6",
+    # "fastapi>=0.136.3",
 ]
 mlx = [
-   "mlx-lm>=0.31.3",
-]
-torch = [
-   "torch>=2.12.0",
-   "torchvision>=0.27.0",
-   "transformers>=5.9.0",
+    # "mlx-lm>=0.31.3",
 ]
 all = [
-   "moe_infer[serve,mlx,torch]",
-   "lz4>=4.4.5",
-   "numpy>=2.2.6",
+    "moe_infer[vision,serve,mlx]",
+    # "lz4>=4.4.5",
 ]

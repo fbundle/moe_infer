@@ -10,7 +10,7 @@ use crate::cache::Cache as CoreCache;
 use crate::model::Model as CoreModel;
 use crate::error::MoEError;
 use crate::engine::{SignalCheckFn, TelemetryValue, set_record_telemetry, DynEngine};
-use crate::bq4::Bq4;
+use crate::bq4::{Bq4, QwenVersion};
 
 // ─── Module-level functions ──────────────────────────────────────────────────
 
@@ -203,15 +203,21 @@ impl Engine {
 /// BQ4 rules, quantizes, and writes ``model_weights.bin``,
 /// ``model_weights.json``, and ``packed_experts/layer_XX.bin``.
 #[pyfunction]
-#[pyo3(signature = (model_path, output_dir, name_mapping_path, *, qwen36=false, strip_layers=0, strip_experts=0))]
+#[pyo3(signature = (model_path, output_dir, *, version, strip_layers=0, strip_experts=0))]
 pub fn qwen35_moe_bq4_quantize(
     model_path: &str,
     output_dir: &str,
-    name_mapping_path: &str,
-    qwen36: bool,
+    version: &str,
     strip_layers: usize,
     strip_experts: usize,
 ) -> PyResult<()> {
+    let qwen_version = match version {
+        "3.5" => QwenVersion::V35,
+        "3.6" => QwenVersion::V36,
+        _ => return Err(pyo3::exceptions::PyValueError::new_err(
+            format!("Unknown version: {}. Expected '3.5' or '3.6'.", version)
+        )),
+    };
     // Read architectures from model config.json
     let config_path = std::path::Path::new(model_path).join("config.json");
     let arch = std::fs::read_to_string(&config_path)
@@ -225,7 +231,7 @@ pub fn qwen35_moe_bq4_quantize(
         })?;
     let quantize = match arch.as_str() {
         "Qwen3_5MoeForConditionalGeneration" =>
-            Bq4::new(name_mapping_path, qwen36, strip_layers, strip_experts),
+            Bq4::new(strip_layers, strip_experts, qwen_version),
         _ => return Err(pyo3::exceptions::PyValueError::new_err(format!("Unknown architecture: {}", arch))),
     };
     quantize.quantize(model_path, output_dir)

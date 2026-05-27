@@ -10,16 +10,32 @@ use std::path::{Path, PathBuf};
 
 const ALIGN: u64 = 64;
 
+/// Embedded at compile time — no external file needed.
+const NAME_MAPPING_JSON: &str = include_str!("name_mapping.json");
+
+/// Which Qwen generation this model belongs to.  Qwen3.6 needs a +1.0
+/// norm-weight correction relative to Qwen3.5 convention.
+#[derive(Clone, Copy, PartialEq)]
+pub enum QwenVersion {
+    V35,
+    V36,
+}
+
+impl QwenVersion {
+    pub fn is_qwen36(self) -> bool {
+        self == QwenVersion::V36
+    }
+}
+
 pub struct Bq4 {
-    name_mapping_path: String,
-    qwen36: bool,
     strip_layers: usize,
     strip_experts: usize,
+    version: QwenVersion,
 }
 
 impl Bq4 {
-    pub fn new(name_mapping_path: &str, qwen36: bool, strip_layers: usize, strip_experts: usize) -> Self {
-        Bq4 { name_mapping_path: name_mapping_path.to_string(), qwen36, strip_layers, strip_experts }
+    pub fn new(strip_layers: usize, strip_experts: usize, version: QwenVersion) -> Self {
+        Bq4 { strip_layers, strip_experts, version }
     }
 }
 
@@ -147,13 +163,12 @@ fn extract_layer(name: &str) -> Option<usize> {
 type NameMap = HashMap<String, String>;
 
 fn load_name_mapping(
-    path: &Path,
+    json_str: &str,
     num_layers: usize,
     num_vision_blocks: usize,
 ) -> Result<NameMap, String> {
-    let json_str = fs::read_to_string(path).map_err(|e| e.to_string())?;
     let mapping: HashMap<String, String> =
-        serde_json::from_str(&json_str).map_err(|e| e.to_string())?;
+        serde_json::from_str(json_str).map_err(|e| e.to_string())?;
 
     let mut flat = HashMap::new();
     for (hf_pat, mlx_pat) in &mapping {
@@ -464,7 +479,6 @@ impl Bq4 {
     
     let model_path = Path::new(input);
     let output_dir = Path::new(output);
-    let mapping_path = Path::new(&self.name_mapping_path);
 
     // ── 1. Load config ──────────────────────────────────────────────────
     let params = load_config(model_path)?;
@@ -495,7 +509,7 @@ impl Bq4 {
     eprintln!("  moe_intermediate={}, shared_intermediate={}", mi, shared_inter);
 
     // ── 2. Load name mapping ────────────────────────────────────────────
-    let name_map = load_name_mapping(mapping_path, num_layers, 27)?;
+    let name_map = load_name_mapping(NAME_MAPPING_JSON, num_layers, 27)?;
     eprintln!("  Name mapping entries: {}", name_map.len());
 
     // ── 3. Load weight map ──────────────────────────────────────────────
@@ -731,7 +745,7 @@ impl Bq4 {
         // --qwen36 flag applies the correction here.  conv1d.weight
         // uses a different axis layout in HF (C,K,S) vs MLX (C,S,K).
         if q == Quant::Bf16 {
-            if self.qwen36 && is_norm_key(&mlx_name) {
+            if self.version.is_qwen36() && is_norm_key(&mlx_name) {
                 for v in &mut f32_vals {
                     *v += 1.0;
                 }

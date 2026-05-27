@@ -1,26 +1,18 @@
 #!/usr/bin/env python3
-"""
-quantize.py — Quantize HF BF16 Qwen3.5/3.6 MoE model using BQ4.
+"""Quantize HF BF16 Qwen MoE model → BQ4 format.
 
-Quantization is performed entirely in Rust via ``moe_infer.qwen35_moe_bq4_quantize()``.
-The Python side only handles argument parsing and path resolution.
+Thin CLI wrapper around ``moe_infer.qwen35_moe.bq4_quantize``.
 
 Usage:
-    python quant/quantize.py \
-        --model hub/models--Qwen--Qwen3.6-35B-A3B \
-        --output data/my-model
+    python quantize.py --model hub/models--Qwen--Qwen3.6-35B-A3B --version 3.6 --output data/my-model
 """
 
 import argparse
-import os
-import sys
 
-import moe_infer
-
-mapping_path = "quant/name_mapping.json"
+from moe_infer.qwen35_moe import bq4_quantize
 
 
-def main():
+def main() -> None:
     parser = argparse.ArgumentParser(
         description="Quantize HF BF16 Qwen MoE model → BQ4 format")
     parser.add_argument('--model', type=str, required=True,
@@ -28,25 +20,20 @@ def main():
     parser.add_argument('--output', type=str,
                         default='data/models--Qwen--Qwen3.6-35B-A3B-bq4',
                         help='Output directory')
+    parser.add_argument('--version', type=str, required=True,
+                        choices=['3.5', '3.6'],
+                        help='Qwen generation: 3.5 or 3.6')
     parser.add_argument('--strip', action='store_true',
                         help='Strip to 4 layers × 4 experts for verification')
-    parser.add_argument('--qwen36', action='store_true',
-                        help='Apply +1.0 shift to norm weights (Qwen3.6 → 3.5 convention)')
     args = parser.parse_args()
-
-    
-    if not os.path.exists(mapping_path):
-        print(f"ERROR: {mapping_path} not found", file=sys.stderr)
-        sys.exit(1)
 
     strip_layers = 4 if args.strip else 0
     strip_experts = 4 if args.strip else 0
 
-    moe_infer.qwen35_moe_bq4_quantize(
+    bq4_quantize(
         args.model,
         args.output,
-        mapping_path,
-        qwen36=args.qwen36,
+        version=args.version,
         strip_layers=strip_layers,
         strip_experts=strip_experts,
     )
