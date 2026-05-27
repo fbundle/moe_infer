@@ -218,17 +218,26 @@ pub fn qwen35_moe_bq4_quantize(
             format!("Unknown version: {}. Expected '3.5' or '3.6'.", version)
         )),
     };
-    // Read architectures from model config.json
-    let config_path = std::path::Path::new(model_path).join("config.json");
-    let arch = std::fs::read_to_string(&config_path)
-        .map_err(|e| pyo3::exceptions::PyIOError::new_err(e.to_string()))
-        .and_then(|s| {
-            let v: serde_json::Value = serde_json::from_str(&s)
-                .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))?;
-            let arch = v["architectures"][0].as_str()
-                .unwrap_or("Qwen3_5MoeForConditionalGeneration");
-            Ok(arch.to_string())
-        })?;
+    // Read architectures from model config.json (handles both local and HF paths)
+    let config_json = if std::path::Path::new(model_path).is_dir() {
+        let config_path = std::path::Path::new(model_path).join("config.json");
+        std::fs::read_to_string(&config_path)
+            .map_err(|e| pyo3::exceptions::PyIOError::new_err(e.to_string()))?
+    } else {
+        let repo = crate::hf_util::HfRepo::from_hf(model_path)
+            .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e))?;
+        let config_path = repo.ensure("config.json")
+            .map_err(|e| pyo3::exceptions::PyIOError::new_err(e))?;
+        std::fs::read_to_string(&config_path)
+            .map_err(|e| pyo3::exceptions::PyIOError::new_err(e.to_string()))?
+    };
+    let arch = {
+        let v: serde_json::Value = serde_json::from_str(&config_json)
+            .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))?;
+        v["architectures"][0].as_str()
+            .unwrap_or("Qwen3_5MoeForConditionalGeneration")
+            .to_string()
+    };
     let quantize = match arch.as_str() {
         "Qwen3_5MoeForConditionalGeneration" =>
             Bq4::new(strip_layers, strip_experts, qwen_version),

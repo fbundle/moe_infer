@@ -12,19 +12,18 @@ use std::path::{Path, PathBuf};
 pub struct HfRepo {
     repo_id: Option<String>,
     staging: PathBuf,
-    _tmp_dir: Option<tempfile::TempDir>,
 }
 
 impl HfRepo {
     pub fn from_local(path: PathBuf) -> Self {
-        Self { repo_id: None, staging: path, _tmp_dir: None }
+        Self { repo_id: None, staging: path }
     }
 
     pub fn from_hf(repo_id: &str) -> Result<Self, String> {
         eprintln!("  Input '{}' not found locally — treating as HF repo ID", repo_id);
-        let tmp = tempfile::tempdir().map_err(|e| e.to_string())?;
-        let staging = tmp.path().to_path_buf();
-        Ok(Self { repo_id: Some(repo_id.to_owned()), staging, _tmp_dir: Some(tmp) })
+        let staging = PathBuf::from(format!("hub/models--{}", repo_id.replace('/', "--")));
+        fs::create_dir_all(&staging).map_err(|e| e.to_string())?;
+        Ok(Self { repo_id: Some(repo_id.to_owned()), staging })
     }
 
     pub fn is_hf(&self) -> bool { self.repo_id.is_some() }
@@ -96,7 +95,7 @@ fn download_hf(repo_id: &str, filename: &str, dest_dir: &Path) -> Result<PathBuf
 
     eprint!("  Downloading {} ...", filename);
 
-    let resp = ureq::get(&url)
+    let mut resp = ureq::get(&url)
         .call()
         .map_err(|e| format!("HTTP error for {filename}: {e}"))?;
 
@@ -108,7 +107,9 @@ fn download_hf(repo_id: &str, filename: &str, dest_dir: &Path) -> Result<PathBuf
         .unwrap_or(0);
 
     let data = resp
-        .into_body()
+        .body_mut()
+        .with_config()
+        .limit(5_000_000_000) // 5 GB — shard files can be several GB
         .read_to_vec()
         .map_err(|e| format!("read {filename}: {e}"))?;
     let n = data.len() as u64;
