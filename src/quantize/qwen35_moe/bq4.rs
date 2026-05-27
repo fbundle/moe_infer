@@ -1,13 +1,20 @@
 // Full A→Z quantization pipeline: read HF safetensors → classify → encode → write BQ4.
 //
 // Called from Python via a single `moe_infer.quantize()` function.
+//
+// Input can be either a local model directory or a HuggingFace repo ID
+// (e.g. "Qwen/Qwen3.6-35B-A3B").  In HF mode, files are downloaded one at
+// a time from the Hub and deleted after their tensors are processed.
+// This keeps peak disk usage near the size of one shard + the output.
 
-use crate::quant::{Quant, GROUP_SIZE, quant_f32_to_int4, quant_f32_to_int8, f32_to_bf16_u16};
-use crate::safetensors::{bytes_to_f32, parse_safetensors, read_tensor_bytes, ShardHeader};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs;
 use std::io::Write;
-use std::path::{Path, PathBuf};
+use std::path::Path;
+
+use crate::hf_util::HfRepo;
+use crate::quant::{Quant, GROUP_SIZE, quant_f32_to_int4, quant_f32_to_int8, f32_to_bf16_u16};
+use crate::safetensors::{bytes_to_f32, parse_safetensors, read_tensor_bytes};
 
 const ALIGN: u64 = 64;
 
@@ -140,13 +147,12 @@ fn extract_layer(name: &str) -> Option<usize> {
     let haystack = name;
     let mut start = 0;
     while let Some(pos) = haystack[start..].find("layers.") {
-        let after = start + pos + 7; // after "layers."
+        let after = start + pos + 7;
         let digits_end = haystack[after..]
             .find(|c: char| !c.is_ascii_digit())
             .unwrap_or(haystack.len() - after);
         if digits_end > 0 {
             if let Ok(n) = haystack[after..after + digits_end].parse::<usize>() {
-                // Check there's a dot after the digits (e.g. "layers.0." not "layers.0abc")
                 if after + digits_end < haystack.len()
                     && haystack.as_bytes()[after + digits_end] == b'.'
                 {
@@ -324,30 +330,21 @@ fn is_vision_tensor(mlx_name: &str) -> bool {
     mlx_name.starts_with("vision_tower.")
 }
 
-// ─── Expert pack size ────────────────────────────────────────────────────────
-
-#[allow(dead_code)]
-fn expert_pack_size(hd: usize, mi: usize) -> usize {
-    let gs = GROUP_SIZE;
-    let gate_w = mi * hd / 2;
-    let gate_sb = mi * (hd / gs) * 2;
-    let up_w = mi * hd / 2;
-    let up_sb = mi * (hd / gs) * 2;
-    let down_w = hd * mi / 2;
-    let down_sb = hd * (mi / gs) * 2;
-    gate_w + 2 * gate_sb + up_w + 2 * up_sb + down_w + 2 * down_sb
-}
-
 // ─── Main pipeline ───────────────────────────────────────────────────────────
 
 impl Bq4 {
     pub fn quantize(&self, input: &str, output: &str) -> Result<(), String> {
-    
-    let model_path = Path::new(input);
-    let output_dir = Path::new(output);
+
+    // ── 0. Local directory or HF repo? ────────────────────────────────
+    let repo = if Path::new(input).is_dir() {
+        HfRepo::from_local(Path::new(input).to_path_buf())
+    } else {
+        HfRepo::from_hf(input)?
+    };
 
     // ── 1. Load config ──────────────────────────────────────────────────
-    let params = load_config(model_path)?;
+    repo.ensure("config.json")?;
+    let params = load_config(repo.path())?;
     let hd = params.hidden_dim;
     let num_layers = params.num_layers;
     let mi = params.moe_intermediate;
@@ -379,8 +376,8 @@ impl Bq4 {
     eprintln!("  Name mapping entries: {}", name_map.len());
 
     // ── 3. Load weight map ──────────────────────────────────────────────
-    let index_path = model_path.join("model.safetensors.index.json");
-    let weight_map = if index_path.exists() {
+    let index_path = repo.ensure("model.safetensors.index.json")?;
+    let weight_map = {
         let idx_str = fs::read_to_string(&index_path).map_err(|e| e.to_string())?;
         let idx: serde_json::Value =
             serde_json::from_str(&idx_str).map_err(|e| e.to_string())?;
@@ -391,49 +388,32 @@ impl Bq4 {
             }
         }
         wm
-    } else {
-        eprintln!("  No safetensors index found, scanning shards...");
-        let mut wm = HashMap::new();
-        let mut shards: Vec<PathBuf> = Vec::new();
-        if let Ok(entries) = fs::read_dir(model_path) {
-            for entry in entries.flatten() {
-                let name = entry.file_name().to_string_lossy().to_string();
-                if name.starts_with("model-") && name.ends_with(".safetensors") {
-                    shards.push(entry.path());
-                }
-            }
-        }
-        shards.sort();
-        for shard_path in &shards {
-            let header = parse_safetensors(shard_path)?;
-            for k in header.tensors.keys() {
-                wm.insert(
-                    k.clone(),
-                    shard_path.file_name().unwrap().to_string_lossy().to_string(),
-                );
-            }
-        }
-        wm
     };
     eprintln!("  Total tensors: {}", weight_map.len());
 
     // ── 4. Classify tensors ─────────────────────────────────────────────
-    let mut non_expert: Vec<(String, String)> = Vec::new(); // (hf_name, shard)
-    let mut expert: Vec<(String, String)> = Vec::new();
+    #[derive(Clone)]
+    struct Classified {
+        hf_name: String,
+        shard: String,
+        mlx_name: String,
+        is_expert: bool,
+    }
+    let mut classified: Vec<Classified> = Vec::new();
     let mut unmapped: Vec<String> = Vec::new();
 
     for (hf_name, shard) in weight_map.iter() {
         match name_map.get(hf_name) {
             Some(mlx_name) => {
                 if is_vision_tensor(mlx_name) {
-                    // Vision encoder extracted separately — skip here.
                     continue;
                 }
-                if is_expert_tensor(mlx_name) {
-                    expert.push((hf_name.clone(), shard.clone()));
-                } else {
-                    non_expert.push((hf_name.clone(), shard.clone()));
-                }
+                classified.push(Classified {
+                    hf_name: hf_name.clone(),
+                    shard: shard.clone(),
+                    mlx_name: mlx_name.clone(),
+                    is_expert: is_expert_tensor(mlx_name),
+                });
             }
             None => unmapped.push(hf_name.clone()),
         }
@@ -447,75 +427,54 @@ impl Bq4 {
         ));
     }
 
-    non_expert.sort_by(|a, b| a.0.cmp(&b.0));
-    expert.sort_by(|a, b| a.0.cmp(&b.0));
-
-    eprintln!(
-        "  Non-expert: {}, Expert: {}",
-        non_expert.len(),
-        expert.len()
-    );
+    classified.sort_by(|a, b| a.hf_name.cmp(&b.hf_name));
+    let non_expert_count = classified.iter().filter(|c| !c.is_expert).count();
+    let expert_count = classified.iter().filter(|c| c.is_expert).count();
+    eprintln!("  Non-expert: {}, Expert: {}", non_expert_count, expert_count);
 
     // ── 4b. Strip mode ──────────────────────────────────────────────────
     let (eff_num_layers, eff_num_experts) = if self.strip_layers > 0 {
         let sl = self.strip_layers;
-        let se = if self.strip_experts > 0 {
-            self.strip_experts
-        } else {
-            num_experts
-        };
+        let se = if self.strip_experts > 0 { self.strip_experts } else { num_experts };
         eprintln!("  [strip] layers={}, experts={}", sl, se);
 
-        // Filter non-expert
-        non_expert.retain(|(hf_name, _)| {
-            match extract_layer(hf_name) {
-                Some(n) => n < sl,
-                None => true, // non-layered tensors
-            }
-        });
-        expert.retain(|(hf_name, _)| {
-            match extract_layer(hf_name) {
-                Some(n) => n < sl,
-                None => true,
-            }
+        classified.retain(|c| match extract_layer(&c.hf_name) {
+            Some(n) => n < sl,
+            None => true,
         });
 
-        eprintln!(
-            "  [strip] non-expert: {}, expert: {}",
-            non_expert.len(),
-            expert.len()
-        );
+        eprintln!("  [strip] non-expert: {}, expert: {}",
+            classified.iter().filter(|c| !c.is_expert).count(),
+            classified.iter().filter(|c| c.is_expert).count());
         (sl, se)
     } else {
         (num_layers, num_experts)
     };
 
-    // ── 5. Cache shard headers ──────────────────────────────────────────
-    let mut shard_set: HashSet<String> = HashSet::new();
-    for (_, shard) in non_expert.iter().chain(expert.iter()) {
-        shard_set.insert(shard.clone());
-    }
-    let mut header_cache: HashMap<String, ShardHeader> = HashMap::new();
-    for shard_name in &shard_set {
-        let shard_path = model_path.join(shard_name);
-        if shard_path.exists() {
-            eprintln!("  Caching header: {}", shard_name);
-            header_cache.insert(shard_name.clone(), parse_safetensors(&shard_path)?);
+    // ── 5. Group by shard ───────────────────────────────────────────────
+    let shard_order: Vec<String> = {
+        let mut set: HashSet<String> = HashSet::new();
+        for c in &classified {
+            set.insert(c.shard.clone());
         }
-    }
+        let mut v: Vec<String> = set.into_iter().collect();
+        v.sort();
+        v
+    };
 
     // ── 6. Create output directory ──────────────────────────────────────
+    let output_dir = Path::new(output);
     fs::create_dir_all(output_dir).map_err(|e| e.to_string())?;
     let experts_dir = output_dir.join("packed_experts");
     fs::create_dir_all(&experts_dir).map_err(|e| e.to_string())?;
 
-    // ── 7. Quantize non-expert → model_weights.bin + .json ──────────────
+    // ── 7. Process shards one at a time ─────────────────────────────────
     eprintln!("\n============================================================");
     eprintln!("Quantizing non-expert weights (BQ4)...");
     eprintln!("============================================================");
 
     let mut manifest: serde_json::Map<String, serde_json::Value> = serde_json::Map::new();
-    manifest.insert("model".into(), serde_json::Value::String(model_path.to_string_lossy().into()));
+    manifest.insert("model".into(), serde_json::Value::String(input.to_owned()));
 
     // Build config
     let mut cfg = serde_json::Map::new();
@@ -545,7 +504,6 @@ impl Bq4 {
     ins!("rope_theta", params.rope_theta);
     ins!("mtp_num_hidden_layers", if self.strip_layers > 0 { 0 } else { mtp_layers });
 
-    // Layer types
     let layer_types: Vec<String> = (0..eff_num_layers.min(num_main_layers))
         .map(|i| {
             if (i + 1) % full_attn_interval == 0 {
@@ -574,217 +532,189 @@ impl Bq4 {
     let t0 = std::time::Instant::now();
     let mut t_count: usize = 0;
 
-    for (hf_name, shard_name) in &non_expert {
-        // Check for Ctrl-C every 50 tensors
-        t_count += 1;
-        if t_count % 50 == 0 {
-            check_interrupt()?;
-        }
-        let header = header_cache
-            .get(shard_name)
-            .ok_or_else(|| format!("header not cached for {}", shard_name))?;
+    for shard_name in &shard_order {
+        // Ensure shard is available (download if HF mode)
+        let shard_path = repo.ensure(shard_name)?;
 
-        if !header.tensors.contains_key(hf_name) {
-            eprintln!("  WARNING: {} not in {}, skipping", hf_name, shard_name);
-            continue;
-        }
+        // Parse header
+        eprintln!("  Caching header: {}", shard_name);
+        let header = parse_safetensors(&shard_path)?;
 
-        let meta = &header.tensors[hf_name];
-        let shape = meta.shape.clone();
-        let dtype = meta.dtype.clone();
-        let mlx_name = name_map[hf_name].clone();
+        // Process tensors belonging to this shard
+        let shard_tensors: Vec<&Classified> = classified.iter().filter(|c| c.shard == *shard_name).collect();
 
-        // Read raw bytes
-        let raw_data = read_tensor_bytes(&model_path.join(shard_name), header, hf_name)?;
+        for c in &shard_tensors {
+            t_count += 1;
+            if t_count % 50 == 0 {
+                check_interrupt()?;
+            }
 
-        // Classify
-        let q = bq4(&mlx_name, &shape);
-        let q_str = q.as_str().to_string();
-        *quant_summary.entry(q_str.clone()).or_insert(0) += 1;
+            let meta = header.tensors.get(&c.hf_name)
+                .ok_or_else(|| format!("{} not found in {}", c.hf_name, shard_name))?;
+            let shape = meta.shape.clone();
+            let dtype = meta.dtype.clone();
 
-        // Read source as F32
-        let mut f32_vals = bytes_to_f32(&raw_data, &dtype);
-        let mut out_shape = shape.clone();
+            if c.is_expert {
+                // Expert tensors are processed in Phase 8 below.
+                continue;
+            }
 
-        // ── Sanitize (BF16 only) ────────────────────────────────────
-        // Qwen3.6 norm weights are shifted by -1.0 vs Qwen3.5 convention;
-        // --qwen36 flag applies the correction here.  conv1d.weight
-        // uses a different axis layout in HF (C,K,S) vs MLX (C,S,K).
-        if q == Quant::Bf16 {
-            if self.version.is_qwen36() && is_norm_key(&mlx_name) {
-                for v in &mut f32_vals {
-                    *v += 1.0;
+            // ── Non-expert processing ──────────────────────────────
+            let mlx_name = c.mlx_name.clone();
+            let q = bq4(&mlx_name, &shape);
+            let q_str = q.as_str().to_string();
+            *quant_summary.entry(q_str.clone()).or_insert(0) += 1;
+
+            // Read source as F32
+            let raw_data = read_tensor_bytes(&shard_path, &header, &c.hf_name)?;
+            let mut f32_vals = bytes_to_f32(&raw_data, &dtype);
+            let mut out_shape = shape.clone();
+
+            // ── Sanitize (BF16 only) ──────────────────────────────
+            if q == Quant::Bf16 {
+                if self.version.is_qwen36() && is_norm_key(&mlx_name) {
+                    for v in &mut f32_vals { *v += 1.0; }
+                }
+                if mlx_name.contains("conv1d.weight") && out_shape.len() == 3 {
+                    moveaxis_2_to_1(&mut f32_vals, &mut out_shape);
                 }
             }
-            if mlx_name.contains("conv1d.weight") && out_shape.len() == 3 {
-                moveaxis_2_to_1(&mut f32_vals, &mut out_shape);
-            }
-        }
 
-        // ── Pad inner dim for INT4 ──────────────────────────────────
-        let out_dim = out_shape[0];
-        let in_dim = if out_shape.len() >= 2 { out_shape[1] } else { 0 };
-        let (padded_in, f32_padded) = if q == Quant::Int4 {
-            let pi = (in_dim + GROUP_SIZE - 1) / GROUP_SIZE * GROUP_SIZE;
-            if pi != in_dim {
-                let mut p = vec![0.0f32; out_dim * pi];
-                for r in 0..out_dim {
-                    let src = r * in_dim;
-                    let dst = r * pi;
-                    p[dst..dst + in_dim].copy_from_slice(&f32_vals[src..src + in_dim]);
+            // ── Pad inner dim for INT4 ────────────────────────────
+            let out_dim = out_shape[0];
+            let in_dim = if out_shape.len() >= 2 { out_shape[1] } else { 0 };
+            let (padded_in, f32_padded) = if q == Quant::Int4 {
+                let pi = (in_dim + GROUP_SIZE - 1) / GROUP_SIZE * GROUP_SIZE;
+                if pi != in_dim {
+                    let mut p = vec![0.0f32; out_dim * pi];
+                    for r in 0..out_dim {
+                        let src = r * in_dim;
+                        let dst = r * pi;
+                        p[dst..dst + in_dim].copy_from_slice(&f32_vals[src..src + in_dim]);
+                    }
+                    (pi, p)
+                } else {
+                    (in_dim, f32_vals)
                 }
-                (pi, p)
             } else {
                 (in_dim, f32_vals)
-            }
-        } else {
-            (in_dim, f32_vals)
-        };
+            };
 
-        // ── Align ──────────────────────────────────────────────────
-        if offset % ALIGN != 0 {
-            let pad = ALIGN - (offset % ALIGN);
-            out_f
-                .write_all(&vec![0u8; pad as usize])
-                .map_err(|e| e.to_string())?;
-            offset += pad;
+            // ── Align ────────────────────────────────────────────
+            if offset % ALIGN != 0 {
+                let pad = ALIGN - (offset % ALIGN);
+                out_f.write_all(&vec![0u8; pad as usize]).map_err(|e| e.to_string())?;
+                offset += pad;
+            }
+
+            // ── Encode ───────────────────────────────────────────
+            let base = if mlx_name.ends_with(".weight") {
+                mlx_name[..mlx_name.len() - 7].to_string()
+            } else {
+                mlx_name.clone()
+            };
+
+            match q {
+                Quant::Int4 => {
+                    let (packed, scales, biases) = quant_f32_to_int4(&f32_padded, out_dim, padded_in);
+                    let num_groups = padded_in / GROUP_SIZE;
+
+                    let packed_bytes: Vec<u8> =
+                        packed.iter().flat_map(|v| v.to_le_bytes()).collect();
+                    let scales_bytes: Vec<u8> =
+                        scales.iter().flat_map(|v| v.to_le_bytes()).collect();
+                    let biases_bytes: Vec<u8> =
+                        biases.iter().flat_map(|v| v.to_le_bytes()).collect();
+
+                    for (data, suffix, data_shape, data_dtype) in [
+                        (packed_bytes, ".weight", vec![out_dim, padded_in / 8], "u32"),
+                        (scales_bytes, ".scales", vec![out_dim, num_groups], "bf16"),
+                        (biases_bytes, ".biases", vec![out_dim, num_groups], "bf16"),
+                    ] {
+                        let tname = format!("{}{}", base, suffix);
+                        let dlen = data.len() as u64;
+                        out_f.write_all(&data).map_err(|e| e.to_string())?;
+                        let mut entry = serde_json::Map::new();
+                        entry.insert("offset".into(), serde_json::Value::from(offset));
+                        entry.insert("size".into(), serde_json::Value::from(dlen));
+                        entry.insert("shape".into(), serde_json::Value::Array(
+                            data_shape.iter().map(|&n| serde_json::Value::from(n as u64)).collect(),
+                        ));
+                        entry.insert("dtype".into(), serde_json::Value::String(data_dtype.into()));
+                        tensors_map.insert(tname, serde_json::Value::Object(entry));
+                        offset += dlen;
+                        total_bytes += dlen;
+                        tensor_count += 1;
+                    }
+                }
+                Quant::Fp32 => {
+                    let data: Vec<u8> = f32_padded.iter().flat_map(|v| v.to_le_bytes()).collect();
+                    let dlen = data.len() as u64;
+                    out_f.write_all(&data).map_err(|e| e.to_string())?;
+                    let mut entry = serde_json::Map::new();
+                    entry.insert("offset".into(), serde_json::Value::from(offset));
+                    entry.insert("size".into(), serde_json::Value::from(dlen));
+                    entry.insert("shape".into(), serde_json::Value::Array(
+                        out_shape.iter().map(|&n| serde_json::Value::from(n as u64)).collect(),
+                    ));
+                    entry.insert("dtype".into(), serde_json::Value::String("f32".into()));
+                    tensors_map.insert(base, serde_json::Value::Object(entry));
+                    offset += dlen;
+                    total_bytes += dlen;
+                    tensor_count += 1;
+                }
+                Quant::Int8 => {
+                    let (packed, scales) = quant_f32_to_int8(&f32_padded, out_dim, in_dim);
+                    let packed_bytes: Vec<u8> = unsafe {
+                        std::slice::from_raw_parts(packed.as_ptr() as *const u8, packed.len()).to_vec()
+                    };
+                    let scales_bytes: Vec<u8> =
+                        scales.iter().flat_map(|v| v.to_le_bytes()).collect();
+
+                    for (data, suffix, data_shape, data_dtype) in [
+                        (packed_bytes, ".weight", vec![out_dim, in_dim], "u8"),
+                        (scales_bytes, ".scales", vec![out_dim], "f32"),
+                    ] {
+                        let tname = format!("{}{}", base, suffix);
+                        let dlen = data.len() as u64;
+                        out_f.write_all(&data).map_err(|e| e.to_string())?;
+                        let mut entry = serde_json::Map::new();
+                        entry.insert("offset".into(), serde_json::Value::from(offset));
+                        entry.insert("size".into(), serde_json::Value::from(dlen));
+                        entry.insert("shape".into(), serde_json::Value::Array(
+                            data_shape.iter().map(|&n| serde_json::Value::from(n as u64)).collect(),
+                        ));
+                        entry.insert("dtype".into(), serde_json::Value::String(data_dtype.into()));
+                        tensors_map.insert(tname, serde_json::Value::Object(entry));
+                        offset += dlen;
+                        total_bytes += dlen;
+                        tensor_count += 1;
+                    }
+                }
+                Quant::Bf16 => {
+                    let bf16 = f32_to_bf16_u16(&f32_padded);
+                    let data: Vec<u8> = bf16.iter().flat_map(|v| v.to_le_bytes()).collect();
+                    let dlen = data.len() as u64;
+                    out_f.write_all(&data).map_err(|e| e.to_string())?;
+                    let mut entry = serde_json::Map::new();
+                    entry.insert("offset".into(), serde_json::Value::from(offset));
+                    entry.insert("size".into(), serde_json::Value::from(dlen));
+                    entry.insert("shape".into(), serde_json::Value::Array(
+                        out_shape.iter().map(|&n| serde_json::Value::from(n as u64)).collect(),
+                    ));
+                    entry.insert("dtype".into(), serde_json::Value::String("bf16".into()));
+                    tensors_map.insert(mlx_name.clone(), serde_json::Value::Object(entry));
+                    offset += dlen;
+                    total_bytes += dlen;
+                    tensor_count += 1;
+                }
+            }
         }
 
-        // ── Encode ─────────────────────────────────────────────────
-        let base = if mlx_name.ends_with(".weight") {
-            mlx_name[..mlx_name.len() - 7].to_string()
-        } else {
-            mlx_name.clone()
-        };
-
-        match q {
-            Quant::Int4 => {
-                let (packed, scales, biases) =
-                    quant_f32_to_int4(&f32_padded, out_dim, padded_in);
-                let num_groups = padded_in / GROUP_SIZE;
-
-                let packed_bytes: Vec<u8> =
-                    packed.iter().flat_map(|v| v.to_le_bytes()).collect();
-                let scales_bytes: Vec<u8> =
-                    scales.iter().flat_map(|v| v.to_le_bytes()).collect();
-                let biases_bytes: Vec<u8> =
-                    biases.iter().flat_map(|v| v.to_le_bytes()).collect();
-
-                for (data, suffix, data_shape, data_dtype) in [
-                    (packed_bytes, ".weight", vec![out_dim, padded_in / 8], "u32"),
-                    (scales_bytes, ".scales", vec![out_dim, num_groups], "bf16"),
-                    (biases_bytes, ".biases", vec![out_dim, num_groups], "bf16"),
-                ] {
-                    let tname = format!("{}{}", base, suffix);
-                    let dlen = data.len() as u64;
-                    out_f.write_all(&data).map_err(|e| e.to_string())?;
-                    let mut entry = serde_json::Map::new();
-                    entry.insert("offset".into(), serde_json::Value::from(offset));
-                    entry.insert("size".into(), serde_json::Value::from(dlen));
-                    entry.insert(
-                        "shape".into(),
-                        serde_json::Value::Array(
-                            data_shape
-                                .iter()
-                                .map(|&n| serde_json::Value::from(n as u64))
-                                .collect(),
-                        ),
-                    );
-                    entry.insert("dtype".into(), serde_json::Value::String(data_dtype.into()));
-                    tensors_map.insert(tname, serde_json::Value::Object(entry));
-                    offset += dlen;
-                    total_bytes += dlen;
-                    tensor_count += 1;
-                }
-            }
-            Quant::Fp32 => {
-                let data = f32_padded
-                    .iter()
-                    .flat_map(|v| v.to_le_bytes())
-                    .collect::<Vec<u8>>();
-                let dlen = data.len() as u64;
-                out_f.write_all(&data).map_err(|e| e.to_string())?;
-                let mut entry = serde_json::Map::new();
-                entry.insert("offset".into(), serde_json::Value::from(offset));
-                entry.insert("size".into(), serde_json::Value::from(dlen));
-                entry.insert(
-                    "shape".into(),
-                    serde_json::Value::Array(
-                        out_shape
-                            .iter()
-                            .map(|&n| serde_json::Value::from(n as u64))
-                            .collect(),
-                    ),
-                );
-                entry.insert("dtype".into(), serde_json::Value::String("f32".into()));
-                tensors_map.insert(base, serde_json::Value::Object(entry));
-                offset += dlen;
-                total_bytes += dlen;
-                tensor_count += 1;
-            }
-            Quant::Int8 => {
-                let (packed, scales) =
-                    quant_f32_to_int8(&f32_padded, out_dim, in_dim);
-
-                // Convert Vec<i8> → bytes (safe: transmute is fine for i8)
-                let packed_bytes: Vec<u8> = unsafe {
-                    std::slice::from_raw_parts(
-                        packed.as_ptr() as *const u8,
-                        packed.len(),
-                    ).to_vec()
-                };
-                let scales_bytes: Vec<u8> =
-                    scales.iter().flat_map(|v| v.to_le_bytes()).collect();
-
-                for (data, suffix, data_shape, data_dtype) in [
-                    (packed_bytes, ".weight", vec![out_dim, in_dim], "u8"),
-                    (scales_bytes, ".scales", vec![out_dim], "f32"),
-                ] {
-                    let tname = format!("{}{}", base, suffix);
-                    let dlen = data.len() as u64;
-                    out_f.write_all(&data).map_err(|e| e.to_string())?;
-                    let mut entry = serde_json::Map::new();
-                    entry.insert("offset".into(), serde_json::Value::from(offset));
-                    entry.insert("size".into(), serde_json::Value::from(dlen));
-                    entry.insert(
-                        "shape".into(),
-                        serde_json::Value::Array(
-                            data_shape
-                                .iter()
-                                .map(|&n| serde_json::Value::from(n as u64))
-                                .collect(),
-                        ),
-                    );
-                    entry.insert("dtype".into(), serde_json::Value::String(data_dtype.into()));
-                    tensors_map.insert(tname, serde_json::Value::Object(entry));
-                    offset += dlen;
-                    total_bytes += dlen;
-                    tensor_count += 1;
-                }
-            }
-            Quant::Bf16 => {
-                let bf16 = f32_to_bf16_u16(&f32_padded);
-                let data: Vec<u8> = bf16.iter().flat_map(|v| v.to_le_bytes()).collect();
-                let dlen = data.len() as u64;
-                out_f.write_all(&data).map_err(|e| e.to_string())?;
-                let mut entry = serde_json::Map::new();
-                entry.insert("offset".into(), serde_json::Value::from(offset));
-                entry.insert("size".into(), serde_json::Value::from(dlen));
-                entry.insert(
-                    "shape".into(),
-                    serde_json::Value::Array(
-                        out_shape
-                            .iter()
-                            .map(|&n| serde_json::Value::from(n as u64))
-                            .collect(),
-                    ),
-                );
-                entry.insert("dtype".into(), serde_json::Value::String("bf16".into()));
-                tensors_map.insert(mlx_name.clone(), serde_json::Value::Object(entry));
-                offset += dlen;
-                total_bytes += dlen;
-                tensor_count += 1;
-            }
+        // Done with this shard — delete to save storage
+        if repo.is_hf() {
+            repo.remove(shard_name);
+            eprintln!("  Deleted {}", shard_name);
         }
     }
 
@@ -811,64 +741,71 @@ impl Bq4 {
     fs::write(&json_path, json_str).map_err(|e| e.to_string())?;
     eprintln!("  Manifest: {}", json_path.display());
 
-    // ── 8. Repack experts ──────────────────────────────────────────────
+    // ── 8. Process experts (HF mode: download shards again as needed) ────
     eprintln!("\n============================================================");
     eprintln!("Quantizing expert weights (int4)...");
     eprintln!("============================================================");
 
     let t1 = std::time::Instant::now();
+    let mut expert_layers_done = 0usize;
 
-    // Group expert tensors by layer index
-    let mut expert_layers: BTreeMap<usize, (String, String)> = BTreeMap::new();
-    // layer_idx → (gate_up_proj_hf, down_proj_hf)
-
-    for (hf_name, _shard) in &expert {
-        if let Some(layer) = extract_layer(hf_name) {
-            let entry = expert_layers.entry(layer).or_insert_with(|| (String::new(), String::new()));
-            if hf_name.contains("gate_up_proj") || hf_name.contains("gate_.biases") || hf_name.contains("gate_.scales") {
-                // The actual weight key for gate_up_proj
-                if !hf_name.contains("biases") && !hf_name.contains("scales") {
-                    entry.0 = hf_name.clone();
-                }
-            } else if hf_name.contains("down_proj") && !hf_name.contains("biases") && !hf_name.contains("scales") {
-                entry.1 = hf_name.clone();
+    // Group expert tensors by layer
+    let mut expert_by_layer: BTreeMap<usize, (String, String)> = BTreeMap::new();
+    for c in &classified {
+        if !c.is_expert { continue; }
+        if let Some(layer) = extract_layer(&c.hf_name) {
+            let entry = expert_by_layer.entry(layer).or_insert_with(|| (String::new(), String::new()));
+            if c.mlx_name.contains("gate_up_proj") {
+                entry.0 = c.hf_name.clone(); // gate_up key
+            } else if c.mlx_name.contains("down_proj") {
+                entry.1 = c.hf_name.clone(); // down key
             }
         }
     }
 
-    let mut expert_layers_done = 0usize;
-
-    for (layer_idx, (gate_up_key, down_key)) in &expert_layers {
-        // Check for Ctrl-C on each layer
+    for (layer_idx, (gate_up_key, down_key)) in &expert_by_layer {
         check_interrupt()?;
         if gate_up_key.is_empty() || down_key.is_empty() {
             eprintln!("  Layer {} SKIPPED (missing keys)", layer_idx);
             continue;
         }
 
-        // Determine which shard has these tensors
+        // Determine which shards we need
         let gu_shard = weight_map.get(gate_up_key).ok_or("shard not found")?;
         let down_shard = weight_map.get(down_key).ok_or("shard not found")?;
 
-        let gu_header = header_cache.get(gu_shard).ok_or("header not cached")?;
-        let down_header = header_cache.get(down_shard).ok_or("header not cached")?;
+        // Download the two shards (or one if same)
+        let gu_path = repo.ensure(gu_shard)?;
+        let down_path = if gu_shard == down_shard {
+            gu_path.clone()
+        } else {
+            repo.ensure(down_shard)?
+        };
+
+        let gu_header = parse_safetensors(&gu_path)?;
+        let down_header = parse_safetensors(&down_path)?;
 
         // Read gate_up_proj (fused [E, 2*I, H] as BF16)
-        let gu_raw = read_tensor_bytes(&model_path.join(gu_shard), gu_header, gate_up_key)?;
+        let gu_raw = read_tensor_bytes(&gu_path, &gu_header, gate_up_key)?;
         let gu_f32 = bytes_to_f32(&gu_raw, &gu_header.tensors[gate_up_key].dtype);
-        // gu_f32 shape: [E, 2*I, H]
 
         // Read down_proj ([E, H, I] as BF16)
-        let down_raw =
-            read_tensor_bytes(&model_path.join(down_shard), down_header, down_key)?;
+        let down_raw = read_tensor_bytes(&down_path, &down_header, down_key)?;
         let down_f32 = bytes_to_f32(&down_raw, &down_header.tensors[down_key].dtype);
-        // down_f32 shape: [E, H, I]
 
+        // Delete shards after reading
+        if repo.is_hf() {
+            repo.remove(gu_shard);
+            if gu_shard != down_shard {
+                repo.remove(down_shard);
+            }
+        }
+
+        // ── Quantize and pack ────────────────────────────────────
         let inter = mi;
         let hidden = hd;
         let gs = GROUP_SIZE;
 
-        // Layout per expert
         let gate_w_bytes = inter * (hidden / 8) * 4;
         let gate_s_bytes = inter * (hidden / gs) * 2;
         let gate_b_bytes = gate_s_bytes;
@@ -885,7 +822,6 @@ impl Bq4 {
         let mut buf = vec![0u8; eff_num_experts * expert_size];
 
         for e in 0..eff_num_experts {
-            // Extract gate [I, H] and up [I, H] from fused gate_up [2*I, H]
             let gu_base = e * (2 * inter * hidden);
             let gate_f32: Vec<f32> = gu_f32[gu_base..gu_base + inter * hidden].to_vec();
             let up_f32: Vec<f32> =
@@ -896,44 +832,34 @@ impl Bq4 {
 
             let (gate_p, gate_s, gate_b) = quant_f32_to_int4(&gate_f32, inter, hidden);
             let (up_p, up_s, up_b) = quant_f32_to_int4(&up_f32, inter, hidden);
-            let (down_p, down_s, down_b) =
-                quant_f32_to_int4(&down_f32_e, hidden, inter);
+            let (down_p, down_s, down_b) = quant_f32_to_int4(&down_f32_e, hidden, inter);
 
             let base = e * expert_size;
 
-            // Gate weight (u32)
             let bytes: Vec<u8> = gate_p.iter().flat_map(|v| v.to_le_bytes()).collect();
             buf[base..base + gate_w_bytes].copy_from_slice(&bytes);
             let mut pos = base + gate_w_bytes;
-            // Gate scales (u16)
             let bytes: Vec<u8> = gate_s.iter().flat_map(|v| v.to_le_bytes()).collect();
             buf[pos..pos + gate_s_bytes].copy_from_slice(&bytes);
             pos += gate_s_bytes;
-            // Gate biases (u16)
             let bytes: Vec<u8> = gate_b.iter().flat_map(|v| v.to_le_bytes()).collect();
             buf[pos..pos + gate_b_bytes].copy_from_slice(&bytes);
             pos += gate_b_bytes;
-            // Up weight (u32)
             let bytes: Vec<u8> = up_p.iter().flat_map(|v| v.to_le_bytes()).collect();
             buf[pos..pos + up_w_bytes].copy_from_slice(&bytes);
             pos += up_w_bytes;
-            // Up scales (u16)
             let bytes: Vec<u8> = up_s.iter().flat_map(|v| v.to_le_bytes()).collect();
             buf[pos..pos + up_s_bytes].copy_from_slice(&bytes);
             pos += up_s_bytes;
-            // Up biases (u16)
             let bytes: Vec<u8> = up_b.iter().flat_map(|v| v.to_le_bytes()).collect();
             buf[pos..pos + up_b_bytes].copy_from_slice(&bytes);
             pos += up_b_bytes;
-            // Down weight (u32)
             let bytes: Vec<u8> = down_p.iter().flat_map(|v| v.to_le_bytes()).collect();
             buf[pos..pos + down_w_bytes].copy_from_slice(&bytes);
             pos += down_w_bytes;
-            // Down scales (u16)
             let bytes: Vec<u8> = down_s.iter().flat_map(|v| v.to_le_bytes()).collect();
             buf[pos..pos + down_s_bytes].copy_from_slice(&bytes);
             pos += down_s_bytes;
-            // Down biases (u16)
             let bytes: Vec<u8> = down_b.iter().flat_map(|v| v.to_le_bytes()).collect();
             buf[pos..pos + down_b_bytes].copy_from_slice(&bytes);
         }
@@ -964,21 +890,13 @@ impl Bq4 {
 
     // ── 10. Summary ─────────────────────────────────────────────────────
     let total_time = t0.elapsed();
-    let bin_size = fs::metadata(&bin_path)
-        .map(|m| m.len())
-        .unwrap_or(0);
+    let bin_size = fs::metadata(&bin_path).map(|m| m.len()).unwrap_or(0);
     eprintln!("\n============================================================");
     eprintln!("Done!");
-    eprintln!(
-        "  model_weights.bin : {:.2} GB",
-        bin_size as f64 / 1e9
-    );
+    eprintln!("  model_weights.bin : {:.2} GB", bin_size as f64 / 1e9);
     eprintln!("  model_weights.json: {}", json_path.display());
     eprintln!("  packed_experts    : {} layers", expert_layers_done);
-    eprintln!(
-        "  Total time        : {:.1}s",
-        total_time.as_secs_f64()
-    );
+    eprintln!("  Total time        : {:.1}s", total_time.as_secs_f64());
     eprintln!("============================================================");
 
     Ok(())

@@ -5,7 +5,7 @@
 mod cache;
 mod constants;
 mod error;
-mod huggingface;
+pub mod hf_util;
 mod quant;
 mod safetensors;
 #[path = "quantize/qwen35_moe/bq4.rs"] pub mod bq4;
