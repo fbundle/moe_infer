@@ -1,6 +1,6 @@
 [package]
 name = "_moe_infer_rs"
-version = "0.1.0"
+version = "0.1.3"
 edition = "2021"
 description = "Rust port of Flash-MoE Metal inference engine for MoE models on Apple Silicon"
 

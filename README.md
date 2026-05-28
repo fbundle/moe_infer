@@ -15,7 +15,7 @@ Open Terminal and run these commands from the project folder:
 
 ```bash
 # 1. Build and install
-uv add moe_infer[all]  # or `uv sync --reinstall --extra vision` if you live inside this project
+uv add moe_infer[all]  # or `uv build; uv sync --extra vision` if you live inside this project
 
 # 2. Download the model (about 70 GB)
 hf download Qwen/Qwen3.6-35B-A3B \
@@ -30,7 +30,7 @@ If you live in a cave, you can install with pip `pip install moe_infer[all]`
 from moe_infer.qwen35_moe import convert
 
 
-# BQ4 only (selective quantization — smaller, faster)
+# BQ4 only (block-aware quantization)
 convert('hub/models--Qwen--Qwen3.6-35B-A3B', 'data/Qwen3.6-35B-A3B', version='3.6')
 
 # INT4 only (all weights quantized)

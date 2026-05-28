@@ -46,6 +46,20 @@ pub trait Engine {
         check_signal: SignalCheckFn<'_>,
     ) -> Result<Vec<f32>, MoEError>;
 
+    /// H pre-norm from the last forward pass (before final norm + lm_head).
+    /// Only populated by engines that support MTP.
+    fn last_h_pre_norm(&self) -> &[f32] { &[] }
+
+    /// MTP draft step: (last_h_pre_norm, token_id) → logits.
+    /// Returns empty vec if MTP is not supported.
+    fn mtp_forward(&mut self, _token_id: usize) -> Vec<f32> { Vec::new() }
+
+    /// Reset MTP KV cache.
+    fn mtp_reset(&mut self) {}
+
+    /// Roll back MTP KV cache to a specific position.
+    fn mtp_rollback(&mut self, _pos: usize) {}
+
     /// Per-engine telemetry. Keys are like `engine.*`.
     /// Values can be scalars or per-invocation lists.
     fn telemetry(&self) -> BTreeMap<String, TelemetryValue> {
@@ -66,6 +80,8 @@ mod fused_exp2;
 pub mod metal_context;
 #[path = "engine/qwen35_moe/metal_kernels.rs"]
 mod metal_kernels;
+#[path = "engine/qwen35_moe/mtp.rs"]
+pub mod mtp;
 
 use crate::engine::qwen35_constants::{FullModel, StrippedModel};
 use crate::engine::fused_exp1::FusedExp1;
@@ -117,6 +133,22 @@ impl DynEngine {
 
     pub fn forward_hidden(&mut self, embeddings: &[f32], check_signal: SignalCheckFn<'_>) -> Result<Vec<f32>, MoEError> {
         self.inner.forward_hidden(embeddings, check_signal)
+    }
+
+    pub fn last_h_pre_norm(&self) -> &[f32] {
+        self.inner.last_h_pre_norm()
+    }
+
+    pub fn mtp_forward(&mut self, token_id: usize) -> Vec<f32> {
+        self.inner.mtp_forward(token_id)
+    }
+
+    pub fn mtp_reset(&mut self) {
+        self.inner.mtp_reset()
+    }
+
+    pub fn mtp_rollback(&mut self, pos: usize) {
+        self.inner.mtp_rollback(pos)
     }
 
     pub fn telemetry(&self) -> BTreeMap<String, TelemetryValue> {

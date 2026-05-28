@@ -190,6 +190,33 @@ impl Engine {
         Ok(dict.into_pyobject(py)?.into_any().into())
     }
 
+    /// H pre-norm from the last forward pass (needed by MTP draft).
+    fn last_h_pre_norm(&self, py: Python<'_>) -> PyResult<PyObject> {
+        let h = self.engine.last_h_pre_norm();
+        let arr = PyArray1::<f32>::from_owned_array(py,
+            numpy::ndarray::Array1::from_vec(h.to_vec()));
+        Ok(arr.into_pyobject(py)?.into_any().into())
+    }
+
+    /// MTP draft step: (last_h_pre_norm, token_id) → logits.
+    fn mtp_forward(&mut self, py: Python<'_>, token_id: i64) -> PyResult<PyObject> {
+        let logits = self.engine.mtp_forward(token_id as usize);
+        let vs = logits.len();
+        let arr = PyArray1::<f32>::from_owned_array(py,
+            numpy::ndarray::Array1::from_vec(logits));
+        Ok(arr.into_pyobject(py)?.into_any().into())
+    }
+
+    /// Reset MTP KV cache (call when starting new sequence or after verification).
+    fn mtp_reset(&mut self) {
+        self.engine.mtp_reset();
+    }
+
+    /// Roll back MTP KV cache to a specific position (after partial accept).
+    fn mtp_rollback(&mut self, pos: usize) {
+        self.engine.mtp_rollback(pos);
+    }
+
     fn __repr__(&self) -> String {
         format!("Engine(loaded: {} layers, hidden={})",
             self.model.config.get_usize("num_hidden_layers").unwrap_or(0),

@@ -52,6 +52,7 @@ pub struct BQ4Scheme {
     name_map: NameMap,
     eff_num_layers: usize,
     eff_num_experts: usize,
+    mtp_offset: usize,
 }
 
 impl BQ4Scheme {
@@ -60,21 +61,22 @@ impl BQ4Scheme {
         let num_layers = params.num_layers;
         let num_experts = params.num_experts;
 
-        let eff_num_layers = num_layers;
+        let eff_num_layers = num_layers + params.mtp_num_layers;
         let eff_num_experts = num_experts;
+        let mtp_offset = num_layers;
 
         let name_map = load_name_mapping(NAME_MAPPING_JSON, num_layers)?;
 
         eprintln!("Model config:");
         eprintln!("  hidden_dim={}, vocab_size={}", params.hidden_dim, params.vocab_size);
         eprintln!("  num_layers={} (main={}, mtp={})",
-            num_layers, num_layers - params.mtp_num_layers, params.mtp_num_layers);
+            eff_num_layers, num_layers, params.mtp_num_layers);
         eprintln!("  num_experts={}, experts_per_tok={}", num_experts, params.num_experts_per_tok);
         eprintln!("  moe_intermediate={}, shared_intermediate={}",
             params.moe_intermediate, params.shared_intermediate);
         eprintln!("  Name mapping entries: {}", name_map.len());
 
-        Ok(Self { version, params, name_map, eff_num_layers, eff_num_experts })
+        Ok(Self { version, params, name_map, eff_num_layers, eff_num_experts, mtp_offset })
     }
 }
 
@@ -94,6 +96,11 @@ impl QuantScheme for BQ4Scheme {
 
         if is_expert_tensor(&mlx_name) {
             if let Some(layer) = extract_layer(hf_name) {
+                let layer = if hf_name.starts_with("mtp.") {
+                    layer + self.mtp_offset
+                } else {
+                    layer
+                };
                 let q = bq4(&mlx_name, shape);
                 return WeightClass { name: mlx_name, quant: q, kind: WeightKind::Expert(layer) };
             }

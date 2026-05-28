@@ -192,8 +192,8 @@ const MLX_NORM_KEYS: &[&str] = &[
     ".k_norm.weight",
 ];
 const MTP_NORM_KEYS: &[&str] = &[
-    ".hnorm.weight", ".enorm.weight", ".shared_head.norm.weight",
-    ".norm1.weight", ".norm2.weight",
+    ".pre_fc_norm_hidden.weight", ".pre_fc_norm_embedding.weight",
+    ".norm.weight",  // matches mtp.norm.weight
 ];
 
 pub(crate) fn is_norm_key(mlx_name: &str) -> bool {
@@ -365,10 +365,11 @@ pub(crate) fn write_manifest_config_common(
     ins!("linear_conv_kernel_dim", p.linear_conv_kernel_dim);
     ins!("partial_rotary_factor", p.partial_rotary_factor);
     ins!("rope_theta", p.rope_theta);
-    ins!("mtp_num_hidden_layers", if eff_num_layers < p.num_layers { 0 } else { p.mtp_num_layers });
+    ins!("mtp_num_hidden_layers", p.mtp_num_layers);
 
-    let num_main = p.num_layers - p.mtp_num_layers;
-    let layer_types: Vec<String> = (0..eff_num_layers.min(num_main))
+    let num_main = p.num_layers;
+    let num_total = eff_num_layers;
+    let mut layer_types: Vec<String> = (0..num_main)
         .map(|i| {
             if (i + 1) % p.full_attn_interval == 0 {
                 "full_attention".to_string()
@@ -377,6 +378,10 @@ pub(crate) fn write_manifest_config_common(
             }
         })
         .collect();
+    // MTP layers: treated as full_attention blocks
+    for _ in num_main..num_total {
+        layer_types.push("full_attention".to_string());
+    }
     cfg.insert("layer_types".into(), serde_json::Value::Array(
         layer_types.iter().map(|s| serde_json::Value::String(s.clone())).collect()
     ));

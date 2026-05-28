@@ -18,6 +18,7 @@ use metal::{Buffer, CommandBuffer, ComputeCommandEncoderRef, MTLSize};
 
 use crate::engine::metal_kernels;
 use crate::engine::metal_context::{metal_buf_shared, WeightBuffer, MetalContext, ExpertBuffer, MAX_K};
+use crate::engine::mtp::{MtpState, mtp_step};
 use crate::cache::Cache;
 use crate::engine::Engine;
 use crate::model::Model;
@@ -863,6 +864,8 @@ pub struct FusedExp2<C: ModelConfig> {
     pub expert_buffer: ExpertBuffer,
     pub k: usize,
     pub timing: BTreeMap<String, TelemetryValue>,
+    pub last_h_pre_norm: Vec<f32>,
+    pub mtp_state: Option<MtpState>,
     _phantom: PhantomData<C>,
 }
 
@@ -881,10 +884,22 @@ impl<C: ModelConfig> FusedExp2<C> {
         //     "language_model.model.layers.3.mlp.shared_expert.gate_proj",
         //     C::SHARED_INTERMEDIATE, C::HIDDEN_DIM);
 
+        // Detect MTP support
+        let mtp_num_layers = model.config.get_usize("mtp_num_hidden_layers").unwrap_or(0);
+        let mtp_state = if mtp_num_layers > 0 {
+            eprintln!("[engine] MTP detected: {} layer(s), expert file index={}",
+                mtp_num_layers, C::NUM_LAYERS);
+            Some(MtpState::new(&ctx.device, C::NUM_KV_HEADS * C::HEAD_DIM))
+        } else {
+            None
+        };
+
         Ok(FusedExp2 {
             model, ctx, weight_buffer, expert_buffer,
             k: if k == 0 { C::NUM_EXPERTS_PER_TOK } else { k },
             timing: BTreeMap::new(),
+            last_h_pre_norm: Vec::new(),
+            mtp_state,
             _phantom: PhantomData,
         })
     }
@@ -940,6 +955,8 @@ impl<C: ModelConfig> Engine for FusedExp2<C> {
                 }
 
                 let mut hidden = exec.hidden_wait();
+                // Save h_pre_norm before final norm + lm_head consumes it
+                exec.engine.last_h_pre_norm = hidden.clone();
                 pos += 1;
                 exec.engine.ctx.pos.set(pos);
 
@@ -951,7 +968,74 @@ impl<C: ModelConfig> Engine for FusedExp2<C> {
         Ok(logits)
     }
 
+    fn last_h_pre_norm(&self) -> &[f32] {
+        &self.last_h_pre_norm
+    }
+
+    fn mtp_forward(&mut self, token_id: usize) -> Vec<f32> {
+        self.mtp_forward_impl(token_id)
+    }
+
+    fn mtp_reset(&mut self) {
+        self.mtp_reset_impl()
+    }
+
+    fn mtp_rollback(&mut self, pos: usize) {
+        self.mtp_rollback_impl(pos)
+    }
+
     fn telemetry(&self) -> BTreeMap<String, TelemetryValue> {
         self.timing.clone()
+    }
+}
+
+impl<C: ModelConfig> FusedExp2<C> {
+    /// Run one MTP draft step: (h_pre_norm, token_id) → logits.
+    /// Returns empty vec if MTP is not available.
+    fn mtp_forward_impl(&mut self, token_id: usize) -> Vec<f32> {
+        let mtp_state = match self.mtp_state.as_mut() {
+            Some(s) => s,
+            None => {
+                eprintln!("[mtp_forward] MTP not available");
+                return Vec::new();
+            }
+        };
+
+        let expert_file = &self.model.expert_files[C::NUM_LAYERS]; // MTP experts at index NUM_LAYERS
+        let h = self.last_h_pre_norm.clone();
+
+        mtp_step(
+            &self.model.weight_file,
+            &self.weight_buffer,
+            &self.expert_buffer,
+            mtp_state,
+            &self.ctx,
+            &h,
+            token_id,
+            C::HIDDEN_DIM,
+            C::NUM_ATTN_HEADS,
+            C::NUM_KV_HEADS,
+            C::HEAD_DIM,
+            C::NUM_EXPERTS,
+            C::NUM_EXPERTS_PER_TOK,
+            C::MOE_INTERMEDIATE,
+            C::SHARED_INTERMEDIATE,
+            C::VOCAB_SIZE,
+            expert_file,
+        )
+    }
+
+    /// Reset MTP KV cache (call when starting a new sequence).
+    fn mtp_reset_impl(&mut self) {
+        if let Some(ref mut s) = self.mtp_state {
+            s.reset();
+        }
+    }
+
+    /// Roll back MTP KV cache to a specific position (after partial accept).
+    fn mtp_rollback_impl(&mut self, pos: usize) {
+        if let Some(ref mut s) = self.mtp_state {
+            s.rollback(pos);
+        }
     }
 }

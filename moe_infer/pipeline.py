@@ -13,7 +13,7 @@ import numpy as np
 
 import _moe_infer_rs as _rs  # type: ignore[import-untyped]
 
-from moe_infer.generation import generate_from
+from moe_infer.generation import generate_from, generate_from_mtp
 from moe_infer.hub import load_tokenizer
 
 
@@ -43,6 +43,20 @@ def _preprocess_image(path: str, processor: Any, min_pixels: int, max_pixels: in
     grid = inputs["image_grid_thw"]
     n_merged = int((grid[0, 1] // 2) * (grid[0, 2] // 2))
     return pv, grid, n_merged
+
+
+def _check_mtp(model_dir: str) -> bool:
+    """Return True if the quantized model has MTP layers."""
+    import json
+    import os
+
+    cfg_path = os.path.join(model_dir, "config.json")
+    try:
+        with open(cfg_path) as f:
+            cfg = json.load(f)
+    except (OSError, json.JSONDecodeError):
+        return False
+    return cfg.get("mtp_num_hidden_layers", 0) > 0
 
 
 def _word_stream(
@@ -182,6 +196,9 @@ class Pipeline:
         self._engine = _rs.Engine(self._model, mode, k)
         self._cache = _rs.Cache(self._model)
 
+        # Detect MTP support
+        self._has_mtp = _check_mtp(model_path)
+
         # Tokenizer
         if tokenizer is not None:
             self._tokenizer = tokenizer
@@ -260,7 +277,8 @@ class Pipeline:
         def _on_token(tok: int) -> None:
             tokens.append(tok)
 
-        completion, _stats = generate_from(
+        _gen = generate_from_mtp if self._has_mtp else generate_from
+        completion, _stats = _gen(
             logits[-1],
             self._engine,
             self._cache,
@@ -290,6 +308,12 @@ class Pipeline:
         """Run generation inline, yielding whitespace-delimited word chunks."""
         from moe_infer.sampling import sample
 
+        if self._has_mtp:
+            yield from self._stream_chat_mtp(
+                first_logits, max_tokens, temperature, top_k, top_p, min_p,
+            )
+            return
+
         last = np.asarray(first_logits)
         token_ids: list[int] = []
         cursor = [0]  # byte offset already yielded
@@ -306,6 +330,83 @@ class Pipeline:
                 np.array([tok], dtype=np.int64),
             )
             last = self._engine.forward_hidden(emb, self._cache)[0]
+
+        # Flush remainder
+        text = self._tokenizer.decode(token_ids)
+        remainder = text[cursor[0] :]
+        if remainder:
+            yield remainder
+
+        response = self._extract_response(text)
+        self._messages.append({"role": "assistant", "content": response})
+
+    def _stream_chat_mtp(
+        self,
+        first_logits: np.ndarray,
+        max_tokens: int,
+        temperature: float,
+        top_k: int,
+        top_p: float,
+        min_p: float,
+    ) -> Iterator[str]:
+        """Streaming generation with MTP speculative decoding."""
+        from moe_infer.sampling import sample
+
+        last = np.asarray(
+            first_logits[-1] if first_logits.ndim == 2 else first_logits
+        )
+        first_tok = sample(last, temperature, top_k, top_p, min_p)
+        token_ids: list[int] = [first_tok]
+        cursor = [0]
+        tok = first_tok
+
+        while len(token_ids) < max_tokens:
+            self._engine.mtp_reset()
+
+            # Draft with MTP
+            drafts: list[int] = []
+            cur = tok
+            for _ in range(1):  # one draft per round for streaming
+                d_logits = self._engine.mtp_forward(cur)
+                if len(d_logits) == 0:
+                    break
+                d = sample(d_logits, temperature, top_k, top_p, min_p)
+                drafts.append(d)
+                cur = d
+
+            if not drafts:
+                emb = self._engine.embed_lookup(
+                    np.array([tok], dtype=np.int64),
+                )
+                last = self._engine.forward_hidden(emb, self._cache)[0]
+                tok = sample(last, temperature, top_k, top_p, min_p)
+                if tok in self.eos_ids:
+                    break
+                token_ids.append(tok)
+                chunk = _word_stream(self._tokenizer, token_ids, cursor)
+                if chunk:
+                    yield chunk
+                continue
+
+            # Verify with main model
+            emb = self._engine.embed_lookup(
+                np.array(drafts, dtype=np.int64),
+            )
+            verified_logits = self._engine.forward_hidden(
+                emb, self._cache,
+            )
+
+            for v_logits in verified_logits:
+                tok = sample(v_logits, temperature, top_k, top_p, min_p)
+                if tok in self.eos_ids:
+                    break
+                token_ids.append(tok)
+                chunk = _word_stream(self._tokenizer, token_ids, cursor)
+                if chunk:
+                    yield chunk
+
+            if tok in self.eos_ids:
+                break
 
         # Flush remainder
         text = self._tokenizer.decode(token_ids)
