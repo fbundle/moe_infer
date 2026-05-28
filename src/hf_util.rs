@@ -7,7 +7,10 @@
 //   removed after processing.
 
 use std::fs;
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
+
+use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
 
 pub struct HfRepo {
     repo_id: Option<String>,
@@ -87,7 +90,7 @@ impl HfRepo {
     }
 
     /// Ensure a file is available locally, downloading if in HF mode.
-    /// Returns the local path to the file.
+    /// Shows a tqdm-style progress bar for the download.
     pub fn ensure(&self, filename: &str) -> Result<PathBuf, String> {
         let local = self.staging.join(filename);
         if local.exists() {
@@ -95,12 +98,16 @@ impl HfRepo {
         }
         match &self.repo_id {
             None => Err(format!("file not found: {}", local.display())),
-            Some(repo_id) => download_hf(repo_id, filename, &self.staging),
+            Some(repo_id) => {
+                let pb = ProgressBar::new_spinner();
+                pb.set_style(tqdm_style());
+                pb.set_message(filename.to_string());
+                download_hf(repo_id, filename, &self.staging, &pb)
+            }
         }
     }
 
-    /// Download multiple files in parallel.  Returns paths in the same order.
-    /// For local repos, just verifies all files exist.
+    /// Download multiple files in parallel with tqdm-style progress bars.
     pub fn ensure_batch(&self, filenames: &[String]) -> Result<Vec<PathBuf>, String> {
         match &self.repo_id {
             None => {
@@ -117,13 +124,17 @@ impl HfRepo {
             Some(repo_id) => {
                 let repo_id = repo_id.clone();
                 let staging = self.staging.clone();
+                let mp = MultiProgress::new();
                 std::thread::scope(move |s| {
                     let mut handles = Vec::with_capacity(filenames.len());
                     for f in filenames {
+                        let pb = mp.add(ProgressBar::new_spinner());
+                        pb.set_style(tqdm_style());
+                        pb.set_message(f.clone());
                         let rid = repo_id.clone();
                         let stg = staging.clone();
                         let f = f.clone();
-                        handles.push(s.spawn(move || download_hf(&rid, &f, &stg)));
+                        handles.push(s.spawn(move || download_hf(&rid, &f, &stg, &pb)));
                     }
                     let mut results = Vec::with_capacity(filenames.len());
                     for h in handles {
@@ -141,11 +152,24 @@ impl HfRepo {
     }
 }
 
-fn download_hf(repo_id: &str, filename: &str, dest_dir: &Path) -> Result<PathBuf, String> {
+fn tqdm_style() -> ProgressStyle {
+    ProgressStyle::with_template(
+        "{msg:30} {bar:40.cyan/blue} {percent:>3}% {bytes:>10}/{total_bytes:10} {bytes_per_sec:>12} {elapsed:>6}"
+    ).unwrap()
+    .progress_chars("━╸─")
+}
+
+fn download_hf(
+    repo_id: &str,
+    filename: &str,
+    dest_dir: &Path,
+    pb: &ProgressBar,
+) -> Result<PathBuf, String> {
     let url = format!("https://huggingface.co/{}/resolve/main/{}", repo_id, filename);
     let dest = dest_dir.join(filename);
 
     if dest.exists() {
+        pb.finish_and_clear();
         return Ok(dest);
     }
 
@@ -160,6 +184,8 @@ fn download_hf(repo_id: &str, filename: &str, dest_dir: &Path) -> Result<PathBuf
         .and_then(|v| v.parse().ok())
         .unwrap_or(0);
 
+    pb.set_length(total);
+
     let mut reader = resp.body_mut().with_config().limit(5_000_000_000).reader();
 
     let tmp = dest.with_extension("part");
@@ -167,38 +193,20 @@ fn download_hf(repo_id: &str, filename: &str, dest_dir: &Path) -> Result<PathBuf
         .map_err(|e| format!("create {filename}: {e}"))?;
 
     let mut buf = vec![0u8; 8 * 1024 * 1024]; // 8 MiB
-    let mut written: u64 = 0;
-    let show_progress = total > 0;
-    if show_progress {
-        eprint!("\r  {filename}   0%");
-    }
-
     loop {
-        let n = std::io::Read::read(&mut reader, &mut buf)
+        let n = reader.read(&mut buf)
             .map_err(|e| format!("read {filename}: {e}"))?;
         if n == 0 {
             break;
         }
-        std::io::Write::write_all(&mut file, &buf[..n])
+        file.write_all(&buf[..n])
             .map_err(|e| format!("write {filename}: {e}"))?;
-        written += n as u64;
-        if show_progress && written % (50 * 1024 * 1024) < 8 * 1024 * 1024 {
-            let pct = (written * 100) / total;
-            eprint!("\r  {filename}  {}%", pct);
-        }
+        pb.inc(n as u64);
     }
 
-    // Finalize
     drop(file);
     fs::rename(&tmp, &dest).map_err(|e| format!("rename {filename}: {e}"))?;
-
-    if show_progress {
-        eprintln!("\r  {filename}  {:.1} MB", written as f64 / 1e6);
-    }
-
-    if total > 0 && written != total {
-        eprintln!("  WARNING: expected {total} bytes, got {written}");
-    }
+    pb.finish_and_clear();
 
     Ok(dest)
 }
