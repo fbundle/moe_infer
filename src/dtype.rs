@@ -23,6 +23,7 @@ pub enum DType {
     Bf16,
     Int4,
     Int8,
+    Fp4E2m1,
 }
 
 impl DType {
@@ -32,6 +33,7 @@ impl DType {
             DType::Bf16 => "bf16",
             DType::Int4 => "u32",
             DType::Int8 => "u8",
+            DType::Fp4E2m1 => "fp4_e2m1",
         }
     }
 }
@@ -43,6 +45,7 @@ pub fn string_to_dtype(dtype: &str) -> Option<DType> {
         "bf16" => DType::Bf16,
         "u32"  => DType::Int4,
         "u8"   => DType::Int8,
+        "fp4_e2m1" => DType::Fp4E2m1,
         _ => return None,
     })
 }
@@ -64,6 +67,7 @@ impl DType {
             DType::Int8 => encode_int8(f32_vals, out_dim, in_dim),
             DType::Bf16 => encode_bf16(f32_vals),
             DType::Fp32 => encode_fp32(f32_vals),
+            DType::Fp4E2m1 => encode_fp4_e2m1(f32_vals, out_dim, in_dim),
         }
     }
 }
@@ -179,7 +183,125 @@ pub fn int8_to_f32(packed: &[i8], scales: &[f32], out_dim: usize, in_dim: usize)
     result
 }
 
+// ─── FP4_E2M1 ───────────────────────────────────────────────────────────────
+
+/// FP4 E2M1 lookup table: nibble → f32.
+///
+/// Format: 1 sign | 2 exponent | 1 mantissa.
+///   normal (e > 0):  (-1)^s × 2^(e-1) × (1 + m/2)
+///   subnormal (e=0): (-1)^s × 2^(-1) × (m/2)      [m=0 → 0, m=1 → 0.5]
+pub const FP4_E2M1_LUT: [f32; 16] = [
+     0.0,  0.5,  1.0,  1.5,  2.0,  3.0,  4.0,  6.0,
+    -0.0, -0.5, -1.0, -1.5, -2.0, -3.0, -4.0, -6.0,
+];
+
+/// Decode a packed FP4_E2M1 nibble to f32.
+#[inline]
+pub fn fp4_e2m1_to_f32(nibble: u32) -> f32 {
+    FP4_E2M1_LUT[(nibble & 0xF) as usize]
+}
+
+/// Quantize f32 values to FP4_E2M1 with per-group BF16 scale.
+///
+/// Returns (packed_u32, scales_bf16).  Unlike INT4 there is no bias —
+/// FP4's symmetric representation handles the zero point natively.
+pub fn quant_f32_to_fp4_e2m1(f32_vals: &[f32], out_dim: usize, in_dim: usize)
+    -> (Vec<u32>, Vec<u16>)
+{
+    let num_groups = in_dim / GROUP_SIZE;
+    let words_per_row = in_dim / 8;
+    let mut packed = vec![0u32; out_dim * words_per_row];
+    let mut scales = vec![0u16; out_dim * num_groups];
+
+    // Build reverse LUT for encoding: use only positive half (indices 0..8).
+    // Sign is applied separately via the MSB — avoids ambiguity from
+    // duplicated absolute values in the negative half.
+    let mut thresholds: [(f32, u8); 8] = [(0.0, 0); 8];
+    for i in 0..8u8 {
+        thresholds[i as usize] = (FP4_E2M1_LUT[i as usize], i);
+    }
+    thresholds.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap());
+
+    for row in 0..out_dim {
+        let row_base = row * in_dim;
+        for g in 0..num_groups {
+            let g_base = row_base + g * GROUP_SIZE;
+            let group = &f32_vals[g_base..g_base + GROUP_SIZE];
+            let max_abs = group.iter().fold(0.0f32, |a, &v| a.max(v.abs()));
+            let max_val = if max_abs < 1e-8 { 1e-8 } else { max_abs };
+
+            // Scale so that max_abs maps to 6.0 (largest representable magnitude)
+            let scale = max_val / 6.0f32;
+            scales[row * num_groups + g] = f32_to_bf16_u16_single(scale);
+            let inv_scale = 1.0f32 / scale;
+
+            for p in 0..8 {
+                let mut word: u32 = 0;
+                for n in 0..8 {
+                    let v = group[p * 8 + n];
+                    let norm = (v * inv_scale).abs();
+                    // Binary search in thresholds to find nearest match
+                    let idx = match thresholds.binary_search_by(|t| t.0.partial_cmp(&norm).unwrap()) {
+                        Ok(i) => i,
+                        Err(i) => {
+                            if i == 0 { 0 }
+                            else if i >= 8 { 7 }
+                            else {
+                                let lo = thresholds[i - 1].0;
+                                let hi = thresholds[i].0;
+                                if norm - lo < hi - norm { i - 1 } else { i }
+                            }
+                        }
+                    };
+                    let mut nibble = thresholds[idx].1;
+                    if v < 0.0 { nibble |= 0x8; } // set sign bit
+                    word |= ((nibble as u32) & 0xF) << (n * 4);
+                }
+                packed[row * words_per_row + g * 8 + p] = word;
+            }
+        }
+    }
+    (packed, scales)
+}
+
+/// Dequantize FP4_E2M1 packed weights to f32.
+#[allow(dead_code)]
+pub fn fp4_e2m1_to_f32_full(
+    packed: &[u32], scales: &[u16], out_dim: usize, in_dim: usize,
+) -> Vec<f32> {
+    let num_groups = in_dim / GROUP_SIZE;
+    let words_per_row = in_dim / 8;
+    let mut result = vec![0.0f32; out_dim * in_dim];
+    for row in 0..out_dim {
+        let w_row = &packed[row * words_per_row..(row + 1) * words_per_row];
+        let s_row = &scales[row * num_groups..(row + 1) * num_groups];
+        for g in 0..num_groups {
+            let scale = bf16_to_f32(s_row[g]);
+            let out_base = row * in_dim + g * GROUP_SIZE;
+            for p in 0..8 {
+                let word = w_row[g * 8 + p];
+                for n in 0..8 {
+                    let nibble = (word >> (n * 4)) & 0xF;
+                    result[out_base + p * 8 + n] = fp4_e2m1_to_f32(nibble) * scale;
+                }
+            }
+        }
+    }
+    result
+}
+
 // ─── Encode helpers ──────────────────────────────────────────────────────────
+
+fn encode_fp4_e2m1(f32_vals: &[f32], out_dim: usize, in_dim: usize) -> Vec<EncodedTensor> {
+    let num_groups = in_dim / GROUP_SIZE;
+    let (packed, scales) = quant_f32_to_fp4_e2m1(f32_vals, out_dim, in_dim);
+    let packed_bytes: Vec<u8> = unsafe { std::slice::from_raw_parts(packed.as_ptr() as *const u8, packed.len() * 4).to_vec() };
+    let scales_bytes: Vec<u8> = unsafe { std::slice::from_raw_parts(scales.as_ptr() as *const u8, scales.len() * 2).to_vec() };
+    vec![
+        EncodedTensor { data: packed_bytes, suffix: ".weight", shape: vec![out_dim, in_dim / 8], dtype: DType::Fp4E2m1.as_str() },
+        EncodedTensor { data: scales_bytes, suffix: ".scales", shape: vec![out_dim, num_groups], dtype: DType::Bf16.as_str() },
+    ]
+}
 
 fn encode_int4(f32_vals: &[f32], out_dim: usize, in_dim: usize) -> Vec<EncodedTensor> {
     let num_groups = in_dim / GROUP_SIZE;
@@ -249,6 +371,26 @@ mod tests {
         for (a, b) in vals.iter().zip(r.iter()) {
             assert!((a - b).abs() / range.max(0.01) < 0.02, "err={}", (a-b).abs());
         }
+    }
+
+    #[test]
+    fn test_fp4_e2m1_roundtrip() {
+        let out_dim = 2;
+        let in_dim = 128;
+        let vals: Vec<f32> = (0..(out_dim * in_dim))
+            .map(|i| ((i as f32) * 0.13).sin() * 2.5)
+            .collect();
+        let (p, s) = quant_f32_to_fp4_e2m1(&vals, out_dim, in_dim);
+        let r = fp4_e2m1_to_f32_full(&p, &s, out_dim, in_dim);
+        let max_abs = vals.iter().fold(0.0f32, |a, &v| a.max(v.abs()));
+        let mut max_err = 0.0f32;
+        for (a, b) in vals.iter().zip(r.iter()) {
+            let err = (a - b).abs();
+            if err > max_err { max_err = err; }
+        }
+        // FP4 has ~12.5% relative error ceiling (6 bits of range / 2^4 = 6/16)
+        let rel = max_err / max_abs.max(0.001);
+        assert!(rel < 0.5, "max relative error {} exceeds 0.5", rel);
     }
 
     #[test]

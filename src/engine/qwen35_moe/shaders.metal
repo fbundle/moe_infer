@@ -432,6 +432,75 @@ kernel void dequant_matvec_4bit_v5(
 }
 
 // ============================================================================
+// Kernel 1g: FP4_E2M1 dequant matvec
+// ============================================================================
+// Same structure as v3/v5 but decodes FP4 E2M1 nibbles via a static lookup
+// table.  No bias — FP4's symmetric encoding handles the zero point natively.
+//
+//   dequant_val = fp4_lut[nibble] * scale
+//
+// The LUT is hard-coded to match the Rust-side FP4_E2M1_LUT.
+
+constant float fp4_e2m1_lut[16] = {
+     0.0,  0.5,  1.0,  1.5,  2.0,  3.0,  4.0,  6.0,
+    -0.0, -0.5, -1.0, -1.5, -2.0, -3.0, -4.0, -6.0,
+};
+
+kernel void dequant_matvec_fp4_e2m1(
+    device const uint32_t* W_packed   [[buffer(0)]],  // [out_dim, in_dim/8]
+    device const uint16_t* scales     [[buffer(1)]],  // [out_dim, num_groups] bf16
+    device const float*    x          [[buffer(2)]],  // [in_dim]
+    device float*          out        [[buffer(3)]],  // [out_dim]
+    constant uint&         out_dim    [[buffer(4)]],
+    constant uint&         in_dim     [[buffer(5)]],
+    constant uint&         group_size [[buffer(6)]],
+    uint tgid   [[threadgroup_position_in_grid]],
+    uint lid    [[thread_position_in_threadgroup]],
+    uint simd_lane  [[thread_index_in_simdgroup]],
+    uint simd_group [[simdgroup_index_in_threadgroup]]
+) {
+    uint row = tgid * ROWS_PER_TG + simd_group;
+    uint packed_cols = in_dim / 8;
+    uint num_groups  = in_dim / group_size;
+
+    threadgroup float x_shared[4096];
+    for (uint i = lid; i < in_dim; i += 256) {
+        x_shared[i] = x[i];
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    if (row >= out_dim) return;
+
+    device const uint32_t* w_row = W_packed + row * packed_cols;
+    device const uint16_t* s_row = scales + row * num_groups;
+
+    float acc = 0.0f;
+
+    for (uint col = simd_lane; col < packed_cols; col += 32) {
+        uint g = col / (group_size / 8);
+        float scale = bf16_to_f32(s_row[g]);
+
+        uint32_t packed = w_row[col];
+        uint x_base = col * 8;
+
+        // Dequant with FP4 LUT: val = lut[nibble] * scale, then multiply with x
+        acc += fp4_e2m1_lut[(packed >>  0) & 0xF] * scale * x_shared[x_base + 0];
+        acc += fp4_e2m1_lut[(packed >>  4) & 0xF] * scale * x_shared[x_base + 1];
+        acc += fp4_e2m1_lut[(packed >>  8) & 0xF] * scale * x_shared[x_base + 2];
+        acc += fp4_e2m1_lut[(packed >> 12) & 0xF] * scale * x_shared[x_base + 3];
+        acc += fp4_e2m1_lut[(packed >> 16) & 0xF] * scale * x_shared[x_base + 4];
+        acc += fp4_e2m1_lut[(packed >> 20) & 0xF] * scale * x_shared[x_base + 5];
+        acc += fp4_e2m1_lut[(packed >> 24) & 0xF] * scale * x_shared[x_base + 6];
+        acc += fp4_e2m1_lut[(packed >> 28) & 0xF] * scale * x_shared[x_base + 7];
+    }
+
+    float sum = simd_sum(acc);
+    if (simd_lane == 0) {
+        out[row] = sum;
+    }
+}
+
+// ============================================================================
 // Kernel 1e: 2-bit affine dequant matvec (same structure as v3)
 // ============================================================================
 // Packs 16 x 2-bit values per uint32. Each value is 0-3, dequantized as:

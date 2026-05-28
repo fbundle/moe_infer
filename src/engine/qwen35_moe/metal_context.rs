@@ -83,6 +83,7 @@ pub struct MetalContext {
     pub matvec_v3: ComputePipelineState,
     pub matvec_bf16: ComputePipelineState,
     pub matvec_int8: ComputePipelineState,
+    pub matvec_fp4_e2m1: Option<ComputePipelineState>,
     pub swiglu: ComputePipelineState,
     pub swiglu_vec4: Option<ComputePipelineState>,
     pub rms_norm_sum: ComputePipelineState,
@@ -364,6 +365,7 @@ impl MetalContext {
             let matvec_v3 = make_pipeline("dequant_matvec_4bit_v3")?;
             let matvec_bf16 = make_pipeline("matvec_bf16")?;
             let matvec_int8 = make_pipeline("matvec_int8")?;
+            let matvec_fp4_e2m1 = make_pipeline("dequant_matvec_fp4_e2m1").ok();
             let swiglu = make_pipeline("swiglu_fused")?;
             let rms_norm_sum = make_pipeline("rms_norm_sum_sq")?;
 
@@ -404,6 +406,7 @@ impl MetalContext {
                 matvec_v3: matvec_v3.clone(),
                 matvec_bf16,
                 matvec_int8,
+                matvec_fp4_e2m1,
                 swiglu,
                 swiglu_vec4,
                 rms_norm_sum,
@@ -639,6 +642,23 @@ impl WeightBuffer {
                 );
                 return true;
             }
+            Some(DType::Fp4E2m1) => {
+                let s_ptr = match wf.get_tensor_ptr(&format!("{}.scales", prefix)) {
+                    Some(p) => p,
+                    None => {
+                        eprintln!("[encode_matvec_into] WARNING: tensor not found: {}.scales", prefix);
+                        return false;
+                    }
+                };
+                let s_off = (s_ptr as usize - self.base as usize) as u64;
+                metal_kernels::encode_matvec_fp4_e2m1_offset(
+                    ctx, encoder,
+                    &self.buf, w_off, &self.buf, s_off,
+                    x_buf, x_offset, out_buf, out_offset,
+                    out_dim as u32, in_dim as u32, GPU_MATVEC_GROUP_SIZE,
+                );
+                return true;
+            }
             _ => {} // INT4 or unknown → fall through
         }
 
@@ -741,6 +761,41 @@ impl WeightBuffer {
                 let mut acc = 0.0f64;
                 for c in 0..in_dim {
                     acc += bf16_to_f32(w_u16[r * in_dim + c]) as f64;
+                }
+                cpu_out[r] = acc as f32;
+            }
+        } else if q == Some(DType::Fp4E2m1) {
+            // FP4: dequantize with LUT and compute row sums (no bias)
+            use crate::dtype::fp4_e2m1_to_f32;
+            let w_ptr = wf.get_tensor_ptr(&weight_name).unwrap();
+            let s_ptr = wf.get_tensor_ptr(&format!("{}.scales", prefix)).unwrap();
+
+            let s_info = wf.get_tensor_info(&format!("{}.scales", prefix)).unwrap();
+            let num_groups = s_info.shape[1];
+            let group_size = in_dim / num_groups;
+            let packed_per_group = group_size / 8;
+
+            let w_u32 = unsafe {
+                std::slice::from_raw_parts(w_ptr as *const u32, out_dim * in_dim / 8)
+            };
+            let s_u16 = unsafe {
+                std::slice::from_raw_parts(s_ptr as *const u16, out_dim * num_groups)
+            };
+
+            for r in 0..out_dim {
+                let w_row = &w_u32[r * in_dim / 8..];
+                let s_row = &s_u16[r * num_groups..];
+
+                let mut acc = 0.0f64;
+                for g in 0..num_groups {
+                    let scale = bf16_to_f32(s_row[g]);
+                    for p in 0..packed_per_group {
+                        let packed = w_row[g * packed_per_group + p];
+                        for n in 0..8 {
+                            let nibble = (packed >> (n * 4)) & 0xF;
+                            acc += (fp4_e2m1_to_f32(nibble) * scale) as f64;
+                        }
+                    }
                 }
                 cpu_out[r] = acc as f32;
             }
