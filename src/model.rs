@@ -41,7 +41,8 @@ impl Model {
         let hd = config.get_usize("hidden_size").unwrap();
         let mi = config.get_usize("moe_intermediate_size").unwrap();
         let expert_size = config::expert_size_4bit(hd, mi, 64);
-        let num_layers = config.get_usize("num_hidden_layers").unwrap();
+        let num_layers = config.get_usize("num_hidden_layers").unwrap()
+            + config.get_usize("mtp_num_hidden_layers").unwrap_or(0);
 
         let mut expert_files = Vec::with_capacity(num_layers);
         for layer in 0..num_layers {

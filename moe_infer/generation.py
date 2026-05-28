@@ -100,81 +100,22 @@ def generate_from_mtp(
     min_p: float = 0.0,
     eos_ids: tuple[int, ...] = (248046, 248044),
     on_token: Callable[[int], None] | None = None,
-    num_drafts: int = 1,
 ) -> tuple[str, dict[str, Any]]:
-    """Generate tokens with MTP speculative decoding.
+    """Generate tokens with MTP-aware engine (standard loop for now).
 
-    Drafts *num_drafts* tokens via cheap MTP forward passes, then verifies
-    all drafts in a single batched main-model forward.  The main model's
-    predictions are always used (drafts are just guesses that enable
-    batching).  Falls back to normal autoregressive generation if MTP is
-    not available.
+    The engine initialises MTP state during model load.  This generator
+    uses the standard autoregressive loop; speculative batching will be
+    added once KV-cache consistency is handled at the engine level.
 
-    Parameters match :func:`generate_from` with one addition:
-
-    num_drafts : int
-        Number of tokens to draft per verification round.  Default 1.
-        Higher values give more speedup but diminishing returns as
-        draft acceptance drops.
+    Parameters match :func:`generate_from`.
     """
-    t0 = time.time()
-    last = np.asarray(
-        first_logits[-1] if first_logits.ndim == 2 else first_logits
+    return generate_from(
+        first_logits, engine, cache, tokenizer,
+        max_tokens=max_tokens,
+        temperature=temperature,
+        top_k=top_k,
+        top_p=top_p,
+        min_p=min_p,
+        eos_ids=eos_ids,
+        on_token=on_token,
     )
-    first_tok = sample(last, temperature, top_k, top_p, min_p)
-    generated: list[int] = [first_tok]
-    if on_token is not None:
-        on_token(first_tok)
-    tok = first_tok
-
-    while len(generated) < max_tokens:
-        engine.mtp_reset()
-
-        # Draft num_drafts tokens with cheap MTP forward passes.
-        drafts: list[int] = []
-        cur = tok
-        for _ in range(num_drafts):
-            d_logits = engine.mtp_forward(cur)
-            if len(d_logits) == 0:          # MTP not available
-                break
-            d = sample(d_logits, temperature, top_k, top_p, min_p)
-            drafts.append(d)
-            cur = d
-
-        if not drafts:
-            emb = engine.embed_lookup(np.array([tok], dtype=np.int64))
-            last = engine.forward_hidden(emb, cache)[0]
-            tok = sample(last, temperature, top_k, top_p, min_p)
-            if tok in eos_ids:
-                break
-            generated.append(tok)
-            if on_token is not None:
-                on_token(tok)
-            continue
-
-        # Verify all drafts in one batched main-model forward.
-        emb = engine.embed_lookup(np.array(drafts, dtype=np.int64))
-        verified_logits = engine.forward_hidden(emb, cache)  # [N, vocab]
-
-        stop = False
-        for v_logits in verified_logits:
-            tok = sample(v_logits, temperature, top_k, top_p, min_p)
-            if tok in eos_ids:
-                stop = True
-                break
-            generated.append(tok)
-            if on_token is not None:
-                on_token(tok)
-
-        if stop:
-            break
-
-    dt = time.time() - t0
-    n = len(generated)
-    text = tokenizer.decode(generated)
-    stats: dict[str, Any] = {
-        "tokens": n,
-        "seconds": dt,
-        "tok_per_s": n / dt if n > 0 else 0,
-    }
-    return text, stats
