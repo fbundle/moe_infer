@@ -149,8 +149,6 @@ fn download_hf(repo_id: &str, filename: &str, dest_dir: &Path) -> Result<PathBuf
         return Ok(dest);
     }
 
-    eprint!("  Downloading {} ...", filename);
-
     let mut resp = ureq::get(&url)
         .call()
         .map_err(|e| format!("HTTP error for {filename}: {e}"))?;
@@ -162,20 +160,44 @@ fn download_hf(repo_id: &str, filename: &str, dest_dir: &Path) -> Result<PathBuf
         .and_then(|v| v.parse().ok())
         .unwrap_or(0);
 
-    let data = resp
-        .body_mut()
-        .with_config()
-        .limit(5_000_000_000) // 5 GB — shard files can be several GB
-        .read_to_vec()
-        .map_err(|e| format!("read {filename}: {e}"))?;
-    let n = data.len() as u64;
+    let mut reader = resp.body_mut().with_config().limit(5_000_000_000).reader();
 
-    fs::write(&dest, &data).map_err(|e| format!("write {filename}: {e}"))?;
+    let tmp = dest.with_extension("part");
+    let mut file = fs::File::create(&tmp)
+        .map_err(|e| format!("create {filename}: {e}"))?;
 
-    eprintln!(" {:.1} MB", n as f64 / 1e6);
+    let mut buf = vec![0u8; 8 * 1024 * 1024]; // 8 MiB
+    let mut written: u64 = 0;
+    let show_progress = total > 0;
+    if show_progress {
+        eprint!("\r  {filename}   0%");
+    }
 
-    if total > 0 && n != total {
-        eprintln!("  WARNING: expected {total} bytes, got {n}");
+    loop {
+        let n = std::io::Read::read(&mut reader, &mut buf)
+            .map_err(|e| format!("read {filename}: {e}"))?;
+        if n == 0 {
+            break;
+        }
+        std::io::Write::write_all(&mut file, &buf[..n])
+            .map_err(|e| format!("write {filename}: {e}"))?;
+        written += n as u64;
+        if show_progress && written % (50 * 1024 * 1024) < 8 * 1024 * 1024 {
+            let pct = (written * 100) / total;
+            eprint!("\r  {filename}  {}%", pct);
+        }
+    }
+
+    // Finalize
+    drop(file);
+    fs::rename(&tmp, &dest).map_err(|e| format!("rename {filename}: {e}"))?;
+
+    if show_progress {
+        eprintln!("\r  {filename}  {:.1} MB", written as f64 / 1e6);
+    }
+
+    if total > 0 && written != total {
+        eprintln!("  WARNING: expected {total} bytes, got {written}");
     }
 
     Ok(dest)
