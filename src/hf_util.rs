@@ -99,6 +99,42 @@ impl HfRepo {
         }
     }
 
+    /// Download multiple files in parallel.  Returns paths in the same order.
+    /// For local repos, just verifies all files exist.
+    pub fn ensure_batch(&self, filenames: &[String]) -> Result<Vec<PathBuf>, String> {
+        match &self.repo_id {
+            None => {
+                let mut paths = Vec::with_capacity(filenames.len());
+                for f in filenames {
+                    let local = self.staging.join(f);
+                    if !local.exists() {
+                        return Err(format!("file not found: {}", local.display()));
+                    }
+                    paths.push(local);
+                }
+                Ok(paths)
+            }
+            Some(repo_id) => {
+                let repo_id = repo_id.clone();
+                let staging = self.staging.clone();
+                std::thread::scope(move |s| {
+                    let mut handles = Vec::with_capacity(filenames.len());
+                    for f in filenames {
+                        let rid = repo_id.clone();
+                        let stg = staging.clone();
+                        let f = f.clone();
+                        handles.push(s.spawn(move || download_hf(&rid, &f, &stg)));
+                    }
+                    let mut results = Vec::with_capacity(filenames.len());
+                    for h in handles {
+                        results.push(h.join().map_err(|_| "thread panicked".to_string())??);
+                    }
+                    Ok(results)
+                })
+            }
+        }
+    }
+
     /// Remove a file from the staging directory (no-op if absent).
     pub fn remove(&self, filename: &str) {
         fs::remove_file(self.staging.join(filename)).ok();

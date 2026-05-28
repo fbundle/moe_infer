@@ -290,6 +290,14 @@ impl PyHfRepo {
             .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e))
     }
 
+    /// Download multiple files in parallel (Rust-side threading).
+    /// Returns local paths in the same order.
+    fn ensure_batch(&self, filenames: Vec<String>) -> PyResult<Vec<String>> {
+        self.repo.ensure_batch(&filenames)
+            .map(|paths| paths.iter().map(|p| p.to_string_lossy().to_string()).collect())
+            .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e))
+    }
+
     /// Delete a cached file.
     fn remove(&self, filename: &str) {
         self.repo.remove(filename)
