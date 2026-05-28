@@ -10,7 +10,7 @@ use crate::cache::Cache as CoreCache;
 use crate::model::Model as CoreModel;
 use crate::error::MoEError;
 use crate::engine::{SignalCheckFn, TelemetryValue, set_record_telemetry, DynEngine};
-use crate::bq4::{Bq4, QwenVersion};
+use crate::bq4::{Qwen35MoEScheme, QwenVersion};
 
 // ─── Module-level functions ──────────────────────────────────────────────────
 
@@ -218,19 +218,20 @@ pub fn qwen35_moe_bq4_quantize(
             format!("Unknown version: {}. Expected '3.5' or '3.6'.", version)
         )),
     };
-    // Read architectures from model config.json (handles both local and HF paths)
-    let config_json = if std::path::Path::new(model_path).is_dir() {
-        let config_path = std::path::Path::new(model_path).join("config.json");
-        std::fs::read_to_string(&config_path)
-            .map_err(|e| pyo3::exceptions::PyIOError::new_err(e.to_string()))?
+
+    // Determine directory containing config.json (local or HF staging)
+    let config_dir = if std::path::Path::new(model_path).is_dir() {
+        std::path::PathBuf::from(model_path)
     } else {
         let repo = crate::hf_util::HfRepo::from_hf(model_path)
             .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e))?;
-        let config_path = repo.ensure("config.json")
+        repo.ensure("config.json")
             .map_err(|e| pyo3::exceptions::PyIOError::new_err(e))?;
-        std::fs::read_to_string(&config_path)
-            .map_err(|e| pyo3::exceptions::PyIOError::new_err(e.to_string()))?
+        repo.path().to_path_buf()
     };
+
+    let config_json = std::fs::read_to_string(config_dir.join("config.json"))
+        .map_err(|e| pyo3::exceptions::PyIOError::new_err(e.to_string()))?;
     let arch = {
         let v: serde_json::Value = serde_json::from_str(&config_json)
             .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))?;
@@ -238,12 +239,16 @@ pub fn qwen35_moe_bq4_quantize(
             .unwrap_or("Qwen3_5MoeForConditionalGeneration")
             .to_string()
     };
-    let quantize = match arch.as_str() {
+
+    let scheme = match arch.as_str() {
         "Qwen3_5MoeForConditionalGeneration" =>
-            Bq4::new(strip_layers, strip_experts, qwen_version),
-        _ => return Err(pyo3::exceptions::PyValueError::new_err(format!("Unknown architecture: {}", arch))),
+            Qwen35MoEScheme::new(&config_dir, qwen_version, strip_layers, strip_experts)
+                .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e))?,
+        _ => return Err(pyo3::exceptions::PyValueError::new_err(
+            format!("Unknown architecture: {}", arch)
+        )),
     };
-    quantize.quantize(model_path, output_dir)
+    crate::quantize::run(model_path, output_dir, &scheme, strip_layers, strip_experts)
         .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e))
 }
 

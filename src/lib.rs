@@ -6,9 +6,10 @@ mod cache;
 mod constants;
 mod error;
 pub mod hf_util;
-mod quant;
+mod dtype;
+pub mod quantize;
 mod safetensors;
-#[path = "quantize/qwen35_moe/bq4_hf.rs"] pub mod bq4;
+#[path = "quantize/qwen35_moe/bq4.rs"] pub mod bq4;
 mod timer;
 
 #[cfg(feature = "python-bindings")]

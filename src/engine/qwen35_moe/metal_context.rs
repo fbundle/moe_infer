@@ -9,7 +9,7 @@ use crate::error::MoEError;
 use crate::engine::metal_kernels;
 use crate::math::bf16_to_f32;
 use crate::model::weights::WeightFile;
-use crate::quant::{Quant, string_to_quant};
+use crate::dtype::{DType, string_to_dtype};
 
 // ─── Expert I/O pre-allocation ───────────────────────────────────────────────
 
@@ -610,10 +610,10 @@ impl WeightBuffer {
         let dtype = wf.get_tensor_info(&weight_name)
             .map(|info| info.dtype.as_str())
             .unwrap_or("u32");
-        let q = string_to_quant(dtype);
+        let q = string_to_dtype(dtype);
 
         match q {
-            Some(Quant::Bf16) => {
+            Some(DType::Bf16) => {
                 metal_kernels::encode_matvec_bf16_offset(
                     ctx, encoder,
                     &self.buf, w_off,
@@ -622,7 +622,7 @@ impl WeightBuffer {
                 );
                 return true;
             }
-            Some(Quant::Int8) => {
+            Some(DType::Int8) => {
                 let s_ptr = match wf.get_tensor_ptr(&format!("{}.scales", prefix)) {
                     Some(p) => p,
                     None => {
@@ -730,9 +730,9 @@ impl WeightBuffer {
         // CPU reference
         let mut cpu_out = vec![0.0f32; out_dim];
 
-        let q = string_to_quant(dtype);
+        let q = string_to_dtype(dtype);
 
-        if q == Some(Quant::Bf16) {
+        if q == Some(DType::Bf16) {
             let w_ptr = wf.get_tensor_ptr(&weight_name).unwrap();
             let w_u16 = unsafe {
                 std::slice::from_raw_parts(w_ptr as *const u16, out_dim * in_dim)

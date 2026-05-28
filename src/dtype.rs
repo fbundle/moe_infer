@@ -14,42 +14,42 @@ use std::vec::Vec;
 /// Group size for per-group INT4 quantization (64 elements per scale+bias pair).
 pub const GROUP_SIZE: usize = 64;
 
-// ─── Quant enum ──────────────────────────────────────────────────────────────
+// ─── DType enum ──────────────────────────────────────────────────────────────
 
-/// Quantization format — the binary representation of a tensor's data.
+/// DTypeization format — the binary representation of a tensor's data.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Quant {
+pub enum DType {
     Fp32,
     Bf16,
     Int4,
     Int8,
 }
 
-impl Quant {
+impl DType {
     pub const fn as_str(self) -> &'static str {
         match self {
-            Quant::Fp32 => "f32",
-            Quant::Bf16 => "bf16",
-            Quant::Int4 => "u32",
-            Quant::Int8 => "u8",
+            DType::Fp32 => "f32",
+            DType::Bf16 => "bf16",
+            DType::Int4 => "u32",
+            DType::Int8 => "u8",
         }
     }
 }
 
-/// Parse a manifest dtype string back to a Quant variant.
-pub fn string_to_quant(dtype: &str) -> Option<Quant> {
+/// Parse a manifest dtype string back to a DType variant.
+pub fn string_to_dtype(dtype: &str) -> Option<DType> {
     Some(match dtype {
-        "f32"  => Quant::Fp32,
-        "bf16" => Quant::Bf16,
-        "u32"  => Quant::Int4,
-        "u8"   => Quant::Int8,
+        "f32"  => DType::Fp32,
+        "bf16" => DType::Bf16,
+        "u32"  => DType::Int4,
+        "u8"   => DType::Int8,
         _ => return None,
     })
 }
 
 // ─── Encoded tensor ──────────────────────────────────────────────────────────
 
-/// One output tensor produced by `Quant::encode()`.
+/// One output tensor produced by `DType::encode()`.
 pub struct EncodedTensor {
     pub data: Vec<u8>,
     pub suffix: &'static str,
@@ -57,13 +57,13 @@ pub struct EncodedTensor {
     pub dtype: &'static str,
 }
 
-impl Quant {
+impl DType {
     pub fn encode(self, f32_vals: &[f32], out_dim: usize, in_dim: usize) -> Vec<EncodedTensor> {
         match self {
-            Quant::Int4 => encode_int4(f32_vals, out_dim, in_dim),
-            Quant::Int8 => encode_int8(f32_vals, out_dim, in_dim),
-            Quant::Bf16 => encode_bf16(f32_vals),
-            Quant::Fp32 => encode_fp32(f32_vals),
+            DType::Int4 => encode_int4(f32_vals, out_dim, in_dim),
+            DType::Int8 => encode_int8(f32_vals, out_dim, in_dim),
+            DType::Bf16 => encode_bf16(f32_vals),
+            DType::Fp32 => encode_fp32(f32_vals),
         }
     }
 }
@@ -188,21 +188,21 @@ fn encode_int4(f32_vals: &[f32], out_dim: usize, in_dim: usize) -> Vec<EncodedTe
     let scales_bytes: Vec<u8> = unsafe { std::slice::from_raw_parts(scales.as_ptr() as *const u8, scales.len() * 2).to_vec() };
     let biases_bytes: Vec<u8> = unsafe { std::slice::from_raw_parts(biases.as_ptr() as *const u8, biases.len() * 2).to_vec() };
     vec![
-        EncodedTensor { data: packed_bytes, suffix: ".weight", shape: vec![out_dim, in_dim / 8], dtype: Quant::Int4.as_str() },
-        EncodedTensor { data: scales_bytes, suffix: ".scales", shape: vec![out_dim, num_groups], dtype: Quant::Bf16.as_str() },
-        EncodedTensor { data: biases_bytes, suffix: ".biases", shape: vec![out_dim, num_groups], dtype: Quant::Bf16.as_str() },
+        EncodedTensor { data: packed_bytes, suffix: ".weight", shape: vec![out_dim, in_dim / 8], dtype: DType::Int4.as_str() },
+        EncodedTensor { data: scales_bytes, suffix: ".scales", shape: vec![out_dim, num_groups], dtype: DType::Bf16.as_str() },
+        EncodedTensor { data: biases_bytes, suffix: ".biases", shape: vec![out_dim, num_groups], dtype: DType::Bf16.as_str() },
     ]
 }
 
 fn encode_bf16(f32_vals: &[f32]) -> Vec<EncodedTensor> {
     let v = f32_to_bf16_u16(f32_vals);
     let bytes: Vec<u8> = unsafe { std::slice::from_raw_parts(v.as_ptr() as *const u8, v.len() * 2).to_vec() };
-    vec![EncodedTensor { data: bytes, suffix: "", shape: vec![f32_vals.len()], dtype: Quant::Bf16.as_str() }]
+    vec![EncodedTensor { data: bytes, suffix: "", shape: vec![f32_vals.len()], dtype: DType::Bf16.as_str() }]
 }
 
 fn encode_fp32(f32_vals: &[f32]) -> Vec<EncodedTensor> {
     let bytes: Vec<u8> = unsafe { std::slice::from_raw_parts(f32_vals.as_ptr() as *const u8, f32_vals.len() * 4).to_vec() };
-    vec![EncodedTensor { data: bytes, suffix: "", shape: vec![f32_vals.len()], dtype: Quant::Fp32.as_str() }]
+    vec![EncodedTensor { data: bytes, suffix: "", shape: vec![f32_vals.len()], dtype: DType::Fp32.as_str() }]
 }
 
 fn encode_int8(f32_vals: &[f32], out_dim: usize, in_dim: usize) -> Vec<EncodedTensor> {
@@ -210,8 +210,8 @@ fn encode_int8(f32_vals: &[f32], out_dim: usize, in_dim: usize) -> Vec<EncodedTe
     let packed_bytes: Vec<u8> = unsafe { std::slice::from_raw_parts(packed.as_ptr() as *const u8, packed.len()).to_vec() };
     let scales_bytes: Vec<u8> = unsafe { std::slice::from_raw_parts(scales.as_ptr() as *const u8, scales.len() * 4).to_vec() };
     vec![
-        EncodedTensor { data: packed_bytes, suffix: ".weight", shape: vec![out_dim, in_dim], dtype: Quant::Int8.as_str() },
-        EncodedTensor { data: scales_bytes, suffix: ".scales", shape: vec![out_dim], dtype: Quant::Fp32.as_str() },
+        EncodedTensor { data: packed_bytes, suffix: ".weight", shape: vec![out_dim, in_dim], dtype: DType::Int8.as_str() },
+        EncodedTensor { data: scales_bytes, suffix: ".scales", shape: vec![out_dim], dtype: DType::Fp32.as_str() },
     ]
 }
 

@@ -9,7 +9,7 @@ use std::fs;
 use std::io::{Read, Seek, SeekFrom};
 use std::path::Path;
 
-use crate::quant::bf16_to_f32;
+use crate::dtype::bf16_to_f32;
 
 /// Metadata for one tensor within a safetensors shard.
 pub struct TensorMeta {
