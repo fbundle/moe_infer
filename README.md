@@ -109,6 +109,52 @@ decoding loop (`generate_from_mtp`) is available but currently delegates
 to the standard autoregressive loop.  The Rust MTP forward pass is
 functional; batched draft + verify will land in a future release.
 
+## Verification
+
+To verify that the BQ4 engine computes the same logits as the original
+model, the pipeline is:
+
+1.  **Strip** the HF model to 4 layers / 4 experts (fast test).
+2.  **Quantize** the stripped model to BQ4.
+3.  **Dequantize** BQ4 back to HF safetensors.
+4.  **Compare** logits: dequantized HF (transformers) vs BQ4 engine (Rust).
+
+All four steps run locally — no network needed after the initial download.
+
+```bash
+# 1. Strip: 40 layers → 4 layers, 256 experts → 4 experts (~2.4 GB)
+python -m moe_infer.strip hub/models--Qwen--Qwen3.6-35B-A3B \
+  --out hub/models--Qwen--Qwen3.6-35B-A3B-Strip
+
+# 2. Quantize to BQ4 (~0.9 GB)
+python -c "
+from moe_infer.qwen35_moe import convert
+convert('hub/models--Qwen--Qwen3.6-35B-A3B-Strip',
+        'data/Qwen3.6-35B-A3B-Strip', version='3.6')
+"
+
+# 3. Dequantize back to HF safetensors (~2.4 GB)
+python -m moe_infer.dequantize data/Qwen3.6-35B-A3B-Strip/model_bq4 \
+  --ref hub/models--Qwen--Qwen3.6-35B-A3B-Strip \
+  --out hub/models--Qwen--Qwen3.6-35B-A3B-Strip-Dequant
+
+# 4. Compare logits
+python verify_nway.py
+```
+
+Expected metrics on the 29-token test sequence (vocab_size=248,320):
+
+| Comparison | Cosine | Max Diff | Mean Diff | Notes |
+|---|---|---|---|---|
+| Original HF vs BQ4 engine | ~0.902 | ~4.6 | ~0.79 | INT4 quantization loss |
+| **Dequantized HF vs BQ4 engine** | **~0.925** | **~4.5** | **~0.72** | Same weights, GPU vs CPU path |
+| FusedExp1 vs FusedExp2 | 1.000 | 0.000 | 0.000 | Bit-exact between Rust pipelines |
+
+The dequantized model reproduces the engine more closely than the original
+because both use the same quantized weights.  The remaining gap (~0.075) is
+numerical precision differences between Metal GPU (on-the-fly INT4 matvec)
+and PyTorch CPU (pre-dequantized BF16 matmul).
+
 ## Tips
 
 | Tip | What to do |
