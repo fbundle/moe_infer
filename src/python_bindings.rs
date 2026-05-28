@@ -122,8 +122,10 @@ impl Engine {
     }
 
     /// Process pre-computed embeddings through the LM. Returns [n, vocab_size] logits.
+    #[pyo3(signature = (embeddings, cache, *, mtp=false))]
     fn forward_hidden(&mut self, py: Python<'_>, embeddings: &Bound<PyArray2<f32>>,
         cache: &mut Cache,
+        mtp: bool,
     ) -> PyResult<PyObject> {
         let emb = embeddings.readonly();
         let emb_slice = emb.as_slice()?;
@@ -131,7 +133,7 @@ impl Engine {
         let n = shape[0];
         let vs = self.model.config.get_usize("vocab_size").unwrap();
 
-        let logits = self.forward_hidden_impl(emb_slice, &mut cache.inner, &mut || py.check_signals().is_err())
+        let logits = self.forward_hidden_impl(emb_slice, &mut cache.inner, &mut || py.check_signals().is_err(), mtp)
             .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))?;
 
         let arr = PyArray2::<f32>::from_owned_array(py,
@@ -141,8 +143,10 @@ impl Engine {
         Ok(arr.into_pyobject(py)?.into_any().into())
     }
 
+    #[pyo3(signature = (input_ids, cache, *, mtp=false))]
     fn forward(&mut self, py: Python<'_>, input_ids: &Bound<PyArray1<i64>>,
         cache: &mut Cache,
+        mtp: bool,
     ) -> PyResult<PyObject> {
         let ids = input_ids.readonly();
         let ids = ids.as_slice()?;
@@ -156,7 +160,7 @@ impl Engine {
         let mut embed = vec![0.0f32; n * hd];
         self.engine.embed_lookup(new_ids, &mut embed);
 
-        let logits = self.forward_hidden_impl(&embed, &mut cache.inner, &mut || py.check_signals().is_err())
+        let logits = self.forward_hidden_impl(&embed, &mut cache.inner, &mut || py.check_signals().is_err(), mtp)
             .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))?;
 
         let arr = PyArray2::<f32>::from_owned_array(py,
@@ -369,9 +373,10 @@ impl Engine {
         embeddings: &[f32],
         cache: &mut CoreCache,
         check_signal: SignalCheckFn<'_>,
+        mtp: bool,
     ) -> Result<Vec<f32>, MoEError> {
         self.engine.upload_cache(cache);
-        let logits = self.engine.forward_hidden(embeddings, check_signal)?;
+        let logits = self.engine.forward_hidden(embeddings, check_signal, mtp)?;
         self.engine.download_cache(cache);
         self.telemetry = self.engine.telemetry();
         Ok(logits)

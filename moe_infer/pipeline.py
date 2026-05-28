@@ -317,16 +317,17 @@ class Pipeline:
             input_ids = self._build_text_input(message)
             embeds = self._engine.embed_lookup(input_ids)
 
-        logits = self._engine.forward_hidden(embeds, self._cache)
+        logits = self._engine.forward_hidden(embeds, self._cache, mtp=mtp)
         t_first_token = time.time()
 
         _gen = generate_from_mtp if (mtp and self._has_mtp) else generate_from
 
         if stream:
             return self._stream_chat(
-                logits[-1], _gen,
+                logits[-1],
                 t_start, t_first_token,
                 max_tokens, temperature, top_k, top_p, min_p,
+                mtp=mtp,
             )
 
         tokens: list[int] = []
@@ -346,6 +347,7 @@ class Pipeline:
             min_p=min_p,
             eos_ids=self.eos_ids,
             on_token=_on_token,
+            mtp=mtp,
         )
 
         _print_telemetry(t_start, t_first_token, len(tokens))
@@ -357,7 +359,6 @@ class Pipeline:
     def _stream_chat(
         self,
         first_logits: np.ndarray,
-        _gen,
         t_start: float,
         t_first_token: float,
         max_tokens: int,
@@ -365,30 +366,55 @@ class Pipeline:
         top_k: int,
         top_p: float,
         min_p: float,
+        *,
+        mtp: bool = False,
     ) -> Iterator[str]:
-        """Run generation inline, yielding whitespace-delimited word chunks."""
+        """Run generation inline, yielding whitespace-delimited word chunks.
+
+        Think-block content (``<think>…</think>``) is suppressed from
+        the stream — only the final response after ``</think>`` is
+        yielded, matching what ``_extract_response`` returns in
+        non-streaming mode.
+        """
         from moe_infer.sampling import sample
 
         last = np.asarray(first_logits)
         token_ids: list[int] = []
         cursor = [0]  # byte offset already yielded
+        think_closed = False  # True once </think> has been seen
 
         for _ in range(max_tokens):
             tok = sample(last, temperature, top_k, top_p, min_p)
             if tok in self.eos_ids:
                 break
             token_ids.append(tok)
-            chunk = _word_stream(self._tokenizer, token_ids, cursor)
-            if chunk:
-                yield chunk
+
+            if not think_closed:
+                text = self._tokenizer.decode(token_ids)
+                idx = text.find("</think>")
+                if idx >= 0:
+                    think_closed = True
+                    cursor[0] = idx + len("</think>")
+                    # consume any whitespace right after </think>
+                    while cursor[0] < len(text) and text[cursor[0]] in ("\n", " "):
+                        cursor[0] += 1
+
+            if think_closed:
+                chunk = _word_stream(self._tokenizer, token_ids, cursor)
+                if chunk:
+                    yield chunk
+
             emb = self._engine.embed_lookup(
                 np.array([tok], dtype=np.int64),
             )
-            last = self._engine.forward_hidden(emb, self._cache)[0]
+            last = self._engine.forward_hidden(emb, self._cache, mtp=mtp)[0]
 
         # Flush remainder
         text = self._tokenizer.decode(token_ids)
-        remainder = text[cursor[0] :]
+        if think_closed:
+            remainder = text[cursor[0] :]
+        else:
+            remainder = text
         if remainder:
             yield remainder
 

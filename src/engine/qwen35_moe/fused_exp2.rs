@@ -925,6 +925,7 @@ impl<C: ModelConfig> Engine for FusedExp2<C> {
         &mut self,
         embeddings: &[f32],
         check_signal: SignalCheckFn<'_>,
+        mtp: bool,
     ) -> Result<Vec<f32>, MoEError> {
         let t0 = Instant::now();
         let hidden_dim = C::HIDDEN_DIM;
@@ -956,7 +957,9 @@ impl<C: ModelConfig> Engine for FusedExp2<C> {
 
                 let mut hidden = exec.hidden_wait();
                 // Save h_pre_norm before final norm + lm_head consumes it
-                exec.engine.last_h_pre_norm = hidden.clone();
+                if mtp {
+                    exec.engine.last_h_pre_norm = hidden.clone();
+                }
                 pos += 1;
                 exec.engine.ctx.pos.set(pos);
 

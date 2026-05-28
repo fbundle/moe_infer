@@ -515,6 +515,7 @@ impl<'a, C: ModelConfig> Engine for CpuEngine<'a, C> {
         &mut self,
         embeddings: &[f32],
         check_signal: SignalCheckFn<'_>,
+        _mtp: bool,
     ) -> Result<Vec<f32>, MoEError> {
         let hd = C::HIDDEN_DIM;
         let n_tokens = embeddings.len() / hd;

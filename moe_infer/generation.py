@@ -25,6 +25,7 @@ def generate_from(
     min_p: float = 0.0,
     eos_ids: tuple[int, ...] = (248046, 248044),
     on_token: Callable[[int], None] | None = None,
+    mtp: bool = False,
 ) -> tuple[str, dict[str, Any]]:
     """Generate tokens autoregressively from pre-computed logits.
 
@@ -53,6 +54,8 @@ def generate_from(
         Token ids that signal end-of-sequence.
     on_token : callable or None
         Called with each token id as it is sampled (for streaming output).
+    mtp : bool
+        Forwarded to ``engine.forward_hidden`` to enable MTP state capture.
 
     Returns
     -------
@@ -74,7 +77,7 @@ def generate_from(
         if on_token is not None:
             on_token(tok)
         emb = engine.embed_lookup(np.array([tok], dtype=np.int64))
-        last = engine.forward_hidden(emb, cache)[0]
+        last = engine.forward_hidden(emb, cache, mtp=mtp)[0]
 
     dt = time.time() - t0
     n = len(generated)
@@ -100,6 +103,7 @@ def generate_from_mtp(
     min_p: float = 0.0,
     eos_ids: tuple[int, ...] = (248046, 248044),
     on_token: Callable[[int], None] | None = None,
+    mtp: bool = True,
 ) -> tuple[str, dict[str, Any]]:
     """Generate tokens with MTP-aware engine (standard loop for now).
 
@@ -118,4 +122,5 @@ def generate_from_mtp(
         min_p=min_p,
         eos_ids=eos_ids,
         on_token=on_token,
+        mtp=mtp,
     )

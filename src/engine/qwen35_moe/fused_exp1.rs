@@ -884,6 +884,7 @@ impl<C: ModelConfig> Engine for FusedExp1<C> {
         &mut self,
         embeddings: &[f32],
         check_signal: SignalCheckFn<'_>,
+        _mtp: bool,
     ) -> Result<Vec<f32>, MoEError> {
         let t0 = Instant::now();
         let hidden_dim = C::HIDDEN_DIM;

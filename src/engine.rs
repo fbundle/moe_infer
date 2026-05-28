@@ -44,6 +44,7 @@ pub trait Engine {
         &mut self,
         embeddings: &[f32],
         check_signal: SignalCheckFn<'_>,
+        mtp: bool,
     ) -> Result<Vec<f32>, MoEError>;
 
     /// H pre-norm from the last forward pass (before final norm + lm_head).
@@ -131,8 +132,8 @@ impl DynEngine {
         self.inner.embed_lookup(token_ids, embeddings);
     }
 
-    pub fn forward_hidden(&mut self, embeddings: &[f32], check_signal: SignalCheckFn<'_>) -> Result<Vec<f32>, MoEError> {
-        self.inner.forward_hidden(embeddings, check_signal)
+    pub fn forward_hidden(&mut self, embeddings: &[f32], check_signal: SignalCheckFn<'_>, mtp: bool) -> Result<Vec<f32>, MoEError> {
+        self.inner.forward_hidden(embeddings, check_signal, mtp)
     }
 
     pub fn last_h_pre_norm(&self) -> &[f32] {
