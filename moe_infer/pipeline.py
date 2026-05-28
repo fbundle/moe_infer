@@ -136,6 +136,13 @@ class Pipeline:
         """
         return raw
 
+    # Chat-template format for encoding the continuation tokens of a new
+    # user turn.  Subclass and override for non-Qwen models.
+    _continuation_fmt: str = (
+        "<|im_end|>\n<|im_start|>user\n{message}"
+        "<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n"
+    )
+
     # ── Init ────────────────────────────────────────────────────────────
 
     @staticmethod
@@ -235,6 +242,40 @@ class Pipeline:
 
         # Conversation state
         self._messages: list[dict[str, str]] = []
+        self._template_len: int = 0  # prefill token count from the last template
+
+    def _continuation_ids(self, message: str) -> list[int]:
+        """Encode the continuation tokens that append a new user turn
+        onto the existing KV cache.
+
+        The first turn uses ``apply_chat_template``; subsequent turns
+        use this to avoid re-tokenising the full conversation, which
+        would misalign the template with the cached key-value entries
+        (the template places think-block markers differently when it
+        has assistant history).
+        """
+        text = self._continuation_fmt.format(message=message)
+        return self._tokenizer.encode(text, add_special_tokens=False)
+
+    def _build_text_input(self, message: str) -> np.ndarray:
+        """Return input token IDs for a new user message.
+
+        On the first call this runs the full chat template.  On
+        subsequent calls it only encodes the continuation so the
+        token positions stay aligned with the KV cache.
+        """
+        ids: list[int]
+        if self._template_len == 0:
+            tmpl = self._tokenizer.apply_chat_template(
+                self._messages,
+                add_generation_prompt=True,
+                enable_thinking=False,
+            )
+            ids = list(tmpl.input_ids)
+        else:
+            ids = self._continuation_ids(message)
+        self._template_len += len(ids)
+        return np.array(ids, dtype=np.int64)
 
     # ── Public API ──────────────────────────────────────────────────────
 
@@ -273,14 +314,7 @@ class Pipeline:
             )
         else:
             self._messages.append({"role": "user", "content": message})
-            input_ids = np.array(
-                self._tokenizer.apply_chat_template(
-                    self._messages,
-                    add_generation_prompt=True,
-                    enable_thinking=False,
-                ).input_ids,
-                dtype=np.int64,
-            )[self._cache.pos :]
+            input_ids = self._build_text_input(message)
             embeds = self._engine.embed_lookup(input_ids)
 
         logits = self._engine.forward_hidden(embeds, self._cache)
@@ -366,6 +400,7 @@ class Pipeline:
     def reset(self) -> None:
         """Clear conversation history and reset the KV cache."""
         self._messages.clear()
+        self._template_len = 0
         self._cache.reset()
 
     @property
@@ -430,15 +465,33 @@ class Pipeline:
             feats = out.pooler_output.numpy().astype(np.float32)
             vis_feats.append((feats, n_merged))
 
-        # 2. Apply chat template — emits <|image_pad|> per image
-        input_ids = np.array(
-            self._tokenizer.apply_chat_template(
-                self._messages,
-                add_generation_prompt=True,
-                enable_thinking=False,
-            ).input_ids,
-            dtype=np.int64,
-        )[self._cache.pos :]
+        # 2. Build input IDs — use continuation for multi-turn to keep
+        #    token positions aligned with the KV cache.
+        if self._template_len == 0:
+            # First turn — the full chat template
+            input_ids = np.array(
+                self._tokenizer.apply_chat_template(
+                    self._messages,
+                    add_generation_prompt=True,
+                    enable_thinking=False,
+                ).input_ids,
+                dtype=np.int64,
+            )
+        else:
+            # Multi-turn — encode only the continuation tokens
+            msg_text: str = self._messages[-1]["content"][-1]["text"]
+            cont_str = "<|im_end|>\n<|im_start|>user\n"
+            for _ in images:
+                cont_str += "<|image_pad|>"
+            cont_str += (
+                f"{msg_text}<|im_end|>\n<|im_start|>assistant\n"
+                "<think>\n\n</think>\n\n"
+            )
+            input_ids = np.array(
+                self._tokenizer.encode(cont_str, add_special_tokens=False),
+                dtype=np.int64,
+            )
+        self._template_len += len(input_ids)
 
         # 3. Find <|image_pad|> token positions
         pad_id = self._tokenizer.convert_tokens_to_ids("<|image_pad|>")
