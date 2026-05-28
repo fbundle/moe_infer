@@ -15,7 +15,7 @@ Open Terminal and run these commands from the project folder:
 
 ```bash
 # 1. Build and install
-uv add moe_infer[all]  # or `uv build; uv sync --extra vision` if you live inside this project
+uv add moe_infer[all]  # or `uv sync --reinstall --extra vision` if you live inside this project
 
 # 2. Download the model (about 70 GB)
 hf download Qwen/Qwen3.6-35B-A3B \
@@ -93,6 +93,22 @@ Point it at a photo and ask about it:
 pipe.chat("What is in this photo?", images=["data/crycat-crying-cat.gif"], max_image_pixels=65536)
 ```
 
+### Multi-Token Prediction (MTP)
+
+Qwen3.6 includes an MTP draft head that predicts future tokens.  The
+quantized model bundles the MTP weights automatically — no extra config
+needed.  The engine loads them at startup:
+
+```python
+pipe = Qwen35MoEPipeline("data/Qwen3.6-35B-A3B")
+print(pipe._has_mtp)  # True for Qwen3.6, False for Qwen3.5
+```
+
+MTP state is initialized during model load.  The Python-side speculative
+decoding loop (`generate_from_mtp`) is available but currently delegates
+to the standard autoregressive loop.  The Rust MTP forward pass is
+functional; batched draft + verify will land in a future release.
+
 ## Tips
 
 | Tip | What to do |
@@ -102,3 +118,4 @@ pipe.chat("What is in this photo?", images=["data/crycat-crying-cat.gif"], max_i
 | Conversation history | `pipe.messages` — see what was said |
 | Engine timing | `pipe.telemetry` — how long each step took |
 | Switch quantization | `quantize_mode="int4"` or `quantize_mode="bq4"` (default) |
+| MTP support | Qwen3.6 models load MTP automatically; `pipe._has_mtp` reports status |
