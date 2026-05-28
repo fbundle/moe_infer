@@ -476,7 +476,6 @@ impl MetalContext {
     pub fn upload_cache(&self, cache: &Cache) {
         assert!(self.num_layers > 0, "upload_cache called before init_linear_attn_buffers");
         self.pos.set(cache.pos);
-        if cache.pos == 0 { return; }
         for layer in 0..self.num_layers {
             if (layer + 1) % FULL_ATTN_INTERVAL == 0 {
                 let fa_idx = layer / FULL_ATTN_INTERVAL;
