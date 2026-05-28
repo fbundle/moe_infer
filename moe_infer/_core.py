@@ -46,7 +46,7 @@ class Engine:
     model : Model
         A loaded :class:`Model` instance.
     pipeline_mode : str
-        One of ``"Qwen35MoEBq4Exp1"`` or ``"Qwen35MoEBq4Exp2"``.
+        One of ``"Qwen35MoEFusedExp1"`` or ``"Qwen35MoEFusedExp2"``.
     k : int
         Active experts per token.  0 means "use model default" (8 for Qwen3.6).
     """
@@ -54,7 +54,7 @@ class Engine:
     def __init__(
         self,
         model: Model,
-        pipeline_mode: str = "Qwen35MoEBq4Exp2",
+        pipeline_mode: str = "Qwen35MoEFusedExp2",
         k: int = 0,
     ) -> None:
         self._inner = _rs.Engine(model._inner, pipeline_mode, k)
@@ -101,8 +101,8 @@ def record_engine_telemetry(on: bool) -> None:
 # ── Qwen-specific re-exports (moved to moe_infer.qwen35_moe) ─────────────────
 
 from moe_infer.qwen35_moe import (  # noqa: E402
-    bq4_convert as qwen35_moe_bq4_convert,
-    bq4_extract_tokenizer as qwen35_moe_bq4_extract_tokenizer,
-    bq4_extract_vision as qwen35_moe_bq4_extract_vision,
-    bq4_quantize as qwen35_moe_bq4_quantize,
+    convert as qwen35_moe_convert,
+    extract_tokenizer as qwen35_moe_extract_tokenizer,
+    extract_vision as qwen35_moe_extract_vision,
+    quantize as qwen35_moe_quantize,
 )

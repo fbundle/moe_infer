@@ -27,8 +27,8 @@ If you live in a cave, you can install with pip `pip install moe_infer[all]`
 
 ```python
 # 3. Convert the model (takes ~5 minutes)
-from moe_infer.qwen35_moe import bq4_convert
-bq4_convert('hub/models--Qwen--Qwen3.6-35B-A3B', 'data/models--Qwen--Qwen3.6-35B-A3B', version='3.6')
+from moe_infer.qwen35_moe import convert
+convert('hub/models--Qwen--Qwen3.6-35B-A3B', 'data/models--Qwen--Qwen3.6-35B-A3B', version='3.6')
 ```
 
 When it's done you'll see a new folder with three things inside:

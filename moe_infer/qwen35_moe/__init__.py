@@ -7,7 +7,7 @@ import os as _os
 import _moe_infer_rs as _rs  # type: ignore[import-untyped]
 
 
-def bq4_extract_tokenizer(hub_path: str, output_dir: str) -> None:
+def extract_tokenizer(hub_path: str, output_dir: str) -> None:
     """Copy tokenizer files from a HF hub to *output_dir*."""
     import shutil
 
@@ -28,7 +28,7 @@ def bq4_extract_tokenizer(hub_path: str, output_dir: str) -> None:
             shutil.copy2(src, _os.path.join(output_dir, name))
 
 
-def bq4_extract_vision(hub_path: str, output_dir: str) -> None:
+def extract_vision(hub_path: str, output_dir: str) -> None:
     """Copy vision-encoder files from a HF hub to *output_dir*."""
     import json
     import shutil
@@ -67,7 +67,7 @@ def bq4_extract_vision(hub_path: str, output_dir: str) -> None:
     )
 
 
-def bq4_quantize(
+def quantize(
     model_path: str,
     output_dir: str,
     *,
@@ -94,7 +94,7 @@ def bq4_quantize(
     )
 
 
-def bq4_convert(
+def convert(
     input: str,
     output: str | None = None,
     *,
@@ -122,17 +122,17 @@ def bq4_convert(
 
     model_dir = _os.path.join(output, "model_bq4")
     print(f"[1/3] Quantizing model → {model_dir}")
-    bq4_quantize(
+    quantize(
         hub_path, model_dir,
         version=version,
         scheme=scheme,
     )
 
     print(f"[2/3] Extracting tokenizer → {output}/tokenizer")
-    bq4_extract_tokenizer(hub_path, _os.path.join(output, "tokenizer"))
+    extract_tokenizer(hub_path, _os.path.join(output, "tokenizer"))
 
     print(f"[3/3] Extracting vision encoder → {output}/vision_encoder")
-    bq4_extract_vision(hub_path, _os.path.join(output, "vision_encoder"))
+    extract_vision(hub_path, _os.path.join(output, "vision_encoder"))
 
     print(f"\nDone → {output}/")
     print(f"  model_bq4/       (quantized weights)")

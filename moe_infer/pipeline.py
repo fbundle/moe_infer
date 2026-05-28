@@ -156,7 +156,7 @@ class Pipeline:
         *,
         hub: str | None = None,
         tokenizer: Any = None,
-        mode: str = "Qwen35MoEBq4Exp2",
+        mode: str = "Qwen35MoEFusedExp2",
         k: int = 0,
     ) -> None:
         import os
