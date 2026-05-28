@@ -679,40 +679,39 @@ impl WeightBuffer {
                 );
                 return true;
             }
-            Some(DType::Int4) => {} // fall through to INT4 below
+            Some(DType::Int4) => {
+                let s_ptr = match wf.get_tensor_ptr(&format!("{}.scales", prefix)) {
+                    Some(p) => p,
+                    None => {
+                        eprintln!("[encode_matvec_into] WARNING: tensor not found: {}.scales", prefix);
+                        return false;
+                    }
+                };
+                let b_ptr = match wf.get_tensor_ptr(&format!("{}.biases", prefix)) {
+                    Some(p) => p,
+                    None => {
+                        eprintln!("[encode_matvec_into] WARNING: tensor not found: {}.biases", prefix);
+                        return false;
+                    }
+                };
+
+                let s_off = (s_ptr as usize - self.base as usize) as u64;
+                let b_off = (b_ptr as usize - self.base as usize) as u64;
+
+                metal_kernels::encode_matvec_offset(
+                    ctx, encoder,
+                    &self.buf, w_off, &self.buf, s_off, &self.buf, b_off,
+                    x_buf, x_offset, out_buf, out_offset,
+                    out_dim as u32, in_dim as u32, GPU_MATVEC_GROUP_SIZE, 3,
+                );
+                return true;
+            }
             q => {
                 let d = q.map(|q| q.as_str()).unwrap_or("unknown");
                 eprintln!("[encode_matvec_into] ERROR: unsupported dtype '{}' for tensor {}", d, weight_name);
                 return false;
             }
         }
-
-        // INT4 dequant matvec
-        let s_ptr = match wf.get_tensor_ptr(&format!("{}.scales", prefix)) {
-            Some(p) => p,
-            None => {
-                eprintln!("[encode_matvec_into] WARNING: tensor not found: {}.scales", prefix);
-                return false;
-            }
-        };
-        let b_ptr = match wf.get_tensor_ptr(&format!("{}.biases", prefix)) {
-            Some(p) => p,
-            None => {
-                eprintln!("[encode_matvec_into] WARNING: tensor not found: {}.biases", prefix);
-                return false;
-            }
-        };
-
-        let s_off = (s_ptr as usize - self.base as usize) as u64;
-        let b_off = (b_ptr as usize - self.base as usize) as u64;
-
-        metal_kernels::encode_matvec_offset(
-            ctx, encoder,
-            &self.buf, w_off, &self.buf, s_off, &self.buf, b_off,
-            x_buf, x_offset, out_buf, out_offset,
-            out_dim as u32, in_dim as u32, GPU_MATVEC_GROUP_SIZE, 3,
-        );
-        true
     }
 
     /// Dispatch a single GPU dequant matvec (convenience — creates command buffer).
