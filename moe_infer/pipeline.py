@@ -15,7 +15,7 @@ import numpy as np
 
 import _moe_infer_rs as _rs  # type: ignore[import-untyped]
 
-from moe_infer.generation import generate_from
+from moe_infer.generation import generate_from, generate_from_mtp
 from moe_infer.hub import load_tokenizer
 
 
@@ -251,6 +251,7 @@ class Pipeline:
         min_image_pixels: int = 0,
         max_image_pixels: int = 0,
         stream: bool = False,
+        mtp: bool = True,
     ) -> str | Iterator[str]:
         """Send a message and get the assistant's response.
 
@@ -285,9 +286,12 @@ class Pipeline:
         logits = self._engine.forward_hidden(embeds, self._cache)
         t_first_token = time.time()
 
+        _gen = generate_from_mtp if (mtp and self._has_mtp) else generate_from
+
         if stream:
             return self._stream_chat(
-                logits[-1], t_start, t_first_token,
+                logits[-1], _gen,
+                t_start, t_first_token,
                 max_tokens, temperature, top_k, top_p, min_p,
             )
 
@@ -296,7 +300,7 @@ class Pipeline:
         def _on_token(tok: int) -> None:
             tokens.append(tok)
 
-        completion, _stats = generate_from(
+        completion, _stats = _gen(
             logits[-1],
             self._engine,
             self._cache,
@@ -319,6 +323,7 @@ class Pipeline:
     def _stream_chat(
         self,
         first_logits: np.ndarray,
+        _gen,
         t_start: float,
         t_first_token: float,
         max_tokens: int,
