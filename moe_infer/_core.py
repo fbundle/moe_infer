@@ -111,6 +111,14 @@ class HfRepo:
         Returns local paths in the same order."""
         return self._inner.ensure_batch(filenames)
 
+    def file_size(self, filename: str) -> int:
+        """Get a file's expected size in bytes (from HF API or local fs)."""
+        return self._inner.file_size(filename)
+
+    def file_sizes(self) -> list[tuple[str, int]]:
+        """Get (filename, size_bytes) for all files in the repo."""
+        return self._inner.file_sizes()
+
     def remove(self, filename: str) -> None:
         """Delete a cached file from the staging directory."""
         self._inner.remove(filename)
