@@ -10,7 +10,8 @@ use crate::cache::Cache as CoreCache;
 use crate::model::Model as CoreModel;
 use crate::error::MoEError;
 use crate::engine::{SignalCheckFn, TelemetryValue, set_record_telemetry, DynEngine};
-use crate::bq4::{Qwen35MoEScheme, QwenVersion};
+use crate::bq4::{BQ4Scheme, QwenVersion};
+use crate::int4::Int4Scheme;
 
 // ─── Module-level functions ──────────────────────────────────────────────────
 
@@ -203,13 +204,12 @@ impl Engine {
 /// BQ4 rules, quantizes, and writes ``model_weights.bin``,
 /// ``model_weights.json``, and ``packed_experts/layer_XX.bin``.
 #[pyfunction]
-#[pyo3(signature = (model_path, output_dir, *, version, strip_layers=0, strip_experts=0))]
-pub fn qwen35_moe_bq4_quantize(
+#[pyo3(signature = (model_path, output_dir, *, version, scheme="bq4"))]
+pub fn qwen35_moe_quantize(
     model_path: &str,
     output_dir: &str,
     version: &str,
-    strip_layers: usize,
-    strip_experts: usize,
+    scheme: &str,
 ) -> PyResult<()> {
     let qwen_version = match version {
         "3.5" => QwenVersion::V35,
@@ -240,16 +240,29 @@ pub fn qwen35_moe_bq4_quantize(
             .to_string()
     };
 
-    let scheme = match arch.as_str() {
-        "Qwen3_5MoeForConditionalGeneration" =>
-            Qwen35MoEScheme::new(&config_dir, qwen_version, strip_layers, strip_experts)
-                .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e))?,
-        _ => return Err(pyo3::exceptions::PyValueError::new_err(
+    if arch != "Qwen3_5MoeForConditionalGeneration" {
+        return Err(pyo3::exceptions::PyValueError::new_err(
             format!("Unknown architecture: {}", arch)
-        )),
+        ));
     };
-    crate::quantize::run(model_path, output_dir, &scheme, strip_layers, strip_experts)
-        .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e))
+
+    match scheme {
+        "bq4" => {
+            let s = BQ4Scheme::new(&config_dir, qwen_version)
+                .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e))?;
+            crate::quantize::run(model_path, output_dir, &s)
+                .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e))
+        }
+        "int4" => {
+            let s = Int4Scheme::new(&config_dir, qwen_version)
+                .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e))?;
+            crate::quantize::run(model_path, output_dir, &s)
+                .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e))
+        }
+        _ => Err(pyo3::exceptions::PyValueError::new_err(
+            format!("Unknown scheme: {}. Expected 'bq4' or 'int4'.", scheme)
+        )),
+    }
 }
 
 // ─── Internal forward impl ─────────────────────────────────────────────────

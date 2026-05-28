@@ -71,8 +71,6 @@ pub fn run(
     input: &str,
     output: &str,
     scheme: &dyn QuantScheme,
-    _strip_layers: usize,
-    _strip_experts: usize,
 ) -> Result<(), String> {
     // ── 0. Local directory or HF repo? ────────────────────────────────
     let repo = if Path::new(input).is_dir() {
