@@ -87,6 +87,47 @@ class Cache:
         return self._inner.__repr__()
 
 
+# ── HfRepo ────────────────────────────────────────────────────────────────────
+
+class HfRepo:
+    """HuggingFace repo file downloader (local or remote).
+
+    Parameters
+    ----------
+    repo_id : str
+        HuggingFace repo ID (e.g. ``"Qwen/Qwen3.6-35B-A3B"``) or a
+        local directory path.
+    """
+
+    def __init__(self, repo_id: str) -> None:
+        self._inner = _rs.PyHfRepo(repo_id)
+
+    def ensure(self, filename: str) -> str:
+        """Download *filename* and return its local path."""
+        return self._inner.ensure(filename)
+
+    def remove(self, filename: str) -> None:
+        """Delete a cached file from the staging directory."""
+        self._inner.remove(filename)
+
+    def ls(self) -> list[str]:
+        """List files in the repo."""
+        return self._inner.ls()
+
+    @property
+    def path(self) -> str:
+        """Local staging directory path."""
+        return self._inner.path
+
+    @property
+    def is_hf(self) -> bool:
+        """True if this is a remote HF repo (vs a local directory)."""
+        return self._inner.is_hf
+
+    def __repr__(self) -> str:
+        return f"HfRepo({self.path!r})"
+
+
 # ── Top-level functions ──────────────────────────────────────────────────────
 
 def record_engine_telemetry(on: bool) -> None:

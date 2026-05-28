@@ -27,6 +27,7 @@ Low-level API
 from moe_infer._core import (
     Cache,
     Engine,
+    HfRepo,
     Model,
     qwen35_moe_convert,
     qwen35_moe_extract_tokenizer,
@@ -43,6 +44,7 @@ from moe_infer.sampling import sample, softmax
 __all__ = [
     "Cache",
     "Engine",
+    "HfRepo",
     "Model",
     "Pipeline",
     "Qwen35MoEPipeline",

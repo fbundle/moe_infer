@@ -11,6 +11,7 @@ use crate::model::Model as CoreModel;
 use crate::error::MoEError;
 use crate::engine::{SignalCheckFn, TelemetryValue, set_record_telemetry, DynEngine};
 use crate::bq4::{BQ4Scheme, QwenVersion};
+use crate::hf_util::HfRepo;
 use crate::int4::Int4Scheme;
 
 // ─── Module-level functions ──────────────────────────────────────────────────
@@ -262,6 +263,52 @@ pub fn qwen35_moe_quantize(
         _ => Err(pyo3::exceptions::PyValueError::new_err(
             format!("Unknown scheme: {}. Expected 'bq4' or 'int4'.", scheme)
         )),
+    }
+}
+
+// ─── HfRepo (HF downloader exposed to Python) ────────────────────────────
+
+#[pyclass(unsendable)]
+pub struct PyHfRepo {
+    repo: HfRepo,
+}
+
+#[pymethods]
+impl PyHfRepo {
+    #[new]
+    #[pyo3(signature = (repo_id))]
+    fn new(repo_id: &str) -> PyResult<Self> {
+        HfRepo::from_hf(repo_id)
+            .map(|repo| PyHfRepo { repo })
+            .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e))
+    }
+
+    /// Download a file and return its local path.
+    fn ensure(&self, filename: &str) -> PyResult<String> {
+        self.repo.ensure(filename)
+            .map(|p| p.to_string_lossy().to_string())
+            .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e))
+    }
+
+    /// Delete a cached file.
+    fn remove(&self, filename: &str) {
+        self.repo.remove(filename)
+    }
+
+    /// List files in the repo (remote API call for HF, local list for local).
+    fn ls(&self) -> PyResult<Vec<String>> {
+        self.repo.ls()
+            .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e))
+    }
+
+    #[getter]
+    fn path(&self) -> String {
+        self.repo.path().to_string_lossy().to_string()
+    }
+
+    #[getter]
+    fn is_hf(&self) -> bool {
+        self.repo.is_hf()
     }
 }
 
