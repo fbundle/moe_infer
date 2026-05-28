@@ -679,7 +679,12 @@ impl WeightBuffer {
                 );
                 return true;
             }
-            _ => {} // INT4 or unknown → fall through
+            Some(DType::Int4) => {} // fall through to INT4 below
+            q => {
+                let d = q.map(|q| q.as_str()).unwrap_or("unknown");
+                eprintln!("[encode_matvec_into] ERROR: unsupported dtype '{}' for tensor {}", d, weight_name);
+                return false;
+            }
         }
 
         // INT4 dequant matvec
