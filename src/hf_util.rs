@@ -30,19 +30,15 @@ impl HfRepo {
 
     pub fn path(&self) -> &Path { &self.staging }
 
-    /// List files in the repo.
-    /// - Local: lists files in the directory.
-    /// - HF: fetches file list from the Hub API.
+    /// List all files in the repo recursively.
+    /// - Local: walks the directory tree.
+    /// - HF: fetches the full file tree from the Hub API (already recursive).
     pub fn ls(&self) -> Result<Vec<String>, String> {
         match &self.repo_id {
             None => {
                 let mut files = Vec::new();
-                for entry in fs::read_dir(&self.staging).map_err(|e| e.to_string())? {
-                    let entry = entry.map_err(|e| e.to_string())?;
-                    if entry.file_type().map(|t| t.is_file()).unwrap_or(false) {
-                        files.push(entry.file_name().to_string_lossy().to_string());
-                    }
-                }
+                walk_dir(&self.staging, &self.staging, &mut files)
+                    .map_err(|e| e.to_string())?;
                 files.sort();
                 Ok(files)
             }
@@ -83,6 +79,21 @@ impl HfRepo {
     pub fn remove(&self, filename: &str) {
         fs::remove_file(self.staging.join(filename)).ok();
     }
+}
+
+fn walk_dir(base: &Path, dir: &Path, files: &mut Vec<String>) -> Result<(), std::io::Error> {
+    for entry in fs::read_dir(dir)? {
+        let entry = entry?;
+        let path = entry.path();
+        if entry.file_type()?.is_dir() {
+            walk_dir(base, &path, files)?;
+        } else if entry.file_type()?.is_file() {
+            if let Ok(rel) = path.strip_prefix(base) {
+                files.push(rel.to_string_lossy().to_string());
+            }
+        }
+    }
+    Ok(())
 }
 
 fn download_hf(repo_id: &str, filename: &str, dest_dir: &Path) -> Result<PathBuf, String> {
