@@ -295,9 +295,11 @@ impl PyHfRepo {
         self.repo.remove(filename)
     }
 
-    /// List files in the repo (remote API call for HF, local list for local).
-    fn ls(&self) -> PyResult<Vec<String>> {
-        self.repo.ls()
+    /// List immediate children of *dir* (defaults to root).  Behaves like UNIX
+    /// ``ls``: returns names of files and directories at that level.
+    #[pyo3(signature = (dir=None))]
+    fn ls(&self, dir: Option<&str>) -> PyResult<Vec<String>> {
+        self.repo.ls(dir)
             .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e))
     }
 

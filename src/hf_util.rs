@@ -30,17 +30,26 @@ impl HfRepo {
 
     pub fn path(&self) -> &Path { &self.staging }
 
-    /// List all files in the repo recursively.
-    /// - Local: walks the directory tree.
-    /// - HF: fetches the full file tree from the Hub API (already recursive).
-    pub fn ls(&self) -> Result<Vec<String>, String> {
+    /// List immediate children of *dir* (defaults to root).  Behaves like UNIX ``ls``:
+    /// returns names of files and directories at that level, not recursive.
+    /// - Local: reads the filesystem.
+    /// - HF: fetches the full file tree from the Hub API and filters to one level.
+    pub fn ls(&self, dir: Option<&str>) -> Result<Vec<String>, String> {
+        let prefix = dir.unwrap_or("");
         match &self.repo_id {
             None => {
-                let mut files = Vec::new();
-                walk_dir(&self.staging, &self.staging, &mut files)
-                    .map_err(|e| e.to_string())?;
-                files.sort();
-                Ok(files)
+                let target = if prefix.is_empty() {
+                    self.staging.clone()
+                } else {
+                    self.staging.join(prefix)
+                };
+                let mut entries = Vec::new();
+                for entry in fs::read_dir(&target).map_err(|e| e.to_string())? {
+                    let entry = entry.map_err(|e| e.to_string())?;
+                    entries.push(entry.file_name().to_string_lossy().to_string());
+                }
+                entries.sort();
+                Ok(entries)
             }
             Some(repo_id) => {
                 let url = format!("https://huggingface.co/api/models/{}/tree/main", repo_id);
@@ -50,14 +59,29 @@ impl HfRepo {
                     .into_body()
                     .read_to_string()
                     .map_err(|e| format!("read API response: {e}"))?;
-                let entries: Vec<serde_json::Value> =
+                let all: Vec<serde_json::Value> =
                     serde_json::from_str(&body_str).map_err(|e| e.to_string())?;
-                let files: Vec<String> = entries
+                // Collect all paths from the API
+                let all_paths: Vec<&str> = all
                     .iter()
-                    .filter(|v| v["type"] == "file")
-                    .filter_map(|v| v["path"].as_str().map(String::from))
+                    .filter_map(|v| v["path"].as_str())
                     .collect();
-                Ok(files)
+                // Find immediate children of *prefix*: strip prefix + "/",
+                // keep only entries that have exactly one more component
+                let prefix_len = if prefix.is_empty() { 0 } else { prefix.len() + 1 };
+                let mut seen = std::collections::BTreeSet::new();
+                for path in &all_paths {
+                    if prefix_len > 0 && !path.starts_with(prefix) {
+                        continue;
+                    }
+                    let rest = &path[prefix_len..];
+                    if let Some(slash) = rest.find('/') {
+                        seen.insert(rest[..slash].to_string());
+                    } else if !rest.is_empty() {
+                        seen.insert(rest.to_string());
+                    }
+                }
+                Ok(seen.into_iter().collect())
             }
         }
     }
@@ -79,21 +103,6 @@ impl HfRepo {
     pub fn remove(&self, filename: &str) {
         fs::remove_file(self.staging.join(filename)).ok();
     }
-}
-
-fn walk_dir(base: &Path, dir: &Path, files: &mut Vec<String>) -> Result<(), std::io::Error> {
-    for entry in fs::read_dir(dir)? {
-        let entry = entry?;
-        let path = entry.path();
-        if entry.file_type()?.is_dir() {
-            walk_dir(base, &path, files)?;
-        } else if entry.file_type()?.is_file() {
-            if let Ok(rel) = path.strip_prefix(base) {
-                files.push(rel.to_string_lossy().to_string());
-            }
-        }
-    }
-    Ok(())
 }
 
 fn download_hf(repo_id: &str, filename: &str, dest_dir: &Path) -> Result<PathBuf, String> {
