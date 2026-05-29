@@ -227,7 +227,7 @@ impl<'b, C: ModelConfig> ExecCtx<'b, C> {
     // ── Routing ───────────────────────────────────────────────────────────
 
     fn route_experts(&mut self, layer: usize, mut gate_scores: GateScores) -> Routing {
-        let k = self.engine.k;
+        let k = self.engine.num_active_experts;
         softmax(&mut gate_scores.scores);
         let mut expert_indices = vec![0usize; k];
         let mut expert_weights = vec![0.0f32; k];
@@ -317,7 +317,7 @@ impl<'b, C: ModelConfig> ExecCtx<'b, C> {
         let hidden_dim = C::HIDDEN_DIM;
         let moe_inter = C::MOE_INTERMEDIATE;
         let shared_inter = C::SHARED_INTERMEDIATE;
-        let k = self.engine.k;
+        let k = self.engine.num_active_experts;
 
         let next_norm_info = if layer + 1 < C::NUM_LAYERS {
             self.engine.model.weight_file.get_tensor_ptr(
@@ -882,15 +882,15 @@ pub struct FusedExp1<C: ModelConfig> {
     pub ctx: MetalContext,
     pub weight_buffer: WeightBuffer,
     pub expert_buffer: ExpertBuffer,
-    pub k: usize,
+    pub num_active_experts: usize,
     pub timing: BTreeMap<String, TelemetryValue>,
     _phantom: PhantomData<C>,
 }
 
 impl<C: ModelConfig> FusedExp1<C> {
-    pub fn new(model: Arc<Model>, k: usize, expert_cache: usize) -> Result<Self, MoEError> {
+    pub fn new(model: Arc<Model>, num_active_experts: usize, expert_cache_count: usize) -> Result<Self, MoEError> {
         C::validate_config(&model.config).map_err(MoEError::Config)?;
-        let (ctx, weight_buffer, expert_buffer) = MetalContext::new::<C>(&model.weight_file, k, "FusedExp1", expert_cache)?;
+        let (ctx, weight_buffer, expert_buffer) = MetalContext::new::<C>(&model.weight_file, num_active_experts, "FusedExp1", expert_cache_count)?;
 
         // // Debug: verify GPU matvec against CPU reference for key tensors
         // eprintln!("[verify] === BF16 matvec verification ===");
@@ -904,7 +904,7 @@ impl<C: ModelConfig> FusedExp1<C> {
 
         Ok(FusedExp1 {
             model, ctx, weight_buffer, expert_buffer,
-            k: if k == 0 { C::NUM_EXPERTS_PER_TOK } else { k },
+            num_active_experts: if num_active_experts == 0 { C::NUM_EXPERTS_PER_TOK } else { num_active_experts },
             timing: BTreeMap::new(),
             _phantom: PhantomData,
         })

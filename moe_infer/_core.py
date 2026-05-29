@@ -47,17 +47,18 @@ class Engine:
         A loaded :class:`Model` instance.
     pipeline_mode : str
         One of ``"Qwen35MoEFusedExp1"`` or ``"Qwen35MoEFusedExp2"``.
-    k : int
-        Active experts per token.  0 means "use model default" (8 for Qwen3.6).
+    num_active_experts : int
+        Active experts per token (top-k routing).  0 means "use the model's
+        configured default" (8 for Qwen3.6).
     """
 
     def __init__(
         self,
         model: Model,
         pipeline_mode: str = "Qwen35MoEFusedExp2",
-        k: int = 0,
+        num_active_experts: int = 0,
     ) -> None:
-        self._inner = _rs.Engine(model._inner, pipeline_mode, k)
+        self._inner = _rs.Engine(model._inner, pipeline_mode, num_active_experts)
 
     def __getattr__(self, name: str) -> Any:
         return getattr(self._inner, name)

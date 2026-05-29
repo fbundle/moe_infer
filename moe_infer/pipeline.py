@@ -139,9 +139,10 @@ class Pipeline:
         Pre-loaded HF tokenizer.  If omitted, loaded from *hub*.
     mode : str
         Pipeline mode passed to :class:`~moe_infer.Engine`.
-    k : int
-        Active experts per token.  0 = model default.
-    expert_cache : int
+    num_active_experts : int
+        Active experts per token (top-k routing).  0 = use the model's
+        configured default (8 on Qwen3.6).
+    expert_cache_count : int
         Size of the GPU-resident shared LRU cache for routed-expert
         weights, in number of entries (each ~1.7 MB on Qwen3.6-35B).
         ``0`` disables it; ``32`` is the sweet spot from empirical
@@ -224,9 +225,9 @@ class Pipeline:
         hub: str | None = None,
         tokenizer: Any = None,
         mode: str = "Qwen35MoEFusedExp2",
-        k: int = 0,
+        num_active_experts: int = 0,
         quantize_mode: str = "bq4",
-        expert_cache: int = 0,
+        expert_cache_count: int = 0,
     ) -> None:
         import os
 
@@ -248,7 +249,7 @@ class Pipeline:
         # LM (raw Rust types — wrappers break cross-calls)
         self._model = _rs.Model(model_path)
         self._engine = _rs.Engine(
-            self._model, mode, k, expert_cache=expert_cache,
+            self._model, mode, num_active_experts, expert_cache_count=expert_cache_count,
         )
         self._cache = _rs.Cache(self._model)
 

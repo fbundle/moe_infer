@@ -100,8 +100,8 @@ impl DynEngine {
     pub fn new(
         engine_type: &str,
         model: Arc<Model>,
-        k: usize,
-        expert_cache: usize,
+        num_active_experts: usize,
+        expert_cache_count: usize,
     ) -> Result<Self, MoEError> {
         let arch = model.config.resolve("architectures")
             .and_then(|v| v.as_array())
@@ -110,13 +110,13 @@ impl DynEngine {
             .unwrap_or_default();
         let inner: Box<dyn Engine> = match (engine_type, arch) {
             ("Qwen35MoEFusedExp1", "Qwen3_5MoeForConditionalGeneration") =>
-                Box::new(FusedExp1::<FullModel>::new(model, k, expert_cache)?),
+                Box::new(FusedExp1::<FullModel>::new(model, num_active_experts, expert_cache_count)?),
             ("Qwen35MoEFusedExp1", "Qwen3_5MoeForConditionalGeneration_Stripped") =>
-                Box::new(FusedExp1::<StrippedModel>::new(model, k, expert_cache)?),
+                Box::new(FusedExp1::<StrippedModel>::new(model, num_active_experts, expert_cache_count)?),
             ("Qwen35MoEFusedExp2", "Qwen3_5MoeForConditionalGeneration") =>
-                Box::new(FusedExp2::<FullModel>::new(model, k, expert_cache)?),
+                Box::new(FusedExp2::<FullModel>::new(model, num_active_experts, expert_cache_count)?),
             ("Qwen35MoEFusedExp2", "Qwen3_5MoeForConditionalGeneration_Stripped") =>
-                Box::new(FusedExp2::<StrippedModel>::new(model, k, expert_cache)?),
+                Box::new(FusedExp2::<StrippedModel>::new(model, num_active_experts, expert_cache_count)?),
             _ => return Err(MoEError::Config(format!(
                 "Unknown engine: engine_type={:?}, arch={:?}", engine_type, arch
             ))),

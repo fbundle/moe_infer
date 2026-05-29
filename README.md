@@ -103,10 +103,10 @@ cache to absorb repeats.  That's usually enough on M2/M3/M4 + a fast
 SSD.  On older hardware (M1, M1 Pro) or slower disks, expert I/O can
 dominate and a GPU-resident LRU helps.
 
-Pass `expert_cache=N` to allocate an N-entry shared LRU:
+Pass `expert_cache_count=N` to allocate an N-entry shared LRU:
 
 ```python
-pipe = Qwen35MoEPipeline("data/Qwen3.6-35B-A3B", expert_cache=32)
+pipe = Qwen35MoEPipeline("data/Qwen3.6-35B-A3B", expert_cache_count=32)
 ```
 
 The cache is a single LRU shared across all MoE layers, keyed by
@@ -116,7 +116,7 @@ minimal memory.  `0` disables it.
 
 Each entry is ~1.7 MB on Qwen3.6-35B, so:
 
-| `expert_cache=` | Footprint | Notes |
+| `expert_cache_count=` | Footprint | Notes |
 |---|---|---|
 | `0` (default) | 0 MB | OS page cache only — best on M2/M3/M4 + fast SSD |
 | `32` | ~54 MB | Sweet spot on M1 / M1 Pro |
@@ -124,7 +124,7 @@ Each entry is ~1.7 MB on Qwen3.6-35B, so:
 
 Empirical measurements on the "write a 200 word essay" prompt:
 
-| Hardware | `expert_cache=0` | `expert_cache=32` |
+| Hardware | `expert_cache_count=0` | `expert_cache_count=32` |
 |---|---|---|
 | M4 + fast SSD | 6.5 tok/s | 6.8 tok/s |
 | M1 Pro + internal SSD | ~7 tok/s | ~9.5 tok/s |
@@ -216,5 +216,5 @@ and PyTorch CPU (pre-dequantized BF16 matmul).
 | Conversation history | `pipe.messages` — see what was said |
 | Engine timing | `pipe.telemetry` — how long each step took |
 | Switch quantization | `quantize_mode="int4"` or `quantize_mode="bq4"` (default) |
-| Expert LRU cache | `Qwen35MoEPipeline(..., expert_cache=32)` — try it on M1/M1 Pro |
+| Expert LRU cache | `Qwen35MoEPipeline(..., expert_cache_count=32)` — try it on M1/M1 Pro |
 | MTP support | Qwen3.6 models load MTP automatically; `pipe._has_mtp` reports status |

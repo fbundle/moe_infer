@@ -165,7 +165,7 @@ impl ExpertBuffer {
             shared_down: metal_buf_shared(device, hidden_dim * 4),
             combine_out: metal_buf_shared(device, hidden_dim * 4),
             combine_params: metal_buf_shared(device, 40),
-            cache: None,  // populated by init_expert_buffers if expert_cache > 0
+            cache: None,  // populated by init_expert_buffers if expert_cache_count > 0
         }
     }
 
@@ -388,7 +388,7 @@ impl MetalContext {
         moe_inter: usize,
         shared_inter: usize,
         _num_layers: usize,
-        expert_cache: usize,
+        expert_cache_count: usize,
     ) -> ExpertBuffer {
         let mut io = ExpertBuffer::new(
             &self.device,
@@ -397,8 +397,8 @@ impl MetalContext {
             moe_inter,
             shared_inter,
         );
-        if expert_cache > 0 {
-            io.init_cache(&self.device, expert_cache, expert_size);
+        if expert_cache_count > 0 {
+            io.init_cache(&self.device, expert_cache_count, expert_size);
         }
         eprintln!(
             "[expert-io] Pre-allocated {}x data bufs ({} MB each), {}x scratch",
@@ -415,21 +415,22 @@ impl MetalContext {
     /// Returns (ctx, weight_buffer, expert_buffer) ready for engine construction.
     pub fn new<C: crate::engine::qwen35_constants::ModelConfig>(
         weight_file: &WeightFile,
-        k: usize,
+        num_active_experts: usize,
         label: &str,
-        expert_cache: usize,
+        expert_cache_count: usize,
     ) -> Result<(Self, WeightBuffer, ExpertBuffer), MoEError> {
-        let k = if k == 0 { C::NUM_EXPERTS_PER_TOK } else { k };
-        if k > C::NUM_EXPERTS_PER_TOK {
+        let num_active = if num_active_experts == 0 { C::NUM_EXPERTS_PER_TOK } else { num_active_experts };
+        if num_active > C::NUM_EXPERTS_PER_TOK {
             return Err(MoEError::Config(format!(
-                "k ({}) must not exceed model's num_experts_per_tok ({})", k, C::NUM_EXPERTS_PER_TOK
+                "num_active_experts ({}) must not exceed model's num_experts_per_tok ({})",
+                num_active, C::NUM_EXPERTS_PER_TOK
             )));
         }
-        if k > MAX_K {
+        if num_active > MAX_K {
             return Err(MoEError::Config(format!(
-                "k ({}) exceeds engine MAX_K ({}); raise MAX_K and the \
+                "num_active_experts ({}) exceeds engine MAX_K ({}); raise MAX_K and the \
                  moe_combine_residual shader's expert-buffer count to support more",
-                k, MAX_K
+                num_active, MAX_K
             )));
         }
 
@@ -444,7 +445,7 @@ impl MetalContext {
         );
         let expert_buffer = ctx.init_expert_buffers(
             C::EXPERT_SIZE_4BIT, C::HIDDEN_DIM, C::MOE_INTERMEDIATE, C::SHARED_INTERMEDIATE,
-            C::NUM_LAYERS, expert_cache,
+            C::NUM_LAYERS, expert_cache_count,
         );
         let weight_buffer = WeightBuffer::new(&ctx.device, weight_file);
 
