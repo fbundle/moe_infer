@@ -150,43 +150,28 @@ impl Engine {
         Ok(arr.into_pyobject(py)?.into_any().into())
     }
 
-    /// Embed the suffix of *input_ids* beyond the current engine position and
-    /// run the LM.  *input_ids* must contain the full sequence so far — the
-    /// engine's own tracked position (advanced by previous forwards on this
-    /// cache) determines where the new tokens start.
+    /// Embed *tokens* and run the LM on them, advancing the cache by
+    /// ``tokens.len()`` positions.  Pass ONLY the new tokens to consume —
+    /// not the full sequence so far.  The engine appends to its existing
+    /// KV cache; previously processed tokens stay where they were.
     ///
-    /// Errors if the engine's position is ahead of `input_ids.len()`.  Reset
-    /// the cache (`cache.reset()`) before passing a shorter sequence.
-    #[pyo3(signature = (input_ids, cache, *, mtp=false))]
-    fn forward(&mut self, py: Python<'_>, input_ids: &Bound<PyArray1<i64>>,
+    /// This is the fast path for text generation: it does embed lookup and
+    /// forward in a single pyo3 call, saving a numpy allocation and a
+    /// Python round-trip per token compared to ``embed_lookup`` +
+    /// ``forward_hidden``.  Use ``forward_hidden`` only when the caller has
+    /// to supply custom embeddings (e.g. spliced vision features).
+    #[pyo3(signature = (tokens, cache, *, mtp=false))]
+    fn forward(&mut self, py: Python<'_>, tokens: &Bound<PyArray1<i64>>,
         cache: &mut Cache,
         mtp: bool,
     ) -> PyResult<PyObject> {
-        let ids = input_ids.readonly();
-        let ids = ids.as_slice()?;
-        // Read the engine's tracked position directly — cache.pos may lag
-        // since forward_hidden no longer syncs it on the hot path.  On a
-        // fresh cache (cpu_dirty=true) the engine hasn't run yet, so fall
-        // back to cache.pos (which the next forward_hidden_impl will upload).
-        let pos = if cache.inner.cpu_dirty {
-            cache.inner.pos
-        } else {
-            self.engine.engine_pos()
-        };
-        if pos > ids.len() {
-            return Err(pyo3::exceptions::PyValueError::new_err(format!(
-                "engine pos ({}) exceeds input_ids.len() ({}); call cache.reset() \
-                 before passing a shorter sequence",
-                pos, ids.len()
-            )));
-        }
-        let new_ids = &ids[pos..];
-        let n = new_ids.len();
+        let toks = tokens.readonly();
+        let toks = toks.as_slice()?;
+        let n = toks.len();
         let hd = self.model.config.get_usize("hidden_size").unwrap();
         let vs = self.model.config.get_usize("vocab_size").unwrap();
 
         if n == 0 {
-            // No new tokens; return an empty [0, vocab_size] array.
             let arr = PyArray2::<f32>::from_owned_array(py,
                 numpy::ndarray::Array2::from_shape_vec((0, vs), Vec::new())
                     .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(
@@ -195,7 +180,7 @@ impl Engine {
         }
 
         let mut embed = vec![0.0f32; n * hd];
-        self.engine.embed_lookup(new_ids, &mut embed);
+        self.engine.embed_lookup(toks, &mut embed);
 
         let logits = self.forward_hidden_impl(&embed, &mut cache.inner, &mut || py.check_signals().is_err(), mtp)
             .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))?;

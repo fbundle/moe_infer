@@ -358,12 +358,13 @@ class Pipeline:
             embeds = self._build_vision_input(
                 images, min_image_pixels, max_image_pixels,
             )
+            logits = self._engine.forward_hidden(embeds, self._cache, mtp=mtp)
         else:
             self._messages.append({"role": "user", "content": message})
             input_ids = self._build_text_input(message)
-            embeds = self._engine.embed_lookup(input_ids)
-
-        logits = self._engine.forward_hidden(embeds, self._cache, mtp=mtp)
+            # Text path: forward() does the embed lookup inside the same
+            # pyo3 call (one round-trip instead of embed_lookup + forward_hidden).
+            logits = self._engine.forward(input_ids, self._cache, mtp=mtp)
         t_first_token = time.time()
 
         _gen = generate_from_mtp if (mtp and self._has_mtp) else generate_from
@@ -436,10 +437,9 @@ class Pipeline:
             if chunk:
                 yield chunk
 
-            emb = self._engine.embed_lookup(
-                np.array([tok], dtype=np.int64),
-            )
-            last = self._engine.forward_hidden(emb, self._cache, mtp=mtp)[0]
+            last = self._engine.forward(
+                np.array([tok], dtype=np.int64), self._cache, mtp=mtp,
+            )[0]
 
         # Flush whatever the word-boundary cursor was still holding back.
         text = self._tokenizer.decode(token_ids)

@@ -76,8 +76,9 @@ def generate_from(
         generated.append(tok)
         if on_token is not None:
             on_token(tok)
-        emb = engine.embed_lookup(np.array([tok], dtype=np.int64))
-        last = engine.forward_hidden(emb, cache, mtp=mtp)[0]
+        last = engine.forward(
+            np.array([tok], dtype=np.int64), cache, mtp=mtp,
+        )[0]
 
     dt = time.time() - t0
     n = len(generated)
