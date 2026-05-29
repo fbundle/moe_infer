@@ -67,6 +67,13 @@ impl Cache {
     }
 
     fn save(&self, bin_path: &str, json_path: &str) -> PyResult<()> {
+        if self.inner.gpu_dirty {
+            eprintln!(
+                "[cache] WARNING: saving cache with gpu_dirty=true — GPU state \
+                 hasn't been downloaded.  Call engine.download_cache(cache) first \
+                 to capture mid-conversation K/V state."
+            );
+        }
         self.inner.save(std::path::Path::new(bin_path), std::path::Path::new(json_path))
             .map_err(|e| pyo3::exceptions::PyIOError::new_err(e.to_string()))
     }
@@ -192,12 +199,16 @@ impl Engine {
     }
 
     /// Expose upload/download for callers that manage cache persistence.
-    fn upload_cache(&self, cache: &Cache) {
+    /// Hot-path forward_hidden no longer round-trips the cache, so callers
+    /// that want to persist GPU state to disk must download_cache first.
+    fn upload_cache(&self, cache: &mut Cache) {
         self.engine.upload_cache(&cache.inner);
+        cache.inner.cpu_dirty = false;
     }
 
     fn download_cache(&self, cache: &mut Cache) {
         self.engine.download_cache(&mut cache.inner);
+        cache.inner.gpu_dirty = false;
     }
 
     /// Engine-level telemetry (only populated when record_engine_telemetry(true)).
@@ -396,9 +407,21 @@ impl Engine {
         check_signal: SignalCheckFn<'_>,
         mtp: bool,
     ) -> Result<Vec<f32>, MoEError> {
-        self.engine.upload_cache(cache);
+        // Cache sync optimization:
+        //   - Upload only when CPU has changes the GPU hasn't seen (cpu_dirty).
+        //     In steady-state autoregressive generation this is always false,
+        //     so we skip the K/V copy entirely.
+        //   - Skip the full download — the GPU is the source of truth.  Only
+        //     sync `pos` (one usize) so callers reading `cache.pos` see the
+        //     advanced position.  Mark gpu_dirty so explicit save() callers
+        //     know to download_cache first.
+        if cache.cpu_dirty {
+            self.engine.upload_cache(cache);
+            cache.cpu_dirty = false;
+        }
         let logits = self.engine.forward_hidden(embeddings, check_signal, mtp)?;
-        self.engine.download_cache(cache);
+        cache.set_pos(self.engine.engine_pos());
+        cache.gpu_dirty = true;
         self.telemetry = self.engine.telemetry();
         Ok(logits)
     }

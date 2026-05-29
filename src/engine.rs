@@ -34,6 +34,9 @@ pub trait Engine {
     fn upload_cache(&self, cache: &Cache);
     /// Download GPU buffers → CPU cache after forward.
     fn download_cache(&self, cache: &mut Cache);
+    /// Current engine-tracked sequence position (cheap — just reads a Cell).
+    /// Used by the hot path to update CPU cache.pos without copying K/V data.
+    fn engine_pos(&self) -> usize { 0 }
 
     /// Convert token IDs to embeddings. Writes into `embeddings` [n, hidden_dim].
     fn embed_lookup(&self, token_ids: &[i64], embeddings: &mut [f32]);
@@ -127,6 +130,10 @@ impl DynEngine {
 
     pub fn download_cache(&self, cache: &mut Cache) {
         self.inner.download_cache(cache);
+    }
+
+    pub fn engine_pos(&self) -> usize {
+        self.inner.engine_pos()
     }
 
     pub fn embed_lookup(&self, token_ids: &[i64], embeddings: &mut [f32]) {

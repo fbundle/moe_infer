@@ -922,6 +922,10 @@ impl<C: ModelConfig> Engine for FusedExp1<C> {
         self.ctx.download_cache(cache);
     }
 
+    fn engine_pos(&self) -> usize {
+        self.ctx.pos.get()
+    }
+
     fn embed_lookup(&self, token_ids: &[i64], embeddings: &mut [f32]) {
         let hidden_dim = C::HIDDEN_DIM;
         for (i, &id) in token_ids.iter().enumerate() {

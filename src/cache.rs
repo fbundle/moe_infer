@@ -32,6 +32,13 @@ impl State {
 pub struct Cache {
     pub pos: usize,
     pub states: Vec<State>,
+    /// CPU state changed since last upload — engine must upload before forward.
+    /// Initially true (GPU has nothing yet), cleared after upload.
+    pub cpu_dirty: bool,
+    /// GPU state is newer than CPU (forward ran without a full download).
+    /// Set after every forward, cleared on full download.  Used by save()
+    /// callers to detect they should flush first.
+    pub gpu_dirty: bool,
 }
 
 impl Cache {
@@ -59,7 +66,7 @@ impl Cache {
                 )));
             }
         }
-        Cache { pos: 0, states }
+        Cache { pos: 0, states, cpu_dirty: true, gpu_dirty: false }
     }
 
     /// Accessors panicking if the layer has the wrong attention type.
@@ -76,6 +83,8 @@ impl Cache {
                 ls.ssm_state.fill(0.0);
             }
         }
+        self.cpu_dirty = true;
+        self.gpu_dirty = false;
     }
 
     /// Set position and sync all full-attention layer lengths.
@@ -212,7 +221,7 @@ impl Cache {
             }
         }
 
-        Ok(Cache { pos, states })
+        Ok(Cache { pos, states, cpu_dirty: true, gpu_dirty: false })
     }
 }
 
