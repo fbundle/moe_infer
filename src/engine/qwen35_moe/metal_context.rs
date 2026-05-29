@@ -393,7 +393,7 @@ impl MetalContext {
         moe_inter: usize,
         shared_inter: usize,
         num_layers: usize,
-        cache_enabled: bool,
+        expert_cache: bool,
     ) -> ExpertBuffer {
         let mut io = ExpertBuffer::new(
             &self.device,
@@ -402,7 +402,7 @@ impl MetalContext {
             moe_inter,
             shared_inter,
         );
-        if cache_enabled {
+        if expert_cache {
             io.init_caches(&self.device, num_layers, expert_size);
         }
         eprintln!(
@@ -422,7 +422,7 @@ impl MetalContext {
         weight_file: &WeightFile,
         k: usize,
         label: &str,
-        cache_enabled: bool,
+        expert_cache: bool,
     ) -> Result<(Self, WeightBuffer, ExpertBuffer), MoEError> {
         let k = if k == 0 { C::NUM_EXPERTS_PER_TOK } else { k };
         if k > C::NUM_EXPERTS_PER_TOK {
@@ -449,7 +449,7 @@ impl MetalContext {
         );
         let expert_buffer = ctx.init_expert_buffers(
             C::EXPERT_SIZE_4BIT, C::HIDDEN_DIM, C::MOE_INTERMEDIATE, C::SHARED_INTERMEDIATE,
-            C::NUM_LAYERS, cache_enabled,
+            C::NUM_LAYERS, expert_cache,
         );
         let weight_buffer = WeightBuffer::new(&ctx.device, weight_file);
 

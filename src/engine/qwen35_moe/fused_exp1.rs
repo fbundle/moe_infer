@@ -890,9 +890,9 @@ pub struct FusedExp1<C: ModelConfig> {
 }
 
 impl<C: ModelConfig> FusedExp1<C> {
-    pub fn new(model: Arc<Model>, k: usize, cache_enabled: bool) -> Result<Self, MoEError> {
+    pub fn new(model: Arc<Model>, k: usize, expert_cache: bool) -> Result<Self, MoEError> {
         C::validate_config(&model.config).map_err(MoEError::Config)?;
-        let (ctx, weight_buffer, expert_buffer) = MetalContext::new::<C>(&model.weight_file, k, "FusedExp1", cache_enabled)?;
+        let (ctx, weight_buffer, expert_buffer) = MetalContext::new::<C>(&model.weight_file, k, "FusedExp1", expert_cache)?;
 
         // // Debug: verify GPU matvec against CPU reference for key tensors
         // eprintln!("[verify] === BF16 matvec verification ===");

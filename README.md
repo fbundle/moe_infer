@@ -95,6 +95,35 @@ Point it at a photo and ask about it:
 pipe.chat("What is in this photo?", images=["data/crycat-crying-cat.gif"], max_image_pixels=65536)
 ```
 
+### Expert LRU cache
+
+By default the engine `pread`s routed expert weights from the mmap'd
+weight file every MoE layer, every token, and relies on the macOS page
+cache to absorb repeats.  That's usually enough on M2/M3/M4 + a fast
+SSD.  On older hardware (M1, M1 Pro) or slower disks, expert I/O can
+dominate and a GPU-resident LRU helps.
+
+Turn it on with `expert_cache=True`:
+
+```python
+pipe = Qwen35MoEPipeline("data/Qwen3.6-35B-A3B", expert_cache=True)
+```
+
+This allocates one LRU per MoE layer (8 entries each, ~540 MB total on
+Qwen3.6-35B).  Cache hits skip the `pread` entirely and reuse the GPU
+buffer from a previous token.
+
+Off by default — measure before flipping it on:
+
+| Hardware | Off | On |
+|---|---|---|
+| M4 + fast SSD | ~6.6 tok/s | ~5.8 tok/s (slower — page cache wins) |
+| M1 Pro + internal SSD | ~7 tok/s | ~9.5 tok/s (reported by user) |
+
+The break-even depends on how often your prompts route to the same
+experts at each layer; the LRU pays off when temporal locality at the
+layer level is high.
+
 ### Multi-Token Prediction (MTP)
 
 Qwen3.6 includes an MTP draft head that predicts future tokens.  The
