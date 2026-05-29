@@ -74,12 +74,15 @@ impl ExpertCache {
     /// the LRU entry if full.  Zero-copy: the cache takes ownership of the
     /// loaded data buffer and the caller's slot now holds the old cache
     /// buffer, ready for reuse as the next pread destination.
-    pub fn insert_swap(&mut self, layer: usize, expert: usize, buf: &mut Buffer) {
+    ///
+    /// Returns a clone of the now-cached buffer so the caller can use it
+    /// directly without a follow-up `lookup` (which would inflate hit stats).
+    pub fn insert_swap(&mut self, layer: usize, expert: usize, buf: &mut Buffer) -> Buffer {
         self.access_counter += 1;
 
         if let Some(&idx) = self.map.get(&(layer, expert)) {
             self.entries[idx].last_used = self.access_counter;
-            return;
+            return self.entries[idx].buffer.clone();
         }
 
         let target = if self.map.len() < self.entries.len() {
@@ -106,6 +109,7 @@ impl ExpertCache {
         self.entries[target].expert_idx = expert as i32;
         self.entries[target].last_used = self.access_counter;
         self.map.insert((layer, expert), target);
+        self.entries[target].buffer.clone()
     }
 
     pub fn len(&self) -> usize { self.map.len() }

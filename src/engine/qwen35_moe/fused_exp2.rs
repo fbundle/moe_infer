@@ -166,7 +166,10 @@ impl<'b, C: ModelConfig> ExecCtx<'b, C> {
         }
 
         cmd.commit();
+        let t_wait = Instant::now();
         cmd.wait_until_completed();
+        timing_add(&mut self.engine.timing, "engine.gpu_wait_ms",
+                   t_wait.elapsed().as_secs_f64() * 1000.0);
         drop(keep_alive);
         self.pending = None;
 
@@ -229,11 +232,14 @@ impl<'b, C: ModelConfig> ExecCtx<'b, C> {
 
     fn route_experts(&mut self, layer: usize, mut gate_scores: GateScores) -> Routing {
         let k = self.engine.num_active_experts;
+        let t_route = Instant::now();
         softmax(&mut gate_scores.scores);
         let mut expert_indices = vec![0usize; k];
         let mut expert_weights = vec![0.0f32; k];
         topk(&gate_scores.scores, k, &mut expert_indices, &mut expert_weights);
         normalize_weights(&mut expert_weights);
+        timing_add(&mut self.engine.timing, "engine.routing_cpu_ms",
+                   t_route.elapsed().as_secs_f64() * 1000.0);
 
         let actual_k = k.min(MAX_K);
         let mut resolved_data: Vec<Option<Buffer>> = vec![None; actual_k];
@@ -265,6 +271,7 @@ impl<'b, C: ModelConfig> ExecCtx<'b, C> {
 
             // Phase 2: parallel pread for cache misses
             if !misses.is_empty() {
+                let t_pread = Instant::now();
                 let expert_buf = &self.engine.expert_buffer;
                 rayon::scope(|s| {
                     for &(ki, eidx) in &misses {
@@ -279,6 +286,10 @@ impl<'b, C: ModelConfig> ExecCtx<'b, C> {
                         });
                     }
                 });
+                timing_add(&mut self.engine.timing, "engine.expert_pread_ms",
+                           t_pread.elapsed().as_secs_f64() * 1000.0);
+                timing_add(&mut self.engine.timing, "engine.expert_pread_bytes",
+                           (misses.len() * expert_size) as f64);
             }
 
             // Phase 3: insert newly loaded experts into the shared cache (zero-copy swap)
@@ -286,10 +297,11 @@ impl<'b, C: ModelConfig> ExecCtx<'b, C> {
                 let expert_buf = &mut self.engine.expert_buffer;
                 if let Some(ref mut cache) = expert_buf.cache {
                     for &(ki, eidx) in &misses {
-                        // Swap: cache gets the loaded data, expert_data[ki] gets old cache buffer
-                        cache.insert_swap(layer, eidx, &mut expert_buf.expert_data[ki]);
-                        // Now look up the just-inserted buffer for resolved_data
-                        resolved_data[ki] = cache.lookup(layer, eidx);
+                        // Swap: cache gets the loaded data, expert_data[ki] gets old cache buffer.
+                        // The returned buffer is the now-cached one — no second lookup needed.
+                        resolved_data[ki] = Some(
+                            cache.insert_swap(layer, eidx, &mut expert_buf.expert_data[ki])
+                        );
                     }
                 }
                 // Resolve remaining buffers (from pread for non-cached path, or from cache hits)

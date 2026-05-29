@@ -285,8 +285,9 @@ impl<'b, C: ModelConfig> ExecCtx<'b, C> {
                 let expert_buf = &mut self.engine.expert_buffer;
                 if let Some(ref mut cache) = expert_buf.cache {
                     for &(ki, eidx) in &misses {
-                        cache.insert_swap(layer, eidx, &mut expert_buf.expert_data[ki]);
-                        resolved_data[ki] = cache.lookup(layer, eidx);
+                        resolved_data[ki] = Some(
+                            cache.insert_swap(layer, eidx, &mut expert_buf.expert_data[ki])
+                        );
                     }
                 }
                 // Resolve remaining buffers (from pread for non-cached path, or from cache hits)
