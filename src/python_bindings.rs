@@ -150,12 +150,13 @@ impl Engine {
         Ok(arr.into_pyobject(py)?.into_any().into())
     }
 
-    /// Embed the suffix of *input_ids* beyond the current cache position and run
-    /// the LM.  *input_ids* must contain the full sequence so far — the cache's
-    /// own position determines where the new tokens start.
+    /// Embed the suffix of *input_ids* beyond the current engine position and
+    /// run the LM.  *input_ids* must contain the full sequence so far — the
+    /// engine's own tracked position (advanced by previous forwards on this
+    /// cache) determines where the new tokens start.
     ///
-    /// Errors if `cache.pos > input_ids.len()` (the cache cannot be ahead of the
-    /// input).  Reset the cache before passing a shorter sequence.
+    /// Errors if the engine's position is ahead of `input_ids.len()`.  Reset
+    /// the cache (`cache.reset()`) before passing a shorter sequence.
     #[pyo3(signature = (input_ids, cache, *, mtp=false))]
     fn forward(&mut self, py: Python<'_>, input_ids: &Bound<PyArray1<i64>>,
         cache: &mut Cache,
@@ -163,10 +164,18 @@ impl Engine {
     ) -> PyResult<PyObject> {
         let ids = input_ids.readonly();
         let ids = ids.as_slice()?;
-        let pos = cache.inner.pos;
+        // Read the engine's tracked position directly — cache.pos may lag
+        // since forward_hidden no longer syncs it on the hot path.  On a
+        // fresh cache (cpu_dirty=true) the engine hasn't run yet, so fall
+        // back to cache.pos (which the next forward_hidden_impl will upload).
+        let pos = if cache.inner.cpu_dirty {
+            cache.inner.pos
+        } else {
+            self.engine.engine_pos()
+        };
         if pos > ids.len() {
             return Err(pyo3::exceptions::PyValueError::new_err(format!(
-                "cache.pos ({}) exceeds input_ids.len() ({}); call cache.reset() \
+                "engine pos ({}) exceeds input_ids.len() ({}); call cache.reset() \
                  before passing a shorter sequence",
                 pos, ids.len()
             )));
@@ -411,16 +420,16 @@ impl Engine {
         //   - Upload only when CPU has changes the GPU hasn't seen (cpu_dirty).
         //     In steady-state autoregressive generation this is always false,
         //     so we skip the K/V copy entirely.
-        //   - Skip the full download — the GPU is the source of truth.  Only
-        //     sync `pos` (one usize) so callers reading `cache.pos` see the
-        //     advanced position.  Mark gpu_dirty so explicit save() callers
-        //     know to download_cache first.
+        //   - Skip the full download — the GPU is the source of truth.
+        //   - Skip syncing cache.pos here.  Nothing in the chat loop reads it
+        //     between forwards; the only consumer (`Engine.forward`) calls
+        //     `engine_pos()` directly.  cache.pos lags GPU until the next
+        //     explicit `engine.download_cache(cache)` (or save() warning).
         if cache.cpu_dirty {
             self.engine.upload_cache(cache);
             cache.cpu_dirty = false;
         }
         let logits = self.engine.forward_hidden(embeddings, check_signal, mtp)?;
-        cache.set_pos(self.engine.engine_pos());
         cache.gpu_dirty = true;
         self.telemetry = self.engine.telemetry();
         Ok(logits)
