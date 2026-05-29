@@ -312,12 +312,24 @@ class Pipeline:
         min_image_pixels: int = 0,
         max_image_pixels: int = 0,
         stream: bool = False,
-        mtp: bool = True,
+        mtp: bool = False,
     ) -> str | Iterator[str]:
         """Send a message and get the assistant's response.
 
         Multi-turn conversation state is preserved via the KV cache.
         Call :meth:`reset` to start fresh.
+
+        Parameters
+        ----------
+        mtp : bool
+            Multi-Token Prediction.  When True, the engine captures the
+            pre-norm hidden state after each step so a speculative draft
+            head can consume it.  The current engine processes tokens
+            sequentially (no batched verify), so spec decoding cannot
+            beat baseline autoregressive — the flag is wired through for
+            researchers wiring up custom draft loops on top of
+            ``engine.mtp_forward`` / ``engine.last_h_pre_norm``.  Default
+            False since the captured state is otherwise unused.
         """
         # Build message content — use structured image items when images
         # are present so the chat template emits <|image_pad|> tokens.

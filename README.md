@@ -104,12 +104,24 @@ needed.  The engine loads them at startup:
 ```python
 pipe = Qwen35MoEPipeline("data/Qwen3.6-35B-A3B")
 print(pipe._has_mtp)  # True for Qwen3.6, False for Qwen3.5
+
+# Off by default; opt in to capture last_h_pre_norm for a custom draft loop.
+pipe.chat("Hello", mtp=True)
 ```
 
-MTP state is initialized during model load.  The Python-side speculative
-decoding loop (`generate_from_mtp`) is available but currently delegates
-to the standard autoregressive loop.  The Rust MTP forward pass is
-functional; batched draft + verify will land in a future release.
+The Rust MTP forward pass (`engine.mtp_forward(token_id)`) and KV cache
+plumbing (`engine.mtp_reset()`, `engine.mtp_rollback(pos)`) are functional.
+The Python-side speculative decoding loop (`generate_from_mtp`) currently
+delegates to the standard autoregressive loop.
+
+**Why is it default-off?**  Speculative decoding needs the main engine to
+verify K draft tokens in roughly the cost of one main forward.  This
+engine's `forward_hidden` processes input tokens sequentially (1-token
+forward ≈ 100 ms, 2-token forward ≈ 210 ms on the M4 / 35B BQ4), so
+spec decoding `(1+α) tokens / 2× main cost` is strictly worse than
+baseline `1 token / 1× main cost`.  A future batched-attention engine
+would make MTP a real win — until then, the flag stays for
+researchers wiring up alternative draft loops.
 
 ## Verification
 
