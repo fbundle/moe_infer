@@ -207,4 +207,5 @@ and PyTorch CPU (pre-dequantized BF16 matmul).
 | Conversation history | `pipe.messages` — see what was said |
 | Engine timing | `pipe.telemetry` — how long each step took |
 | Switch quantization | `quantize_mode="int4"` or `quantize_mode="bq4"` (default) |
+| Expert LRU cache | `Qwen35MoEPipeline(..., expert_cache=True)` — try it on M1/M1 Pro |
 | MTP support | Qwen3.6 models load MTP automatically; `pipe._has_mtp` reports status |
