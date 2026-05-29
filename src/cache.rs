@@ -79,6 +79,11 @@ impl Cache {
     }
 
     /// Set position and sync all full-attention layer lengths.
+    ///
+    /// Note: this does NOT zero linear-attention conv/SSM state, since linear
+    /// state is path-dependent and can't be rewound by position alone.  Use
+    /// `reset()` to fully clear all state.  Rewinding to `pos < self.pos` on a
+    /// model with linear-attention layers will produce stale outputs.
     pub fn set_pos(&mut self, pos: usize) {
         self.pos = pos;
         for s in &mut self.states {

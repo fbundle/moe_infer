@@ -143,6 +143,12 @@ impl Engine {
         Ok(arr.into_pyobject(py)?.into_any().into())
     }
 
+    /// Embed the suffix of *input_ids* beyond the current cache position and run
+    /// the LM.  *input_ids* must contain the full sequence so far — the cache's
+    /// own position determines where the new tokens start.
+    ///
+    /// Errors if `cache.pos > input_ids.len()` (the cache cannot be ahead of the
+    /// input).  Reset the cache before passing a shorter sequence.
     #[pyo3(signature = (input_ids, cache, *, mtp=false))]
     fn forward(&mut self, py: Python<'_>, input_ids: &Bound<PyArray1<i64>>,
         cache: &mut Cache,
@@ -151,11 +157,26 @@ impl Engine {
         let ids = input_ids.readonly();
         let ids = ids.as_slice()?;
         let pos = cache.inner.pos;
-        let start = if pos < ids.len() { pos } else { 0 };
-        let new_ids = &ids[start..];
+        if pos > ids.len() {
+            return Err(pyo3::exceptions::PyValueError::new_err(format!(
+                "cache.pos ({}) exceeds input_ids.len() ({}); call cache.reset() \
+                 before passing a shorter sequence",
+                pos, ids.len()
+            )));
+        }
+        let new_ids = &ids[pos..];
         let n = new_ids.len();
         let hd = self.model.config.get_usize("hidden_size").unwrap();
         let vs = self.model.config.get_usize("vocab_size").unwrap();
+
+        if n == 0 {
+            // No new tokens; return an empty [0, vocab_size] array.
+            let arr = PyArray2::<f32>::from_owned_array(py,
+                numpy::ndarray::Array2::from_shape_vec((0, vs), Vec::new())
+                    .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(
+                        format!("shape error: {}", e)))?);
+            return Ok(arr.into_pyobject(py)?.into_any().into());
+        }
 
         let mut embed = vec![0.0f32; n * hd];
         self.engine.embed_lookup(new_ids, &mut embed);

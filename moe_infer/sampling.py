@@ -30,8 +30,9 @@ def sample(
 ) -> int:
     """Sample a single token id from logits.
 
-    Modifies *logits* in-place.  Zero-temperature disables sampling
-    and returns ``argmax`` (greedy).
+    The caller's array is not modified — a working copy is taken for any
+    temperature/filter step that would scale or zero entries.
+    Zero-temperature returns ``argmax`` (greedy) without copying.
 
     Parameters
     ----------
@@ -53,12 +54,13 @@ def sample(
     int
         Sampled token id.
     """
-    n = len(logits)
-    if abs(temperature - 1.0) > 1e-7:
-        logits /= max(temperature, 1e-8)
     if temperature < 0.01:
         return int(np.argmax(logits))
-    probs = softmax(logits)
+    n = len(logits)
+    work = logits.astype(np.float32, copy=True)
+    if abs(temperature - 1.0) > 1e-7:
+        work /= max(temperature, 1e-8)
+    probs = softmax(work)
 
     if top_k > 0 and top_k < n:
         indices = np.argpartition(probs, -top_k)[-top_k:]
@@ -79,6 +81,6 @@ def sample(
 
     total = probs.sum()
     if total <= 0:
-        return int(np.argmax(logits))
+        return int(np.argmax(work))
     probs /= total
     return int(np.random.choice(n, p=probs))

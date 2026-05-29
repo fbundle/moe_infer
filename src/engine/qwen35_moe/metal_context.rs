@@ -218,9 +218,6 @@ pub struct MetalContext {
     pub attn_sdpa_fused: Option<ComputePipelineState>,        // fused online-softmax SDPA
     pub attn_sdpa_block: Option<ComputePipelineState>,       // 2-pass SDPA: block pass
     pub attn_sdpa_reduce: Option<ComputePipelineState>,      // 2-pass SDPA: reduce pass
-    pub attn_scores_batched: Option<ComputePipelineState>,
-    pub attn_softmax_batched: Option<ComputePipelineState>,
-    pub attn_values_batched: Option<ComputePipelineState>,
     pub gated_delta_net_step: Option<ComputePipelineState>,
     pub conv1d_step: Option<ComputePipelineState>,
     pub rms_norm_qk: Option<ComputePipelineState>,
@@ -280,10 +277,10 @@ pub struct MetalContext {
     pub buf_attn_q: Option<Buffer>,
     /// Q-gate buffer [num_attn_heads * head_dim] f32
     pub buf_attn_q_gate: Option<Buffer>,
-    /// Attention scores [num_attn_heads * MAX_SEQ] f32
-    pub buf_attn_scores: Option<Buffer>,
     /// Attention output [num_attn_heads * head_dim] f32
     pub buf_attn_out: Option<Buffer>,
+    /// 2-pass SDPA partials [num_attn_heads * ceil(MAX_SEQ/32) * (2 + head_dim)] f32
+    pub buf_attn_partials: Option<Buffer>,
     // ── Pre-allocated QKV projection buffers (match C's cs->x_buf/qbuf/kbuf/vbuf) ──
     /// Input normed hidden [hidden_dim] f32
     pub buf_qkv_x: Option<Buffer>,
@@ -371,11 +368,15 @@ impl MetalContext {
         // Pre-allocated full-attention GPU buffers (match C's buf_attn_*).
         // Shared across all full-attention layers within a token since processing is sequential.
         let q_dim = num_attn_heads * head_dim;
-        let attn_scores_size = num_attn_heads * crate::constants::MAX_SEQ * 4;
         self.buf_attn_q = Some(metal_buf_shared(&self.device, q_dim * 4));
         self.buf_attn_q_gate = Some(metal_buf_shared(&self.device, q_dim * 4));
-        self.buf_attn_scores = Some(metal_buf_shared(&self.device, attn_scores_size));
         self.buf_attn_out = Some(metal_buf_shared(&self.device, q_dim * 4));
+        // 2-pass SDPA partials — sized for the worst case (MAX_SEQ tokens) so
+        // we don't allocate a fresh Metal buffer per full-attn layer per token.
+        let max_blocks = (crate::constants::MAX_SEQ + 31) / 32;
+        let partials_stride = 2 + head_dim;
+        let partials_size = num_attn_heads * max_blocks * partials_stride * 4;
+        self.buf_attn_partials = Some(metal_buf_shared(&self.device, partials_size));
         // Pre-allocated QKV projection buffers — reused across all full-attention layers.
         self.buf_qkv_x = Some(metal_buf_shared(&self.device, hidden_dim * 4));
         self.buf_qkv_q = Some(metal_buf_shared(&self.device, q_proj_dim * 4));
@@ -427,6 +428,13 @@ impl MetalContext {
         if k > C::NUM_EXPERTS_PER_TOK {
             return Err(MoEError::Config(format!(
                 "k ({}) must not exceed model's num_experts_per_tok ({})", k, C::NUM_EXPERTS_PER_TOK
+            )));
+        }
+        if k > MAX_K {
+            return Err(MoEError::Config(format!(
+                "k ({}) exceeds engine MAX_K ({}); raise MAX_K and the \
+                 moe_combine_residual shader's expert-buffer count to support more",
+                k, MAX_K
             )));
         }
 
@@ -511,9 +519,6 @@ impl MetalContext {
             let attn_sdpa_fused = make_pipeline("attn_sdpa_fused").ok();
             let attn_sdpa_block  = make_pipeline("attn_sdpa_block").ok();
             let attn_sdpa_reduce = make_pipeline("attn_sdpa_reduce").ok();
-            let attn_scores_batched = make_pipeline("attn_scores_batched").ok();
-            let attn_softmax_batched = make_pipeline("attn_softmax_batched").ok();
-            let attn_values_batched = make_pipeline("attn_values_batched").ok();
             let gated_delta_net_step = make_pipeline("gated_delta_net_step").ok();
             let conv1d_step = make_pipeline("conv1d_step").ok();
             let rms_norm_qk = make_pipeline("rms_norm_qk").ok();
@@ -550,9 +555,6 @@ impl MetalContext {
                 attn_sdpa_fused,
                 attn_sdpa_block,
                 attn_sdpa_reduce,
-                attn_scores_batched,
-                attn_softmax_batched,
-                attn_values_batched,
                 gated_delta_net_step,
                 conv1d_step,
                 rms_norm_qk,
@@ -585,8 +587,8 @@ impl MetalContext {
                 buf_kv_v: Vec::new(),
                 buf_attn_q: None,
                 buf_attn_q_gate: None,
-                buf_attn_scores: None,
                 buf_attn_out: None,
+                buf_attn_partials: None,
                 buf_qkv_x: None,
                 buf_qkv_q: None,
                 buf_qkv_k: None,

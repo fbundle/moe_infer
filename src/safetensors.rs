@@ -108,6 +108,7 @@ fn f16_to_f32(h: u16) -> f32 {
 }
 
 /// Convert raw safetensors bytes to f32, dispatching on the storage dtype.
+/// Panics on unknown dtypes — silent fallthrough to BF16 was hiding shard bugs.
 pub fn bytes_to_f32(data: &[u8], dtype: &str) -> Vec<f32> {
     match dtype {
         "F32" => {
@@ -129,8 +130,7 @@ pub fn bytes_to_f32(data: &[u8], dtype: &str) -> Vec<f32> {
             }
             out
         }
-        _ => {
-            // BF16 (default for Qwen HF models)
+        "BF16" => {
             let n = data.len() / 2;
             let mut out = Vec::with_capacity(n);
             for i in 0..n {
@@ -140,5 +140,6 @@ pub fn bytes_to_f32(data: &[u8], dtype: &str) -> Vec<f32> {
             }
             out
         }
+        other => panic!("bytes_to_f32: unsupported safetensors dtype {other:?}"),
     }
 }

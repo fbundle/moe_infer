@@ -665,16 +665,11 @@ fn encode_pre_expert_full(
         );
     }
 
-    // ── 2-pass Fused SDPA (block + reduce) ──
+    // ── 2-pass Fused SDPA (block + reduce) — uses pre-allocated partials buffer ──
     {
         let num_blocks: u32 = (seq_len as u32 + 31) / 32;
-        let stride: usize = 2 + head_dim;
-
-        let partials_len = num_q * num_blocks as usize * stride;
-        let partials = c.device.new_buffer(
-            (partials_len * std::mem::size_of::<f32>()) as u64,
-            metal::MTLResourceOptions::StorageModeShared,
-        );
+        let partials = c.buf_attn_partials.as_ref()
+            .expect("buf_attn_partials not initialized");
 
         // ── Pass 1: block processing ──
         {
@@ -683,7 +678,7 @@ fn encode_pre_expert_full(
             enc.set_buffer(0, Some(q_out_buf), 0);
             enc.set_buffer(1, Some(kc_buf), 0);
             enc.set_buffer(2, Some(vc_buf), 0);
-            enc.set_buffer(3, Some(&partials), 0);
+            enc.set_buffer(3, Some(partials), 0);
             enc.set_bytes(4, 4, &(seq_len as u32) as *const u32 as *const c_void);
             enc.set_bytes(5, 4, &num_blocks as *const u32 as *const c_void);
             let scale: f32 = 1.0 / (head_dim as f32).sqrt();
@@ -698,7 +693,7 @@ fn encode_pre_expert_full(
         {
             let pipe = c.attn_sdpa_reduce.as_ref().unwrap();
             enc.set_compute_pipeline_state(pipe);
-            enc.set_buffer(0, Some(&partials), 0);
+            enc.set_buffer(0, Some(partials), 0);
             enc.set_buffer(1, Some(out_buf), 0);
             enc.set_bytes(2, 4, &num_blocks as *const u32 as *const c_void);
             enc.dispatch_thread_groups(

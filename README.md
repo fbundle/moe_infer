@@ -5,7 +5,9 @@ word-by-word, and understands images — all on-device, no internet needed.
 
 ## What you need
 
-- A Mac with Apple Silicon (M1 or newer) and at least 16 GB of RAM
+- A Mac with Apple Silicon (M1 or newer) and at least 32 GB of unified memory
+  (the BQ4 model is ~19 GB on disk and the engine mmaps it plus expert
+  scratch buffers; expect roughly model size + a few GB of headroom)
 - About 100 GB of free disk space (70 GB download + ~20 GB per quantized model)
 - The original HuggingFace model downloaded to `hub/models--Qwen--Qwen3.6-35B-A3B`
 

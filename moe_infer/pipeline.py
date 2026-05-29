@@ -48,7 +48,11 @@ def _preprocess_image(path: str, processor: Any, min_pixels: int, max_pixels: in
 
 
 def _check_mtp(model_dir: str) -> bool:
-    """Return True if the quantized model has MTP layers."""
+    """Return True if the quantized model has MTP layers.
+
+    A missing config is treated as "no MTP", but a malformed one is logged
+    so a corrupted file doesn't silently disable speculative decoding.
+    """
     import json
     import os
 
@@ -56,7 +60,13 @@ def _check_mtp(model_dir: str) -> bool:
     try:
         with open(cfg_path) as f:
             cfg = json.load(f)
-    except (OSError, json.JSONDecodeError):
+    except FileNotFoundError:
+        return False
+    except (OSError, json.JSONDecodeError) as e:
+        print(
+            f"[mtp-check] WARNING: could not parse {cfg_path}: {e} — "
+            "assuming no MTP", file=sys.stderr,
+        )
         return False
     tc = cfg.get("text_config", cfg)
     return tc.get("mtp_num_hidden_layers", 0) > 0
@@ -75,6 +85,9 @@ def _print_telemetry(t_start: float, t_first_token: float, num_tokens: int) -> N
     )
 
 
+_WORD_STREAM_MAX_HOLD = 16  # chars without a boundary before flushing anyway
+
+
 def _word_stream(
     tokenizer: Any, token_ids: list[int], cursor: list[int],
 ) -> str:
@@ -85,12 +98,19 @@ def _word_stream(
     incomplete suffix is held back so the next token can complete it.
     *cursor* is a mutable one-element list tracking the byte offset
     already yielded.
+
+    Languages without whitespace word boundaries (e.g. Chinese, Japanese)
+    would otherwise buffer until newline; if the pending tail grows past
+    ``_WORD_STREAM_MAX_HOLD`` characters with no boundary, flush it.
     """
     text = tokenizer.decode(token_ids)
     new = text[cursor[0] :]
     idx = max(new.rfind(" "), new.rfind("\n"))
     if idx < 0:
-        return ""          # no word boundary yet — hold everything
+        if len(new) < _WORD_STREAM_MAX_HOLD:
+            return ""  # no word boundary yet — hold everything
+        cursor[0] += len(new)
+        return new
     chunk = new[: idx + 1]
     cursor[0] += len(chunk)
     return chunk
