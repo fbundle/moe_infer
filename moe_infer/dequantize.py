@@ -266,14 +266,28 @@ def _read_ref_shapes(ref_dir: str) -> dict[str, tuple[int, ...]]:
 # ─── Reverse sanitization ──────────────────────────────────────────────────
 
 def _is_norm_weight(name: str) -> bool:
-    """Check if a tensor name is a layernorm/rms-norm weight."""
-    _norm_keys = (
-        ".input_layernorm.weight", ".post_attention_layernorm.weight",
-        "model.norm.weight", ".q_norm.weight", ".k_norm.weight",
-        ".pre_fc_norm_hidden.weight", ".pre_fc_norm_embedding.weight",
-        ".norm.weight",
+    """Check if a tensor name is a ZeroCenteredRMSNorm weight (quant added +1,
+    so dequant subtracts back).
+
+    Must match the Rust quant ``is_norm_key`` rule EXACTLY — keep both lists
+    in sync.  ``linear_attn.norm.weight`` is RMSNormGated (regular), NOT
+    zero-centered, so it MUST be excluded here too.
+    """
+    # Exclude the gated norm inside linear_attn — never shifted.
+    if name.endswith(".linear_attn.norm.weight"):
+        return False
+    _zc_suffixes = (
+        ".input_layernorm.weight",
+        ".post_attention_layernorm.weight",
+        ".q_norm.weight",
+        ".k_norm.weight",
+        ".pre_fc_norm_hidden.weight",
+        ".pre_fc_norm_embedding.weight",
     )
-    return any(name.endswith(k) for k in _norm_keys)
+    if any(name.endswith(k) for k in _zc_suffixes):
+        return True
+    # Final model-level norms.
+    return name.endswith("model.norm.weight") or name == "mtp.norm.weight"
 
 
 def _is_qwen36(model_path: str) -> bool:

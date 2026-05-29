@@ -184,20 +184,43 @@ pub(crate) fn is_vision_tensor(mlx_name: &str) -> bool {
 
 // ─── Sanitization ────────────────────────────────────────────────────────────
 
-const MLX_NORM_KEYS: &[&str] = &[
+// Only ZeroCenteredRMSNorm tensors (transformers computes `x * (1 + w)`) get
+// the +1 quant shift.  RMSNormGated tensors (`linear_attn.norm`) use regular
+// RMSNorm (`x * w`) and MUST NOT be shifted, otherwise the engine multiplies
+// by `w+1` while the reference multiplies by `w`.
+//
+// Suffix match: the `.norm.weight` pattern previously caught `mtp.norm.weight`
+// but ALSO incorrectly caught `*.linear_attn.norm.weight`.  We now match the
+// zero-centered norms by their specific suffixes and handle the model-level
+// `mtp.norm.weight` / `model.norm.weight` finals separately.
+const ZC_NORM_SUFFIXES: &[&str] = &[
     ".input_layernorm.weight",
     ".post_attention_layernorm.weight",
-    "model.norm.weight",
     ".q_norm.weight",
     ".k_norm.weight",
-];
-const MTP_NORM_KEYS: &[&str] = &[
-    ".pre_fc_norm_hidden.weight", ".pre_fc_norm_embedding.weight",
-    ".norm.weight",  // matches mtp.norm.weight
+    ".pre_fc_norm_hidden.weight",
+    ".pre_fc_norm_embedding.weight",
 ];
 
+/// Names that are model-level final norms (ZeroCenteredRMSNorm).
+fn is_final_zc_norm(mlx_name: &str) -> bool {
+    // Final HF backbone norm — under language_model. or top-level model.
+    if mlx_name.ends_with("model.norm.weight") || mlx_name == "mtp.norm.weight" {
+        return true;
+    }
+    false
+}
+
 pub(crate) fn is_norm_key(mlx_name: &str) -> bool {
-    MLX_NORM_KEYS.iter().chain(MTP_NORM_KEYS).any(|k| mlx_name.ends_with(k))
+    // Exclude the gated-RMSNorm tensor inside the linear-attn block — it is
+    // NOT zero-centered (transformers uses RMSNormGated, no `(1 + w)`).
+    if mlx_name.ends_with(".linear_attn.norm.weight") {
+        return false;
+    }
+    if ZC_NORM_SUFFIXES.iter().any(|k| mlx_name.ends_with(k)) {
+        return true;
+    }
+    is_final_zc_norm(mlx_name)
 }
 
 pub(crate) fn moveaxis_2_to_1(vals: &mut [f32], shape: &mut Vec<usize>) {
