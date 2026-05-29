@@ -401,19 +401,16 @@ class Pipeline:
         *,
         mtp: bool = False,
     ) -> Iterator[str]:
-        """Run generation inline, yielding whitespace-delimited word chunks.
-
-        Think-block content (``<think>…</think>``) is suppressed from
-        the stream — only the final response after ``</think>`` is
-        yielded, matching what ``_extract_response`` returns in
-        non-streaming mode.
+        """Run generation inline, yielding word-bounded chunks of the full
+        response as they arrive.  Streaming yields everything the model
+        generates — no think-block filtering — so the consumer sees the
+        same text that ``_extract_response`` would return non-streaming.
         """
         from moe_infer.sampling import sample
 
         last = np.asarray(first_logits)
         token_ids: list[int] = []
         cursor = [0]  # byte offset already yielded
-        think_closed = False  # True once </think> has been seen
 
         for _ in range(max_tokens):
             tok = sample(last, temperature, top_k, top_p, min_p)
@@ -421,39 +418,24 @@ class Pipeline:
                 break
             token_ids.append(tok)
 
-            if not think_closed:
-                text = self._tokenizer.decode(token_ids)
-                idx = text.find("</think>")
-                if idx >= 0:
-                    think_closed = True
-                    cursor[0] = idx + len("</think>")
-                    # consume any whitespace right after </think>
-                    while cursor[0] < len(text) and text[cursor[0]] in ("\n", " "):
-                        cursor[0] += 1
-
-            if think_closed:
-                chunk = _word_stream(self._tokenizer, token_ids, cursor)
-                if chunk:
-                    yield chunk
+            chunk = _word_stream(self._tokenizer, token_ids, cursor)
+            if chunk:
+                yield chunk
 
             emb = self._engine.embed_lookup(
                 np.array([tok], dtype=np.int64),
             )
             last = self._engine.forward_hidden(emb, self._cache, mtp=mtp)[0]
 
-        # Flush remainder
+        # Flush whatever the word-boundary cursor was still holding back.
         text = self._tokenizer.decode(token_ids)
-        if think_closed:
-            remainder = text[cursor[0] :]
-        else:
-            remainder = text
+        remainder = text[cursor[0] :]
         if remainder:
             yield remainder
 
         _print_telemetry(t_start, t_first_token, len(token_ids))
 
-        response = self._extract_response(text)
-        self._messages.append({"role": "assistant", "content": response})
+        self._messages.append({"role": "assistant", "content": text})
 
     def reset(self) -> None:
         """Clear conversation history and reset the KV cache."""
