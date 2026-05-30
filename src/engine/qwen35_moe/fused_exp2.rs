@@ -408,7 +408,10 @@ impl<'b, C: ModelConfig> ExecCtx<'b, C> {
 
 // ─── Private helpers ────────────────────────────────────────────────────────
 
-fn encode_pre_expert_linear(
+// encode_pre_expert_linear is `pub(crate)` (rather than fully private) so the
+// batched-prefill engine in `fused_exp3.rs` can reuse its per-token DeltaNet
+// dispatch sequence. Behavior is unchanged from the original.
+pub(crate) fn encode_pre_expert_linear(
     wf: &WeightFile,
     weight_buffer: &WeightBuffer,
     ctx: &MetalContext,

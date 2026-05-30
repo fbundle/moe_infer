@@ -366,3 +366,210 @@ pub fn encode_conv1d_step(
         MTLSize::new(256, 1, 1),
     );
 }
+
+// ---------------------------------------------------------------------------
+// Batched matvec variants (`_n`) for batched prefill.
+//
+// Input x is [N, in_dim] row-major, output is [N, out_dim] row-major.
+// Internally launches ceil(out_dim / ROWS_PER_TG) * N threadgroups,
+// linearized as tgid = row_tile + n * num_row_tiles.
+// ---------------------------------------------------------------------------
+
+pub fn encode_matvec_bf16_n(
+    ctx: &MetalContext,
+    encoder: &ComputeCommandEncoderRef,
+    w_bf16: &BufferRef, w_offset: u64,
+    x: &BufferRef, x_offset: u64,
+    out: &BufferRef, o_offset: u64,
+    out_dim: u32,
+    in_dim: u32,
+    n: u32,
+) {
+    // Use GEMM-tiled variant when available and N >= 2.
+    // For N=1, fall back to per-token kernel — GEMM tile would waste 3/4 of the work.
+    if n >= 2 && ctx.matvec_bf16_gemm_n.is_some() {
+        let ncols_per_tg: u32 = 4;
+        let pipeline = ctx.matvec_bf16_gemm_n.as_ref().unwrap();
+        encoder.set_compute_pipeline_state(pipeline);
+        encoder.set_buffer(0, Some(w_bf16), w_offset);
+        encoder.set_buffer(1, Some(x), x_offset);
+        encoder.set_buffer(2, Some(out), o_offset);
+        let num_row_tiles = (out_dim + ROWS_PER_TG - 1) / ROWS_PER_TG;
+        let num_n_tiles   = (n + ncols_per_tg - 1) / ncols_per_tg;
+        unsafe {
+            set_u32(encoder, 3, out_dim);
+            set_u32(encoder, 4, in_dim);
+            set_u32(encoder, 5, n);
+            set_u32(encoder, 6, num_row_tiles);
+        }
+        encoder.dispatch_thread_groups(
+            MTLSize::new((num_row_tiles as u64) * (num_n_tiles as u64), 1, 1),
+            MTLSize::new(TG_SIZE as u64, 1, 1),
+        );
+        return;
+    }
+    let pipeline = ctx.matvec_bf16_n.as_ref().expect("matvec_bf16_n kernel missing");
+    encoder.set_compute_pipeline_state(pipeline);
+    encoder.set_buffer(0, Some(w_bf16), w_offset);
+    encoder.set_buffer(1, Some(x), x_offset);
+    encoder.set_buffer(2, Some(out), o_offset);
+    let num_row_tiles = (out_dim + ROWS_PER_TG - 1) / ROWS_PER_TG;
+    unsafe {
+        set_u32(encoder, 3, out_dim);
+        set_u32(encoder, 4, in_dim);
+        set_u32(encoder, 5, num_row_tiles);
+    }
+    encoder.dispatch_thread_groups(
+        MTLSize::new((num_row_tiles as u64) * (n as u64), 1, 1),
+        MTLSize::new(TG_SIZE as u64, 1, 1),
+    );
+}
+
+pub fn encode_matvec_int8_n(
+    ctx: &MetalContext,
+    encoder: &ComputeCommandEncoderRef,
+    w_i8: &BufferRef, w_offset: u64,
+    scales: &BufferRef, s_offset: u64,
+    x: &BufferRef, x_offset: u64,
+    out: &BufferRef, o_offset: u64,
+    out_dim: u32,
+    in_dim: u32,
+    n: u32,
+) {
+    let pipeline = ctx.matvec_int8_n.as_ref().expect("matvec_int8_n kernel missing");
+    encoder.set_compute_pipeline_state(pipeline);
+    encoder.set_buffer(0, Some(w_i8), w_offset);
+    encoder.set_buffer(1, Some(scales), s_offset);
+    encoder.set_buffer(2, Some(x), x_offset);
+    encoder.set_buffer(3, Some(out), o_offset);
+    let num_row_tiles = (out_dim + ROWS_PER_TG - 1) / ROWS_PER_TG;
+    unsafe {
+        set_u32(encoder, 4, out_dim);
+        set_u32(encoder, 5, in_dim);
+        set_u32(encoder, 6, num_row_tiles);
+    }
+    encoder.dispatch_thread_groups(
+        MTLSize::new((num_row_tiles as u64) * (n as u64), 1, 1),
+        MTLSize::new(TG_SIZE as u64, 1, 1),
+    );
+}
+
+/// Encode causal batched SDPA for prefill.
+///
+/// N new tokens with Q [N, num_q_heads, head_dim] vs K/V cache where the
+/// new tokens' K/V are at positions [past_pos .. past_pos+N). Causal mask
+/// is implicit: token i only attends positions 0..(past_pos + i).
+pub fn encode_attn_sdpa_causal_n(
+    ctx: &MetalContext,
+    encoder: &ComputeCommandEncoderRef,
+    q: &BufferRef, q_offset: u64,
+    k_cache: &BufferRef,
+    v_cache: &BufferRef,
+    out: &BufferRef, o_offset: u64,
+    past_pos: u32,
+    num_q_heads: u32,
+    head_dim: u32,
+    n: u32,
+) {
+    let pipeline = ctx.attn_sdpa_causal_n.as_ref().expect("attn_sdpa_causal_n kernel missing");
+    encoder.set_compute_pipeline_state(pipeline);
+    encoder.set_buffer(0, Some(q), q_offset);
+    encoder.set_buffer(1, Some(k_cache), 0);
+    encoder.set_buffer(2, Some(v_cache), 0);
+    encoder.set_buffer(3, Some(out), o_offset);
+    let scale = 1.0f32 / (head_dim as f32).sqrt();
+    unsafe {
+        set_u32(encoder, 4, past_pos);
+        set_u32(encoder, 5, num_q_heads);
+        set_f32(encoder, 6, scale);
+    }
+    encoder.dispatch_thread_groups(
+        MTLSize::new((num_q_heads as u64) * (n as u64), 1, 1),
+        MTLSize::new(256, 1, 1),
+    );
+}
+
+/// Append N tokens' K/V into the KV cache at positions [past_pos .. past_pos+N).
+pub fn encode_kv_cache_append_n(
+    ctx: &MetalContext,
+    encoder: &ComputeCommandEncoderRef,
+    k_in: &BufferRef, k_offset: u64,
+    v_in: &BufferRef, v_offset: u64,
+    k_cache: &BufferRef,
+    v_cache: &BufferRef,
+    past_pos: u32,
+    kv_dim: u32,
+    n: u32,
+) {
+    let pipeline = ctx.kv_cache_append_n.as_ref().expect("kv_cache_append_n kernel missing");
+    encoder.set_compute_pipeline_state(pipeline);
+    encoder.set_buffer(0, Some(k_in), k_offset);
+    encoder.set_buffer(1, Some(v_in), v_offset);
+    encoder.set_buffer(2, Some(k_cache), 0);
+    encoder.set_buffer(3, Some(v_cache), 0);
+    let tgs_per_row = (kv_dim + 255) / 256;
+    unsafe {
+        set_u32(encoder, 4, past_pos);
+        set_u32(encoder, 5, kv_dim);
+        set_u32(encoder, 6, tgs_per_row);
+    }
+    encoder.dispatch_thread_groups(
+        MTLSize::new((tgs_per_row as u64) * (n as u64), 1, 1),
+        MTLSize::new(256, 1, 1),
+    );
+}
+
+/// Encode a GPU-side buffer copy: src[src_offset..src_offset + count*4]
+/// → dst[dst_offset..dst_offset + count*4]. Used inside a compute encoder
+/// to copy between buffers while preserving encoder-order serialization.
+pub fn encode_buffer_copy_f32(
+    ctx: &MetalContext,
+    encoder: &ComputeCommandEncoderRef,
+    src: &BufferRef, src_offset: u64,
+    dst: &BufferRef, dst_offset: u64,
+    count: u32,
+) {
+    let pipeline = ctx.buffer_copy_f32.as_ref().expect("buffer_copy_f32 missing");
+    encoder.set_compute_pipeline_state(pipeline);
+    encoder.set_buffer(0, Some(src), src_offset);
+    encoder.set_buffer(1, Some(dst), dst_offset);
+    unsafe { set_u32(encoder, 2, count); }
+    let tgs = (count + 255) / 256;
+    encoder.dispatch_thread_groups(
+        MTLSize::new(tgs as u64, 1, 1),
+        MTLSize::new(256, 1, 1),
+    );
+}
+
+pub fn encode_dequant_matvec_4bit_n(
+    ctx: &MetalContext,
+    encoder: &ComputeCommandEncoderRef,
+    w_packed: &BufferRef, w_offset: u64,
+    scales: &BufferRef, s_offset: u64,
+    biases: &BufferRef, b_offset: u64,
+    x: &BufferRef, x_offset: u64,
+    out: &BufferRef, o_offset: u64,
+    out_dim: u32,
+    in_dim: u32,
+    group_size: u32,
+    n: u32,
+) {
+    let pipeline = ctx.dequant_matvec_4bit_n.as_ref().expect("dequant_matvec_4bit_n kernel missing");
+    encoder.set_compute_pipeline_state(pipeline);
+    encoder.set_buffer(0, Some(w_packed), w_offset);
+    encoder.set_buffer(1, Some(scales), s_offset);
+    encoder.set_buffer(2, Some(biases), b_offset);
+    encoder.set_buffer(3, Some(x), x_offset);
+    encoder.set_buffer(4, Some(out), o_offset);
+    let num_row_tiles = (out_dim + ROWS_PER_TG - 1) / ROWS_PER_TG;
+    unsafe {
+        set_u32(encoder, 5, out_dim);
+        set_u32(encoder, 6, in_dim);
+        set_u32(encoder, 7, group_size);
+        set_u32(encoder, 8, num_row_tiles);
+    }
+    encoder.dispatch_thread_groups(
+        MTLSize::new((num_row_tiles as u64) * (n as u64), 1, 1),
+        MTLSize::new(TG_SIZE as u64, 1, 1),
+    );
+}
