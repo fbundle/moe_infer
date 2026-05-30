@@ -3,6 +3,29 @@
 //! Provides `op1_full_batched` (full-attn pre-MoE work for N tokens at once)
 //! and the supporting buffer struct. The MoE part (op2) still runs per-token,
 //! invoked from the integration in `fused_exp2.rs`'s `forward_hidden_batched`.
+//!
+//! ─── Speedup ceiling (next step) ────────────────────────────────────────
+//!
+//! End-to-end batched_prefill is functionally correct (verified against the
+//! token-serial path: max_diff ~2e-5, top-1 match) but only ~1.0-1.17×
+//! faster at N=16-64. The ceiling is the per-token op2 commits inside each
+//! layer — they dominate wall time.
+//!
+//! Real ~1.4× requires encoding all N op2 dispatches into one command
+//! buffer per layer (drop commits from N+1 to 2 per layer). Blocked by:
+//!
+//!   - `expert_buffer.expert_data[0..K]` is shared scratch — pread for
+//!     token T+1 overwrites T's experts mid-encoding.
+//!   - `ctx.buf_post_normed`, `ctx.buf_temp_residual`, `ctx.buf_moe_hidden`
+//!     etc. are single-token buffers — N op2s all reading/writing them
+//!     would clobber each other.
+//!
+//! Cleanest fix: refactor `encode_post_expert` to accept per-token
+//! input/output buffer offsets so it can read/write slices of
+//! `BatchedFullBuffers` directly. Then route_experts must allocate per-call
+//! expert_data shadows OR require LRU cache ≥ unique experts in the batch
+//! (~ N*K), so cached buffer refs stay stable across all N routes done
+//! before any op2 encoding.
 
 #![allow(dead_code)]
 
