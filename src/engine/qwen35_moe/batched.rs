@@ -4,28 +4,30 @@
 //! and the supporting buffer struct. The MoE part (op2) still runs per-token,
 //! invoked from the integration in `fused_exp2.rs`'s `forward_hidden_batched`.
 //!
-//! ─── Speedup ceiling (next step) ────────────────────────────────────────
+//! ─── Status: batched op1 + batched op2 (done) ──────────────────────────
 //!
-//! End-to-end batched_prefill is functionally correct (verified against the
-//! token-serial path: max_diff ~2e-5, top-1 match) but only ~1.0-1.17×
-//! faster at N=16-64. The ceiling is the per-token op2 commits inside each
-//! layer — they dominate wall time.
+//! End-to-end batched_prefill now hits ~1.2-1.6× faster than forward
+//! across N=8..128. Both phases are batched:
+//!  - op1: batched dispatches for full-attn layers (op1_full_batched).
+//!    Linear-attn still per-token (DeltaNet recurrence is sequential by
+//!    definition; one commit per token per linear-attn layer).
+//!  - op2: ALL N op2 dispatches into ONE command buffer per layer, single
+//!    commit. Uses encode_post_expert_at with offset arithmetic into
+//!    BatchedFullBuffers + a per-call ExpertPool for safe per-token expert
+//!    data without races on shared scratch.
 //!
-//! Real ~1.4× requires encoding all N op2 dispatches into one command
-//! buffer per layer (drop commits from N+1 to 2 per layer). Blocked by:
-//!
-//!   - `expert_buffer.expert_data[0..K]` is shared scratch — pread for
-//!     token T+1 overwrites T's experts mid-encoding.
-//!   - `ctx.buf_post_normed`, `ctx.buf_temp_residual`, `ctx.buf_moe_hidden`
-//!     etc. are single-token buffers — N op2s all reading/writing them
-//!     would clobber each other.
-//!
-//! Cleanest fix: refactor `encode_post_expert` to accept per-token
-//! input/output buffer offsets so it can read/write slices of
-//! `BatchedFullBuffers` directly. Then route_experts must allocate per-call
-//! expert_data shadows OR require LRU cache ≥ unique experts in the batch
-//! (~ N*K), so cached buffer refs stay stable across all N routes done
-//! before any op2 encoding.
+//! Remaining next-step optimizations (documented; not implemented):
+//!  - Batch the linear-attn op1: 30 of 40 layers still do N commits each
+//!    (one per token). Each layer's per-token loop could be collapsed to
+//!    one commit (recurrent dispatches still serialize via Metal's
+//!    implicit barriers on conv_state / delta_state). Estimated win:
+//!    ~3-5% wall-time reduction. Requires adding offset support to
+//!    conv1d_step, gated_delta_net_step, rms_norm_qk, compute_decay_beta,
+//!    gated_rms_norm dispatch helpers.
+//!  - True GEMM matvec_n kernel: current `_n` kernels just batch the
+//!    dispatch grid; they don't tile rows × tokens. A real GEMM would
+//!    reuse weight reads across tokens within a tile. Bigger payoff at
+//!    larger N. Estimated win: another ~10-20% on top.
 
 #![allow(dead_code)]
 
