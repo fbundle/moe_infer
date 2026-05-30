@@ -98,6 +98,8 @@ pub mod metal_context;
 mod metal_kernels;
 #[path = "engine/qwen35_moe/mtp.rs"]
 pub mod mtp;
+#[path = "engine/qwen35_moe/batched.rs"]
+pub mod batched;
 
 use crate::engine::qwen35_constants::{FullModel, StrippedModel};
 use crate::engine::fused_exp1::FusedExp1;
