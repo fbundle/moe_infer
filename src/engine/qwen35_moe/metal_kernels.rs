@@ -496,6 +496,28 @@ pub fn encode_kv_cache_append_n(
     );
 }
 
+/// Encode a GPU-side buffer copy: src[src_offset..src_offset + count*4]
+/// → dst[dst_offset..dst_offset + count*4]. Used inside a compute encoder
+/// to copy between buffers while preserving encoder-order serialization.
+pub fn encode_buffer_copy_f32(
+    ctx: &MetalContext,
+    encoder: &ComputeCommandEncoderRef,
+    src: &BufferRef, src_offset: u64,
+    dst: &BufferRef, dst_offset: u64,
+    count: u32,
+) {
+    let pipeline = ctx.buffer_copy_f32.as_ref().expect("buffer_copy_f32 missing");
+    encoder.set_compute_pipeline_state(pipeline);
+    encoder.set_buffer(0, Some(src), src_offset);
+    encoder.set_buffer(1, Some(dst), dst_offset);
+    unsafe { set_u32(encoder, 2, count); }
+    let tgs = (count + 255) / 256;
+    encoder.dispatch_thread_groups(
+        MTLSize::new(tgs as u64, 1, 1),
+        MTLSize::new(256, 1, 1),
+    );
+}
+
 pub fn encode_dequant_matvec_4bit_n(
     ctx: &MetalContext,
     encoder: &ComputeCommandEncoderRef,

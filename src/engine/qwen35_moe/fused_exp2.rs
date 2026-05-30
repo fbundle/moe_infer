@@ -454,7 +454,7 @@ impl<'b, C: ModelConfig> ExecCtx<'b, C> {
 
 // ─── Private helpers ────────────────────────────────────────────────────────
 
-fn encode_pre_expert_linear(
+pub(crate) fn encode_pre_expert_linear(
     wf: &WeightFile,
     weight_buffer: &WeightBuffer,
     ctx: &MetalContext,
@@ -1120,7 +1120,7 @@ impl<C: ModelConfig> Engine for FusedExp2<C> {
         check_signal: SignalCheckFn<'_>,
         mtp: bool,
     ) -> Result<Vec<f32>, MoEError> {
-        use crate::engine::batched::{BatchedFullBuffers, ExpertPool, op1_full_batched, encode_post_expert_at};
+        use crate::engine::batched::{BatchedFullBuffers, ExpertPool, op1_full_batched, op1_linear_batched, encode_post_expert_at};
 
         let t0 = Instant::now();
         let hidden_dim = C::HIDDEN_DIM;
@@ -1172,75 +1172,17 @@ impl<C: ModelConfig> Engine for FusedExp2<C> {
                 cm.commit();
                 cm.wait_until_completed();
             } else {
-                // Linear-attn op1: per-token (DeltaNet recurrence is sequential).
-                // Just runs op1_linear → copies single-token outputs (post_normed,
-                // temp_residual, shared_*, gate_scores) into batched buffers.
-                // The batched MoE op2 block below then handles all N tokens uniformly.
-                let ctx_buf_moe          = self.ctx.buf_moe_hidden.as_ref().unwrap().clone();
-                let ctx_buf_post_normed  = self.ctx.buf_post_normed.as_ref().unwrap().clone();
-                let ctx_buf_temp_res     = self.ctx.buf_temp_residual.as_ref().unwrap().clone();
-                let ctx_buf_shared_gate  = self.ctx.buf_shared_gate.as_ref().unwrap().clone();
-                let ctx_buf_shared_up    = self.ctx.buf_shared_up.as_ref().unwrap().clone();
-                let ctx_buf_shared_gscore= self.ctx.buf_shared_gate_score.as_ref().unwrap().clone();
-                let ctx_buf_gate_scores  = self.ctx.buf_gate_scores.as_ref().unwrap().clone();
-                let in_norm_name = format!("language_model.model.layers.{}.input_layernorm.weight", layer);
-                let in_norm_ptr = self.model.weight_file.get_tensor_ptr(&in_norm_name).unwrap();
-                let in_norm_off = (in_norm_ptr as usize - self.weight_buffer.base as usize) as u64;
-
-                for ti in 0..n {
-                    unsafe {
-                        std::ptr::copy_nonoverlapping(
-                            (bufs.hidden_n.contents() as *const f32).add(ti * hidden_dim),
-                            ctx_buf_moe.contents() as *mut f32, hidden_dim);
-                    }
-                    let mut exec = ExecCtx { engine: self, pending: None };
-                    let cmd = exec.engine.ctx.queue.new_command_buffer().to_owned();
-                    {
-                        let enc = cmd.new_compute_command_encoder();
-                        let pipe = exec.engine.ctx.rms_norm_fused_bf16.as_ref().unwrap();
-                        let buf_in = exec.engine.ctx.buf_input.as_ref().unwrap();
-                        enc.set_compute_pipeline_state(pipe);
-                        enc.set_buffer(0, Some(&ctx_buf_moe), 0);
-                        enc.set_buffer(1, Some(&exec.engine.weight_buffer.buf), in_norm_off);
-                        enc.set_buffer(2, Some(buf_in), 0);
-                        unsafe {
-                            enc.set_bytes(3, 4, &(hidden_dim as u32) as *const u32 as *const c_void);
-                            enc.set_bytes(4, 4, &RMS_NORM_EPS as *const f32 as *const c_void);
-                        }
-                        enc.dispatch_thread_groups(MTLSize::new(1, 1, 1), MTLSize::new(256, 1, 1));
-                        enc.end_encoding();
-                    }
-                    exec.op1_linear(layer, &cmd);
-                    cmd.commit();
-                    cmd.wait_until_completed();
-                    // Copy single-token op1 outputs into batched slices.
-                    unsafe {
-                        std::ptr::copy_nonoverlapping(
-                            ctx_buf_post_normed.contents() as *const f32,
-                            (bufs.post_normed_n.contents() as *mut f32).add(ti * hidden_dim),
-                            hidden_dim);
-                        std::ptr::copy_nonoverlapping(
-                            ctx_buf_temp_res.contents() as *const f32,
-                            (bufs.temp_residual_n.contents() as *mut f32).add(ti * hidden_dim),
-                            hidden_dim);
-                        std::ptr::copy_nonoverlapping(
-                            ctx_buf_shared_gate.contents() as *const f32,
-                            (bufs.shared_gate_n.contents() as *mut f32).add(ti * shared_inter),
-                            shared_inter);
-                        std::ptr::copy_nonoverlapping(
-                            ctx_buf_shared_up.contents() as *const f32,
-                            (bufs.shared_up_n.contents() as *mut f32).add(ti * shared_inter),
-                            shared_inter);
-                        std::ptr::copy_nonoverlapping(
-                            ctx_buf_shared_gscore.contents() as *const f32,
-                            (bufs.shared_gate_score_n.contents() as *mut f32).add(ti),
-                            1);
-                        std::ptr::copy_nonoverlapping(
-                            ctx_buf_gate_scores.contents() as *const f32,
-                            (bufs.gate_scores_n.contents() as *mut f32).add(ti * num_experts),
-                            num_experts);
-                    }
-                }
+                // Linear-attn op1: all N tokens encoded into ONE cmd buffer.
+                // DeltaNet recurrence (conv_state, delta_state) is sequential
+                // by definition — Metal serializes the per-token dispatches
+                // via implicit barriers on the shared state buffers.
+                let linear_idx = layer - (layer + 1) / FULL_ATTN_INTERVAL;
+                let cm = op1_linear_batched::<C>(
+                    &self.model.weight_file, &self.weight_buffer, &self.ctx,
+                    layer, linear_idx, n, &bufs,
+                );
+                cm.commit();
+                cm.wait_until_completed();
             }
 
             // ── Batched MoE op2: one cmd buffer per layer covers all N tokens ──

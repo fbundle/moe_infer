@@ -447,6 +447,110 @@ pub fn encode_post_expert_at<C: ModelConfig>(
 }
 
 
+// ─── Batched op1 for linear-attention layers ──────────────────────────────
+//
+// DeltaNet recurrence is inherently sequential per token (state depends on
+// previous token's state), so we don't get GEMM-style batching here. What
+// we DO get is collapsing N per-token command buffers into ONE per layer:
+//   - All N tokens' op1_linear dispatches share one encoder
+//   - Per-token sequence: copy_in → input_norm → encode_pre_expert_linear
+//     → copy_out (×6 for the post-MoE-prereq outputs)
+//   - Metal's implicit ordering on the ctx scratch buffers makes the
+//     sequential GPU execution correct
+//
+// Saves ~ (N - 1) commits per linear-attn layer × 30 such layers per token.
+#[allow(clippy::too_many_arguments)]
+pub fn op1_linear_batched<C: ModelConfig>(
+    wf: &WeightFile,
+    weight_buffer: &WeightBuffer,
+    ctx: &MetalContext,
+    layer_idx: usize,
+    linear_idx: usize,
+    n: usize,
+    bufs: &BatchedFullBuffers,
+) -> CommandBuffer {
+    let hidden_dim = C::HIDDEN_DIM;
+    let num_experts = C::NUM_EXPERTS;
+    let shared_inter = C::SHARED_INTERMEDIATE;
+    let qkv_dim = C::LINEAR_CONV_DIM;
+    let total_key = C::LINEAR_TOTAL_KEY;
+    let total_val = C::LINEAR_TOTAL_VALUE;
+    let num_k_heads = C::LINEAR_NUM_K_HEADS;
+    let num_v_heads = C::LINEAR_NUM_V_HEADS;
+    let key_dim = total_key / num_k_heads;
+    let val_dim = total_val / num_v_heads;
+    let inv_scale = 1.0 / (key_dim as f32).sqrt();
+    let k_heads_per_v = num_v_heads / num_k_heads;
+
+    let cm = ctx.queue.new_command_buffer().to_owned();
+    let enc = cm.new_compute_command_encoder();
+
+    let in_norm_name = format!("language_model.model.layers.{}.input_layernorm.weight", layer_idx);
+    let in_norm_ptr = wf.get_tensor_ptr(&in_norm_name).expect("input_layernorm.weight missing");
+    let in_norm_off = (in_norm_ptr as usize - weight_buffer.base as usize) as u64;
+
+    let buf_moe          = ctx.buf_moe_hidden.as_ref().unwrap();
+    let buf_in           = ctx.buf_input.as_ref().unwrap();
+    let buf_post_normed  = ctx.buf_post_normed.as_ref().unwrap();
+    let buf_temp_res     = ctx.buf_temp_residual.as_ref().unwrap();
+    let buf_shared_gate  = ctx.buf_shared_gate.as_ref().unwrap();
+    let buf_shared_up    = ctx.buf_shared_up.as_ref().unwrap();
+    let buf_shared_gscore= ctx.buf_shared_gate_score.as_ref().unwrap();
+    let buf_gate_scores  = ctx.buf_gate_scores.as_ref().unwrap();
+    let rms_pipe         = ctx.rms_norm_fused_bf16.as_ref().unwrap();
+
+    for ti in 0..n {
+        // 1. Copy bufs.hidden_n[ti] → buf_moe_hidden (GPU dispatch).
+        metal_kernels::encode_buffer_copy_f32(
+            ctx, &enc,
+            &bufs.hidden_n, (ti * hidden_dim * 4) as u64,
+            buf_moe, 0,
+            hidden_dim as u32,
+        );
+        // 2. input_norm: buf_moe_hidden → buf_input.
+        enc.set_compute_pipeline_state(rms_pipe);
+        enc.set_buffer(0, Some(buf_moe), 0);
+        enc.set_buffer(1, Some(&weight_buffer.buf), in_norm_off);
+        enc.set_buffer(2, Some(buf_in), 0);
+        unsafe {
+            enc.set_bytes(3, 4, &(hidden_dim as u32) as *const u32 as *const c_void);
+            enc.set_bytes(4, 4, &RMS_NORM_EPS as *const f32 as *const c_void);
+        }
+        enc.dispatch_thread_groups(MTLSize::new(1, 1, 1), MTLSize::new(256, 1, 1));
+
+        // 3. encode_pre_expert_linear (reads buf_input, writes ctx scratch + outputs).
+        crate::engine::fused_exp2::encode_pre_expert_linear(
+            wf, weight_buffer, ctx, &enc, layer_idx, linear_idx,
+            hidden_dim, num_k_heads, num_v_heads, total_key, total_val, qkv_dim,
+            key_dim, val_dim, k_heads_per_v, inv_scale, num_experts, shared_inter,
+        );
+
+        // 4. Copy ctx outputs → bufs slices for this token.
+        metal_kernels::encode_buffer_copy_f32(
+            ctx, &enc, buf_post_normed, 0,
+            &bufs.post_normed_n, (ti * hidden_dim * 4) as u64, hidden_dim as u32);
+        metal_kernels::encode_buffer_copy_f32(
+            ctx, &enc, buf_temp_res, 0,
+            &bufs.temp_residual_n, (ti * hidden_dim * 4) as u64, hidden_dim as u32);
+        metal_kernels::encode_buffer_copy_f32(
+            ctx, &enc, buf_shared_gate, 0,
+            &bufs.shared_gate_n, (ti * shared_inter * 4) as u64, shared_inter as u32);
+        metal_kernels::encode_buffer_copy_f32(
+            ctx, &enc, buf_shared_up, 0,
+            &bufs.shared_up_n, (ti * shared_inter * 4) as u64, shared_inter as u32);
+        metal_kernels::encode_buffer_copy_f32(
+            ctx, &enc, buf_shared_gscore, 0,
+            &bufs.shared_gate_score_n, (ti * 4) as u64, 1);
+        metal_kernels::encode_buffer_copy_f32(
+            ctx, &enc, buf_gate_scores, 0,
+            &bufs.gate_scores_n, (ti * num_experts * 4) as u64, num_experts as u32);
+    }
+
+    enc.end_encoding();
+    cm
+}
+
+
 // ─── Per-call expert pool ────────────────────────────────────────────────
 //
 // For batched op2 commits, each token's experts must live in distinct GPU

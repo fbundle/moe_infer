@@ -2429,3 +2429,20 @@ kernel void dequant_matvec_4bit_n(
     }
 }
 
+
+// ============================================================================
+// Tiny GPU memcpy: src[offset_a..] → dst[offset_b..] for `count` f32s.
+// Used by batched op1_linear to save/load per-token ctx buffer slices
+// without breaking encoder-order serialization.
+// ============================================================================
+kernel void buffer_copy_f32(
+    device const float* src [[buffer(0)]],
+    device float*       dst [[buffer(1)]],
+    constant uint&      count [[buffer(2)]],
+    uint tgid [[threadgroup_position_in_grid]],
+    uint lid  [[thread_position_in_threadgroup]]
+) {
+    uint tid = tgid * 256 + lid;
+    if (tid >= count) return;
+    dst[tid] = src[tid];
+}
