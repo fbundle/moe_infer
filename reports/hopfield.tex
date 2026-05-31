@@ -1,0 +1,350 @@
+\documentclass[11pt,a4paper]{article}
+
+\usepackage[margin=1in]{geometry}
+\usepackage{amsmath}
+\usepackage{amssymb}
+\usepackage{booktabs}
+\usepackage{hyperref}
+
+\hypersetup{
+    colorlinks=true,
+    linkcolor=blue!50!black,
+    citecolor=blue!50!black,
+    urlcolor=blue!50!black,
+}
+
+\title{Modern Hopfield Networks: A Short Note}
+\author{Claude (Anthropic) and Khanh Nguyen}
+\date{May 2026}
+
+\begin{document}
+
+\maketitle
+
+\section{Summary}
+
+Modern Hopfield Networks (MHN) are classical Hopfield networks with the
+energy function swapped from quadratic to exponential. Two things change
+as a result: storage capacity goes from linear in dimension to exponential
+in dimension, and the update rule becomes literally the attention
+operation used in transformers.
+
+\section{Classical Hopfield (1982)}
+
+$N$ binary neurons $s \in \{-1, +1\}^N$. Store $M$ patterns
+$\xi^1, \dots, \xi^M \in \{-1, +1\}^N$ via the Hebbian outer-product rule:
+\[
+W = \frac{1}{N} \sum_{\mu=1}^M \xi^\mu (\xi^\mu)^\top.
+\]
+
+Energy and dynamics:
+\[
+E(s) = -\tfrac{1}{2}\, s^\top W s,
+\qquad
+s_i \leftarrow \operatorname{sign}\!\bigl((W s)_i\bigr).
+\]
+
+Each update flips one neuron only if it decreases energy, so dynamics
+converge to a local minimum. The stored patterns $\xi^\mu$ are minima
+provided the patterns are sufficiently distinct.
+
+\paragraph{Capacity.} Amit, Gutfreund, and Sompolinsky (1985) showed via
+replica methods that the network can reliably store
+\[
+M \approx 0.138 \, N
+\]
+patterns. Above this, cross-pattern interference (spurious minima
+created by pattern superposition in $W$) destroys retrieval.
+
+\paragraph{Why capacity is limited.} All patterns are summed into the
+single matrix $W$. Every pair of patterns contributes a cross-term
+$\xi^\mu (\xi^\nu)^\top$. As $M$ grows, these cross-terms accumulate and
+the energy landscape develops spurious minima between true patterns. The
+quadratic energy is too coarse to keep wells separated.
+
+\section{Modern Hopfield (Demircigil et al.~2017; Ramsauer et al.~2020)}
+
+Two changes:
+
+\begin{enumerate}
+\item States are continuous: $s \in \mathbb{R}^d$ rather than
+    $\{-1, +1\}^N$.
+\item Energy is \textbf{exponential} (technically a log-sum-exp) rather
+    than quadratic.
+\end{enumerate}
+
+With patterns stacked as columns of $\Xi = [\xi^1, \dots, \xi^M] \in
+\mathbb{R}^{d \times M}$:
+\[
+E(s) = -\frac{1}{\beta} \log \sum_{\mu=1}^M \exp\!\bigl(\beta \, \xi^\mu \cdot s\bigr)
+       + \tfrac{1}{2}\,\|s\|^2 + \text{const}.
+\]
+
+The negative log-sum-exp is a smooth \emph{maximum}. It carves a sharp
+well around each stored pattern $\xi^\mu$, with sharpness controlled by
+the inverse-temperature parameter $\beta$. The $\|s\|^2$ term keeps the
+state bounded.
+
+\subsection{Update rule}
+
+Minimising $E(s)$ from a query $s$ via the Concave--Convex Procedure
+gives one update step:
+\[
+s_{\text{new}} = \Xi \cdot \operatorname{softmax}\!\bigl(\beta \, \Xi^\top s\bigr).
+\]
+
+That is: compute affinities $\beta \langle s, \xi^\mu \rangle$, take the
+softmax to get retrieval weights $p_\mu$, return the weighted sum of
+patterns $\sum_\mu p_\mu \xi^\mu$.
+
+\subsection{Connection to attention}
+
+If we separate ``stored cues'' from ``retrieved content'' (let
+$\Xi$ be the keys $K$ and let the values $V$ be different from $K$), the
+update rule becomes:
+\[
+\operatorname{Attn}(q, K, V) = V \cdot \operatorname{softmax}\!\bigl(\beta \, K^\top q\bigr),
+\quad \beta = \frac{1}{\sqrt{d}}.
+\]
+
+\textbf{One attention layer in a transformer is exactly one update step
+on a modern Hopfield energy.} Multi-head attention is parallel retrieval
+from multiple associative memories. The $\sqrt{d}$ scaling that
+transformer papers introduce as ``numerical stabilisation'' is, in this
+framing, the natural inverse-temperature scaling needed to keep the
+Boltzmann distribution in the non-trivial regime.
+
+\subsection{Why capacity is exponential}
+
+The classical Hopfield's quadratic energy summed pattern overlaps
+\emph{additively}: pattern $\mu$'s well bled into pattern $\nu$'s as soon
+as $\xi^\mu \cdot \xi^\nu$ was non-negligible. The exponential energy
+makes wells \emph{multiplicatively} sharp: small angular separation
+between patterns produces vastly different $\exp$ values, so wells stay
+disjoint until patterns are very close.
+
+For random patterns drawn uniformly on the unit sphere in $\mathbb{R}^d$,
+near-orthogonality holds for $\sim \exp(\Theta(d))$ vectors (Johnson--%
+Lindenstrauss / sphere packing). The log-sum-exp energy supports that
+many distinct wells. Demircigil et al.~give the formal bound:
+\[
+M \lesssim \exp(d / 4)
+\]
+patterns can be stored with high probability of correct retrieval.
+
+\paragraph{Concrete numbers for transformers.} Head dimension $d$ in
+modern LLMs is typically 64--256:
+
+\begin{center}
+\begin{tabular}{rl}
+\toprule
+$d$ & approximate capacity $\sim \exp(d/4)$ \\
+\midrule
+64  & $\sim 10^{7}$  \\
+128 & $\sim 10^{14}$ \\
+256 & $\sim 10^{28}$ \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+At $d=128$ the capacity is $\sim 10^{14}$, far exceeding any context
+length a transformer would actually run. \textbf{For practical purposes,
+attention has unlimited memory capacity per head.} Whatever caps
+transformer context length, it is not the attention operation's storage
+capacity --- it is compute (the $O(N^2)$ attention math), memory
+bandwidth, or training-data distribution.
+
+\section{What retrieval looks like geometrically}
+
+Given a query $q$ and stored patterns $\{\xi^\mu\}$:
+
+\begin{itemize}
+\item If $q$ is near one stored $\xi^{\star}$ and far from the rest, the
+    softmax saturates to a one-hot on $\xi^{\star}$ and retrieval returns
+    $\xi^{\star}$ exactly.
+\item If $q$ is between two patterns of comparable affinity, the softmax
+    blends them and retrieval returns a weighted average.
+\item If $q$ is far from everything, the softmax approaches uniform and
+    retrieval returns the centroid of all patterns (uninformative).
+\end{itemize}
+
+The $\sqrt{d}$ temperature keeps the operation in a ``sharp but
+graceful'' regime: clean retrieval on a single match, smooth blending
+on near-ties, soft fallback when nothing matches. Hard argmax (zero
+temperature) would be brittle; uniform mixing (infinite temperature)
+would be useless. Softmax with $\beta = 1/\sqrt{d}$ is the unique
+well-behaved middle.
+
+\section{One step vs.\ iterative retrieval}
+
+Modern Hopfield retrieval typically \textbf{converges in one update
+step} for well-separated patterns. This is why attention works as a
+single-layer operation in transformers --- no iteration required.
+
+For ambiguous queries (multiple stored patterns about equally close),
+additional update steps would refine the answer. Transformers do not
+iterate retrieval; instead they stack many attention layers, each
+performing one update step on a (different) associative store learned
+during training.
+
+\section{What this framing buys you}
+
+\begin{enumerate}
+\item \textbf{Capacity bounds for transformers.} Per-head storage is
+    $\sim \exp(d_{\text{head}}/4)$. For modern head dimensions this is
+    effectively unbounded.
+\item \textbf{Predicting behaviour.} When does attention ``look up'' a
+    single key versus ``blend'' multiple? It depends on the angular
+    geometry of keys around the query --- analyzable via Hopfield tools.
+\item \textbf{New architectures.} Hopfield layers can be used as
+    standalone associative-memory modules, generalising attention to
+    non-sequence contexts (graph nets, set inputs, set-to-set mappings).
+\item \textbf{Theoretical bridge.} Connects transformers to the
+    40-year tradition of statistical-mechanics analysis of neural
+    networks (spin glasses, replica method, mean-field theory).
+\end{enumerate}
+
+\section{What this framing does not buy you}
+
+\begin{itemize}
+\item It does not explain \emph{why} transformers learn good
+    keys/queries --- it analyses retrieval \emph{given} the keys and
+    queries.
+\item It does not explain depth --- why do many stacked layers do
+    something irreducible?
+\item It does not explain attention-head specialisation --- that is an
+    empirical/training story.
+\item It does not directly address in-context learning, scaling laws,
+    or instruction tuning --- those need separate frameworks.
+\end{itemize}
+
+The modern-Hopfield framing is the right abstraction for the
+\textbf{single-layer mechanics} of attention. Multi-layer dynamics,
+in-context learning, and the broader question of why transformers work
+require additional theory. But for the specific question ``what is the
+attention operation, mathematically?'' --- it is content-addressable
+memory retrieval on an exponential-capacity associative store, and that
+statement is exact.
+
+\section{Is the Hopfield Nobel ``really physics''?}
+
+The 2024 Nobel Prize in Physics went to John Hopfield and Geoffrey
+Hinton ``for foundational discoveries and inventions that enable machine
+learning with artificial neural networks.'' A number of physicists
+publicly grumbled that this was not physics. The grumbling is
+sociologically understandable (these people did not appear at APS
+conferences) but mathematically off-base.
+
+\begin{itemize}
+\item Hopfield holds a physics PhD from Cornell, worked at Bell Labs in
+    solid-state physics, and spent decades as a physics professor at
+    Princeton. His 1982 paper applies Ising-model formalism and
+    statistical-mechanics energy methods directly.
+\item The capacity results (Amit, Gutfreund, Sompolinsky 1985) were
+    derived using \emph{replica methods} from spin-glass theory --- the
+    same toolkit Parisi used for his 2021 Nobel.
+\item Hinton's Boltzmann machines (which contributed to his share of
+    the 2024 Nobel) are named after Boltzmann distributions and use
+    partition functions, free energies, and Monte Carlo sampling. Not
+    borrowed as metaphor; borrowed as machinery.
+\end{itemize}
+
+The math is statistical mechanics. The constructions are
+energy-function-driven dynamical systems. The capacity bounds are
+proven with techniques developed for disordered systems. The complaint
+that ``this isn't real physics'' is about the people, not the content.
+
+\section{Hopfield capacity vs.\ the information-theoretic bound}
+
+A clean way to see what modern Hopfield achieves: compare its capacity
+to the Shannon-style information bound.
+
+A $d$-dimensional binary-precise state can index at most $2^d$ distinct
+patterns:
+\[
+M_{\text{Shannon}} \le 2^d
+\quad\Leftrightarrow\quad
+\log_2 M \le d.
+\]
+
+Modern Hopfield with random patterns achieves:
+\[
+M_{\text{MHN}} \lesssim e^{d/4} = 2^{d / (4 \ln 2)} \approx 2^{0.36\, d}.
+\]
+
+So MHN packs about \textbf{36\% of the bits-per-dimension of the
+information-theoretic ceiling}. Not optimal --- but within a constant
+factor in the exponent.
+
+\paragraph{Why this specific ratio.} This is exactly what Shannon's
+\emph{random coding bound} predicts. For random codewords on the
+$d$-sphere, the maximum number of codewords with pairwise angle above a
+threshold $\theta$ grows as $e^{\alpha(\theta) d}$. The constant
+$\alpha$ depends on $\theta$; for the noise tolerance built into
+modern Hopfield's energy landscape, $\alpha = 1/4$.
+
+If patterns were chosen by a designed codebook (Reed--Solomon, BCH,
+lattice codes) rather than placed randomly, $\alpha$ could be pushed
+closer to $\ln 2 \approx 0.69$. The hierarchy:
+
+\begin{center}
+\begin{tabular}{lcc}
+\toprule
+Construction & Capacity exponent & Bits per dim \\
+\midrule
+Classical Hopfield (quadratic energy)     & $\sim (\log d) / d$ & $\to 0$ \\
+Modern Hopfield, random patterns          & $\sim d / 4$        & $0.36$ \\
+Modern Hopfield, designed codebook        & $\to d \ln 2$       & $\to 1.0$ \\
+Information-theoretic ceiling             & $d \ln 2$           & $1.0$ \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\paragraph{Transformers sit in the middle row.} The key vectors are
+``placed randomly'' in the sense that they emerge from learned
+projections without any structured codebook design. So attention
+extracts about 36\% of the information-theoretic ceiling on memory per
+head dimension --- for free, with no engineering effort.
+
+Nobody has tried building transformers with designed codebooks for
+keys. The marginal capacity improvement would be a factor of $\sim 3$
+in bits-per-dimension, which is small compared to what other things
+(compute, training data, model quality) dominate. Probably not worth
+the engineering complexity.
+
+\paragraph{Why this matters for ``scaling head dim''.} The linear cost
+in $d$ buys exponential memory in $d$. Doubling $d$ from 64 to 128
+does not double capacity --- it \emph{squares} it
+($10^7 \to 10^{14}$). That asymmetry is one of the deep architectural
+wins of attention. The hardware cost of wider heads is linear; the
+representational capacity gained is exponential. It is the same reason
+binary trees with $d$ levels can index $2^d$ leaves --- but applied to a
+continuous geometric construction (the unit sphere).
+
+\paragraph{Convergence of perspectives.} Physics gives us the energy
+function and the partition function. Information theory gives us the
+Shannon ceiling. Coding theory gives us the random-coding bound and the
+gap to the ceiling. Modern Hopfield is the same construction read
+through all three lenses, and they agree on the same exponential
+scaling with the same coefficient. The 2024 Nobel honoured work
+sitting at exactly the point where physics, information theory, and
+machine learning meet --- and the math is identical in all three.
+
+\section{References}
+
+\begin{itemize}
+\item J.~J.~Hopfield. \emph{Neural networks and physical systems with
+    emergent collective computational abilities.} PNAS, 1982.
+\item D.~J.~Amit, H.~Gutfreund, H.~Sompolinsky. \emph{Storing infinite
+    numbers of patterns in a spin-glass model of neural networks.}
+    Physical Review Letters, 1985.
+\item D.~Krotov, J.~J.~Hopfield. \emph{Dense Associative Memory for
+    Pattern Recognition.} NIPS, 2016.
+\item M.~Demircigil, J.~Heusel, M.~L\"owe, S.~Upgang, F.~Vermet.
+    \emph{On a model of associative memory with huge storage capacity.}
+    Journal of Statistical Physics, 2017.
+\item H.~Ramsauer et al. \emph{Hopfield Networks Is All You Need.}
+    arXiv:2008.02217, 2020.
+\end{itemize}
+
+\end{document}
