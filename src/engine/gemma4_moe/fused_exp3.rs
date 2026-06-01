@@ -183,7 +183,83 @@ impl<C: Gemma4ModelConfig> Engine for Gemma4Fused<C> {
         //   - num_kv_shared_layers=0       (KV sharing is a 2B/4B feature)
         //   - hidden_size_per_layer_input=0 (per-layer-input gating is a 2B/4B feature)
 
-        unimplemented!("Gemma4Fused::forward_hidden — Phase 2 work");
+        // Phase 2 work breakdown (each chunk ~1-3 hours of careful coding):
+        //
+        // [1] Embedding lookup helper.
+        //     - Read BF16 embed_tokens[token_id] from WeightFile
+        //     - Multiply by sqrt(HIDDEN_DIM)
+        //     - Copy into self.ctx.buf_hidden
+        //
+        // [2] Per-layer dispatcher.
+        //     Reuse self.weight_buffer.encode_matvec_into / encode_matvec_n_into
+        //     for all matvec ops (q/k/v/o projections, dense MLP, expert proj).
+        //     The Gemma 4 model is quantized in MLX format (4-bit packed +
+        //     bf16 scales/biases) — same packed format the existing engine
+        //     reads. After Phase 3 quantize pipeline emits compatible BQ4
+        //     blobs, encode_matvec_into "just works" for our weights.
+        //
+        // [3] Two new kernels, both parameterised (HEAD_DIM as runtime arg,
+        //     not compile-time #define):
+        //     - attn_sdpa_sliding_causal: same online-softmax as
+        //       attn_sdpa_fused but loop bound is
+        //         [max(0, seq_len - sliding_window), seq_len)
+        //       and HEAD_DIM is passed as a constant buffer rather than
+        //       a #define. ~150 lines.
+        //     - rms_norm_no_scale: rms_norm without the learnable weight,
+        //       used for v_norm on full layers. ~40 lines (variant of
+        //       rms_norm_fused_bf16).
+        //
+        // [4] Two reuses with different parameters:
+        //     - q_head_norm_rope: existing kernel works; pass theta=10k
+        //       (sliding) or 1M (full), and rotary_dim=head_dim (sliding)
+        //       or head_dim/4 (full, the 25% partial-rotary case).
+        //     - k_head_norm_rope: same.
+        //
+        // [5] Dual-FFN forward — pure Rust orchestration over the kernels:
+        //     a) Dense MLP path:
+        //         input_norm → buf_pre_ff_normed (rms_norm_fused_bf16)
+        //         gate_proj  → buf_mlp_gate      (matvec_bf16 or dequant_matvec_4bit)
+        //         up_proj    → buf_mlp_up        (same)
+        //         gelu*      → buf_mlp_act       (gelu_fused — ours, written)
+        //         down_proj  → buf_mlp_down      (matvec)
+        //         post_ff_1  → buf_mlp_post      (rms_norm_fused_bf16)
+        //
+        //     b) Router:
+        //         router-norm(h)  → buf_router_normed       (CPU: rms_norm with `scale * sqrt(hidden)^-1` weight)
+        //         router.proj     → buf_router_logits       (matvec)
+        //         CPU top-K       → expert_indices[K]
+        //         CPU softmax over top-K + per_expert_scale → expert_weights[K]
+        //
+        //     c) Experts path (reuse qwen35 batched MoE machinery — we can
+        //        repurpose encode_post_expert_at with shared_gate_score=0
+        //        and rerouting "shared expert" to no-op):
+        //         pre_ff_2 norm   → buf_pre_ff_normed_2
+        //         for each ki in K:
+        //             pread expert (or cache)
+        //             gate_proj → buf_expert_gate (dequant_matvec_4bit)
+        //             up_proj   → buf_expert_up
+        //             gelu_fused → buf_expert_act
+        //             down_proj → expert_out_buf[ki]
+        //         combine: sum weighted contributions → buf_expert_out
+        //         post_ff_2 norm → buf_expert_post
+        //
+        //     d) Combine:
+        //         buf_ff_combined = buf_mlp_post + buf_expert_post  (residual_add helper)
+        //         outer post_ff norm → buf_ff_outer_post
+        //         buf_hidden = h_after_attn_residual + buf_ff_outer_post  (residual_add)
+        //         buf_hidden *= layer_scalar  (CPU scalar; copy out → multiply → copy back)
+        //
+        // [6] Final:
+        //     model.norm → buf_hidden
+        //     lm_head matvec (tied to embed_tokens) → buf_logits
+        //     logit_softcap kernel (already written) → buf_logits
+        //     CPU memcpy buf_logits → output Vec<f32>
+        //
+        // [7] Validation: verify against mlx-vlm on a small input. Needs
+        //     Phase 3 (quantize pipeline) complete so we have engine-format
+        //     weights to load. Expected: max_diff ~ 1e-3 (lossy quant) or
+        //     ~ 2e-5 (if we load BF16 unquantized directly).
+        unimplemented!("Gemma4Fused::forward_hidden — Phase 2 work, breakdown above");
     }
 
     fn telemetry(&self) -> BTreeMap<String, TelemetryValue> {
