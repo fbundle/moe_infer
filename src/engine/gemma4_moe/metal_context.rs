@@ -36,6 +36,8 @@ pub struct Gemma4MetalContext {
     // Gemma4-specific pipelines.
     pub gelu_fused: ComputePipelineState,
     pub logit_softcap: ComputePipelineState,
+    pub attn_sdpa_sliding_causal: ComputePipelineState,
+    pub rms_norm_no_scale: ComputePipelineState,
 
     // Persistent per-token buffers (single-token forward).
     pub buf_hidden: Buffer,
@@ -114,6 +116,8 @@ impl Gemma4MetalContext {
         let swiglu_fused           = make("swiglu_fused")?;
         let gelu_fused             = make("gelu_fused")?;
         let logit_softcap          = make("logit_softcap")?;
+        let attn_sdpa_sliding_causal = make("attn_sdpa_sliding_causal")?;
+        let rms_norm_no_scale      = make("rms_norm_no_scale")?;
 
         let hidden = C::HIDDEN_DIM;
         let n_q_heads = C::NUM_ATTN_HEADS;
@@ -191,6 +195,8 @@ impl Gemma4MetalContext {
             swiglu_fused,
             gelu_fused,
             logit_softcap,
+            attn_sdpa_sliding_causal,
+            rms_norm_no_scale,
         };
 
         Ok((ctx, weight_buffer, expert_buffer))

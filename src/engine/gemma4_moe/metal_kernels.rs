@@ -24,24 +24,68 @@ unsafe fn set_f32(encoder: &ComputeCommandEncoderRef, index: u64, value: f32) {
 
 /// Sliding-window causal SDPA (single-token query path).
 ///
-/// Equivalent to `attn_sdpa_fused` from qwen35_moe, but K/V positions are
-/// restricted to the last `sliding_window` tokens before the query position.
-///
-/// Status: TODO. Kernel skeleton in shaders.metal is `#if 0`'d; this
-/// dispatcher panics. Wire up once the kernel exists.
-pub fn encode_attn_sdpa_sliding(
-    _ctx: &Gemma4MetalContext,
-    _encoder: &ComputeCommandEncoderRef,
-    _q: &BufferRef, _q_offset: u64,
-    _k_cache: &BufferRef,
-    _v_cache: &BufferRef,
-    _out: &BufferRef, _o_offset: u64,
-    _seq_len: u32,
-    _sliding_window: u32,
-    _num_q_heads: u32,
-    _head_dim: u32,
+/// Online-softmax over positions [max(0, seq_len-sliding_window), seq_len).
+/// Uses qwen35's compile-time HEAD_DIM=256 — matches Gemma 4 sliding layers.
+/// kv_dim and heads_per_kv are passed as runtime constants because Gemma 4
+/// uses 8 kv heads (Qwen3.6 uses 2).
+pub fn encode_attn_sdpa_sliding_causal(
+    ctx: &Gemma4MetalContext,
+    encoder: &ComputeCommandEncoderRef,
+    q: &BufferRef, q_offset: u64,
+    k_cache: &BufferRef,
+    v_cache: &BufferRef,
+    out: &BufferRef, o_offset: u64,
+    seq_len: u32,
+    sliding_window: u32,
+    num_q_heads: u32,
+    head_dim: u32,
+    kv_dim: u32,
+    heads_per_kv: u32,
 ) {
-    unimplemented!("encode_attn_sdpa_sliding — Gemma 4 sliding-window kernel not yet implemented");
+    let pipeline = &ctx.attn_sdpa_sliding_causal;
+    encoder.set_compute_pipeline_state(pipeline);
+    encoder.set_buffer(0, Some(q), q_offset);
+    encoder.set_buffer(1, Some(k_cache), 0);
+    encoder.set_buffer(2, Some(v_cache), 0);
+    encoder.set_buffer(3, Some(out), o_offset);
+    let scale = 1.0f32 / (head_dim as f32).sqrt();
+    unsafe {
+        set_u32(encoder, 4, seq_len);
+        set_u32(encoder, 5, sliding_window);
+        set_f32(encoder, 6, scale);
+        set_u32(encoder, 7, kv_dim);
+        set_u32(encoder, 8, heads_per_kv);
+    }
+    encoder.dispatch_thread_groups(
+        MTLSize::new(num_q_heads as u64, 1, 1),
+        MTLSize::new(256, 1, 1),
+    );
+}
+
+/// RMSNorm without learnable scale — for Gemma 4's v_norm on full layers.
+/// Per-head: dispatches num_heads threadgroups; each TG normalises its
+/// `head_dim` elements of `x` into `out`.
+pub fn encode_rms_norm_no_scale(
+    ctx: &Gemma4MetalContext,
+    encoder: &ComputeCommandEncoderRef,
+    x: &BufferRef, x_offset: u64,
+    out: &BufferRef, out_offset: u64,
+    num_heads: u32,
+    head_dim: u32,
+    eps: f32,
+) {
+    let pipeline = &ctx.rms_norm_no_scale;
+    encoder.set_compute_pipeline_state(pipeline);
+    encoder.set_buffer(0, Some(x), x_offset);
+    encoder.set_buffer(1, Some(out), out_offset);
+    unsafe {
+        set_u32(encoder, 2, head_dim);
+        set_f32(encoder, 3, eps);
+    }
+    encoder.dispatch_thread_groups(
+        MTLSize::new(num_heads as u64, 1, 1),
+        MTLSize::new(256, 1, 1),
+    );
 }
 
 /// GELU activation with multiplicative gating (Gemma 4's FFN nonlinearity).

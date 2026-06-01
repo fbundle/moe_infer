@@ -17,40 +17,180 @@
 // they're inherited from the qwen35 source.
 
 // ============================================================================
-// Sliding-window causal attention (Gemma 4 sliding-attention layers).
+// Sliding-window causal SDPA — for Gemma 4 sliding-attention layers.
 //
-// Standard SDPA but the K/V index range is restricted to a window of
-// `sliding_window` positions ending at the query position. Equivalent to
-// causal mask AND distance-mask (i.e., position j is attended iff
-// max(0, pos - sliding_window + 1) <= j <= pos).
+// Online softmax over a restricted position range:
+//   start = max(0, seq_len - sliding_window)
+//   only positions [start, seq_len) are attended
 //
-// Grid: one threadgroup per query head (single-token; for prefill batched
-// version use `attn_sdpa_sliding_causal_n`, TBD).
+// Reuses qwen35's compile-time HEAD_DIM=256 (matches Gemma 4 sliding
+// layers). For Gemma 4's full-attn layers (head_dim=512) write a
+// separate kernel — single-shader can't handle both because V (the
+// per-lane accumulator size) must be compile-time.
 //
-// TODO: implement. Skeleton omitted until we have a reference output to
-// diff against. Probable approach: clone `attn_sdpa_fused` from
-// qwen35_moe/shaders.metal and replace the unbounded `pos < seq_len` loop
-// with `max(0, seq_len - sliding_window) <= pos < seq_len`.
+// Grid: one threadgroup per query head. TG: 256 threads = 8 SIMD groups
+// of 32. Same online-softmax algorithm as `attn_sdpa_fused`; only the
+// position-loop bound differs.
 // ============================================================================
+//
+// Gemma 4 sliding layers use KV_DIM_GEMMA_SLIDING = num_kv_heads(8) *
+// head_dim(256) = 2048. Qwen's KV_DIM is 2*256=512. So the kernel can't
+// reuse qwen35's KV_DIM #define — it takes kv_dim as a runtime constant.
+// Same for HEADS_PER_KV (Gemma 4 sliding: 16/8=2; Qwen: 16/2=8).
 
-#if 0
 kernel void attn_sdpa_sliding_causal(
-    device const float* Q          [[buffer(0)]],   // [num_heads, HEAD_DIM]
-    device const float* K_cache    [[buffer(1)]],
-    device const float* V_cache    [[buffer(2)]],
-    device float*       output     [[buffer(3)]],
-    constant uint&      seq_len    [[buffer(4)]],
+    device const float* Q              [[buffer(0)]],   // [num_q_heads, HEAD_DIM]
+    device const float* K_cache        [[buffer(1)]],   // [max_seq, kv_dim]
+    device const float* V_cache        [[buffer(2)]],
+    device float*       output         [[buffer(3)]],   // [num_q_heads, HEAD_DIM]
+    constant uint&      seq_len        [[buffer(4)]],
     constant uint&      sliding_window [[buffer(5)]],
-    constant float&     scale      [[buffer(6)]],
-    uint tgid   [[threadgroup_position_in_grid]],
+    constant float&     scale          [[buffer(6)]],
+    constant uint&      kv_dim         [[buffer(7)]],   // num_kv_heads * HEAD_DIM
+    constant uint&      heads_per_kv   [[buffer(8)]],   // num_q_heads / num_kv_heads
+    uint tgid       [[threadgroup_position_in_grid]],   // = query head index
     uint simd_lane  [[thread_index_in_simdgroup]],
     uint simd_group [[simdgroup_index_in_threadgroup]]
 ) {
-    // TODO: clone attn_sdpa_fused, restrict pos loop to
-    //   uint start = (seq_len > sliding_window) ? (seq_len - sliding_window) : 0;
-    //   for (uint pos = start + simd_group; pos < seq_len; pos += BN) { ... }
+    constexpr uint BD = 32;
+    constexpr uint BN = 8;
+    constexpr uint V  = HEAD_DIM / BD;   // 256/32 = 8 — same as Qwen sliding
+
+    uint h    = tgid;
+    uint kv_h = h / heads_per_kv;
+
+    device const float* qh = Q + h * HEAD_DIM;
+    device const float* k_base = K_cache + kv_h * HEAD_DIM;
+    device const float* v_base = V_cache + kv_h * HEAD_DIM;
+
+    float q_vals[V];
+    float o_vals[V] = {0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f};
+
+    constexpr float log2_e = 1.442695041f;
+    float q_scale = scale * log2_e;
+    uint elem_base = simd_lane * V;
+    for (uint j = 0; j < V; j++) {
+        q_vals[j] = q_scale * qh[elem_base + j];
+    }
+
+    float max_score = -1e30f;
+    float sum_exp   = 0.0f;
+
+    // Sliding-window restriction: only attend the last `sliding_window` positions.
+    uint start_pos = (seq_len > sliding_window) ? (seq_len - sliding_window) : 0u;
+
+    for (uint pos = start_pos + simd_group; pos < seq_len; pos += BN) {
+        device const float* kp = k_base + pos * kv_dim + elem_base;
+        device const float* vp = v_base + pos * kv_dim + elem_base;
+
+        float score = 0.0f;
+        for (uint j = 0; j < V; j++) {
+            score += q_vals[j] * kp[j];
+        }
+        score = simd_sum(score);
+
+        float new_max   = max(max_score, score);
+        float factor    = fast::exp2(max_score - new_max);
+        float exp_score = fast::exp2(score - new_max);
+
+        max_score = new_max;
+        sum_exp   = sum_exp * factor + exp_score;
+
+        for (uint j = 0; j < V; j++) {
+            o_vals[j] = o_vals[j] * factor + exp_score * vp[j];
+        }
+    }
+
+    // Merge across SIMD groups (identical to attn_sdpa_fused's tail).
+    threadgroup float sg_max[BD];
+    threadgroup float sg_sum[BN];
+    threadgroup float sg_partial[BN * HEAD_DIM];
+
+    sg_max[simd_lane] = -1e30f;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    if (simd_lane == 0) {
+        sg_max[simd_group] = max_score;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    float local_max  = sg_max[simd_lane];
+    float global_max = simd_max(local_max);
+
+    float group_max     = simd_broadcast_first(max_score);
+    float group_sum     = simd_broadcast_first(sum_exp);
+    float rescale       = fast::exp2(group_max - global_max);
+    float rescaled_sum  = group_sum * rescale;
+
+    for (uint j = 0; j < V; j++) {
+        o_vals[j] *= rescale;
+    }
+    for (uint j = 0; j < V; j++) {
+        sg_partial[simd_group * HEAD_DIM + elem_base + j] = o_vals[j];
+    }
+    if (simd_lane == 0) {
+        sg_sum[simd_group] = rescaled_sum;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    for (uint j = 0; j < V; j++) {
+        float sum = 0.0f;
+        for (uint g = 0; g < BN; g++) {
+            sum += sg_partial[g * HEAD_DIM + elem_base + j];
+        }
+        o_vals[j] = sum;
+    }
+
+    float local_sum  = (simd_lane < BN) ? sg_sum[simd_lane] : 0.0f;
+    float global_sum = simd_sum(local_sum);
+
+    for (uint j = 0; j < V; j++) {
+        o_vals[j] = (global_sum == 0.0f) ? 0.0f : (o_vals[j] / global_sum);
+    }
+
+    device float* out_ptr = output + h * HEAD_DIM + elem_base;
+    for (uint j = 0; j < V; j++) {
+        out_ptr[j] = o_vals[j];
+    }
 }
-#endif
+
+// ============================================================================
+// RMSNorm without learnable weight — for Gemma 4's v_norm on full-attention
+// layers. Returns rms_norm(x) without multiplying by a weight vector.
+// Operates per-head: dispatches one TG per (token, head); each TG normalizes
+// its head_dim elements.
+// ============================================================================
+
+kernel void rms_norm_no_scale(
+    device const float* x         [[buffer(0)]],
+    device float*       out       [[buffer(1)]],
+    constant uint&      dim       [[buffer(2)]],
+    constant float&     eps       [[buffer(3)]],
+    uint tgid [[threadgroup_position_in_grid]],
+    uint lid  [[thread_position_in_threadgroup]]
+) {
+    threadgroup float ss[256];
+    device const float* xh = x + tgid * dim;
+    device float* oh = out + tgid * dim;
+
+    float local = 0.0f;
+    for (uint i = lid; i < dim; i += 256) {
+        float v = xh[i];
+        local += v * v;
+    }
+    ss[lid] = local;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    for (uint stride = 128; stride > 0; stride >>= 1) {
+        if (lid < stride) ss[lid] += ss[lid + stride];
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    float inv_rms = rsqrt(ss[0] / float(dim) + eps);
+
+    for (uint i = lid; i < dim; i += 256) {
+        oh[i] = xh[i] * inv_rms;
+    }
+}
 
 // ============================================================================
 // Q/K head norm + RoPE — Gemma 4 variants.
