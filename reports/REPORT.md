@@ -111,7 +111,7 @@ MoE-Infer provides three independent verification paths:
 
 1. **CPU reference engine** (`src/engine/qwen35_moe/cpu.rs`): A pure-CPU, pure-f32 implementation of the entire forward pass using `ndarray`. Every operation — RMS norm, RoPE, attention, GatedDeltaNet, dequant matvec, SwiGLU — is implemented in scalar Rust with no GPU involvement. This serves as the numerical ground truth against which the GPU pipeline is verified.
 
-2. **Stripped model** (`helpers/strip_model.py`): A 4-layer, 4-expert variant of the full model, suitable for fast verification iteration. Running the CPU reference on this model takes seconds, not minutes.
+2. **Stripped model** (`moe_infer/helpers/strip_model.py`): A 4-layer, 4-expert variant of the full model, suitable for fast verification iteration. Running the CPU reference on this model takes seconds, not minutes.
 
 3. **N-way logit comparison** (`verify_nway.py`): Compares logits from CpuEngine, Fused4bit, the C reference, and MLX across multiple prompts, reporting max_diff and cosine similarity for each.
 
@@ -137,7 +137,7 @@ MoE-Infer takes the opposite approach with an application-level LRU cache (512 e
 
 flash-moe experimented with LZ4 expert compression and discarded it ("-13% — decompress overhead > warm cache savings"). Their workload (397B model, 209 GB experts) meant decompression competed with SSD bandwidth on every read.
 
-MoE-Infer ships LZ4 compression as a production feature with transparent auto-detection. `helpers/compress_experts_lz4.py` compresses per-layer expert files (~40–55% compression ratio), and the engine auto-detects `packed_experts_lz4/` at load time, transparently decompressing via `lz4_flex`. The smaller model size (19 GB experts) and Apple Silicon's hardware LZ4 decode make the overhead negligible for most configurations. Both `ExpertFile::Raw` and `ExpertFile::Lz4` share the same `read_expert()` interface — switching is a filesystem-level change, not a code change.
+MoE-Infer ships LZ4 compression as a production feature with transparent auto-detection. `moe_infer/helpers/compress_experts_lz4.py` compresses per-layer expert files (~40–55% compression ratio), and the engine auto-detects `packed_experts_lz4/` at load time, transparently decompressing via `lz4_flex`. The smaller model size (19 GB experts) and Apple Silicon's hardware LZ4 decode make the overhead negligible for most configurations. Both `ExpertFile::Raw` and `ExpertFile::Lz4` share the same `read_expert()` interface — switching is a filesystem-level change, not a code change.
 
 ### Shader Embedding
 
@@ -183,7 +183,7 @@ Input → RMS Norm → Attention (linear or full) → Residual Add
 
 Expert weights (~19 GB 4-bit) live on SSD in per-layer files (`packed_experts/layer_NN.bin`). Only K=8 active experts are read per layer (~1.77 MB each) via parallel `pread()` across 4 threads, with an LRU cache (512 entries) to avoid re-reading repeated experts.
 
-**LZ4 compression** (optional): `helpers/compress_experts_lz4.py` compresses the per-layer expert files with LZ4, reducing total expert size by ~40-55%. The engine auto-detects `packed_experts_lz4/` at load time and transparently decompresses on read via `lz4_flex`. This is a drop-in replacement for the raw packed files and reduces SSD bandwidth by roughly 30-50%. Both `ExpertFile::Raw` and `ExpertFile::Lz4` variants share the same `read_expert()` interface.
+**LZ4 compression** (optional): `moe_infer/helpers/compress_experts_lz4.py` compresses the per-layer expert files with LZ4, reducing total expert size by ~40-55%. The engine auto-detects `packed_experts_lz4/` at load time and transparently decompresses on read via `lz4_flex`. This is a drop-in replacement for the raw packed files and reduces SSD bandwidth by roughly 30-50%. Both `ExpertFile::Raw` and `ExpertFile::Lz4` variants share the same `read_expert()` interface.
 
 #### Why `pread()` and not `mmap()`
 
@@ -243,7 +243,7 @@ The interleaving means the GPU executes expert matvecs from layer *N* and immedi
 
 ## Weight File Format
 
-MoE-Infer uses a custom binary weight format optimized for mmap and pread, converted from the HuggingFace/MLX safetensors format. The conversion is done by helper scripts in `helpers/`.
+MoE-Infer uses a custom binary weight format optimized for mmap and pread, converted from the HuggingFace/MLX safetensors format. The conversion is done by helper scripts in `moe_infer/helpers/`.
 
 ### HF/MLX Format (Input)
 
@@ -257,7 +257,7 @@ The source model is stored in the standard MLX-quantized safetensors layout:
 
 ### MoE-Infer Non-Expert Weights
 
-Single mmap'd file `model_weights.bin` + JSON manifest `model_weights.json`. Produced by `helpers/extract_weights.py`.
+Single mmap'd file `model_weights.bin` + JSON manifest `model_weights.json`. Produced by `moe_infer/helpers/extract_weights.py`.
 
 **`model_weights.bin`**: All non-expert tensors packed contiguously with 64-byte alignment. Each tensor stored in its native format (U32 packed for 4-bit, BF16 for scales/biases, F32 for norms). The file is mmap'd at startup for zero-copy GPU access via `newBufferWithBytesNoCopy`.
 
@@ -282,7 +282,7 @@ Weights are stored in four dtypes under BQ4, each chosen for its precision/throu
 
 ### MoE-Infer Expert Weights
 
-Per-layer flat binary files `packed_experts/layer_NN.bin`. Produced by `helpers/repack_experts_4bit.py`.
+Per-layer flat binary files `packed_experts/layer_NN.bin`. Produced by `moe_infer/helpers/repack_experts_4bit.py`.
 
 Each layer file is a concatenation of expert weight blobs:
 
@@ -333,26 +333,26 @@ Derived fields computed at load time:
 ```
 HF config.json ──► copied directly ──► config.json
 
-HF safetensors/ ──► helpers/extract_weights.py ──► model_weights.bin
+HF safetensors/ ──► moe_infer/helpers/extract_weights.py ──► model_weights.bin
                                                    model_weights.json
 
-HF safetensors/ ──► helpers/repack_experts_4bit.py ──► packed_experts/layer_00.bin
+HF safetensors/ ──► moe_infer/helpers/repack_experts_4bit.py ──► packed_experts/layer_00.bin
                                                        packed_experts/layer_01.bin
                                                        ...
 
-              ┌──► helpers/compress_experts_lz4.py ──► packed_experts_lz4/
+              ┌──► moe_infer/helpers/compress_experts_lz4.py ──► packed_experts_lz4/
               │                                       (optional, ~40-55% compression)
               │
-              ├──► helpers/repack_experts_2bit.py   ──► packed_experts_2bit/
+              ├──► moe_infer/helpers/repack_experts_2bit.py   ──► packed_experts_2bit/
               │                                       (experimental, 2-bit quant)
               │
-              └──► helpers/quantize_from_hf.py +    ──► BQ4 model directory
+              └──► moe_infer/helpers/quantize_from_hf.py +    ──► BQ4 model directory
                    src/quantize/qwen35_moe/bq4.rs       (block-aware quantization)
 ```
 
 All scripts read from the same MLX-format model directory and output to a single MoE-Infer model directory. The conversion is a one-time offline step; at inference time only the binary files are needed.
 
-`helpers/convert.py` automates the entire pipeline with a single command. `helpers/quantize_from_hf.py` converts directly from HuggingFace unquantized models. `helpers/strip_model.py` builds a small 4-layer model for fast verification iteration.
+`moe_infer/helpers/convert.py` automates the entire pipeline with a single command. `moe_infer/helpers/quantize_from_hf.py` converts directly from HuggingFace unquantized models. `moe_infer/helpers/strip_model.py` builds a small 4-layer model for fast verification iteration.
 
 ### Cache Format
 
@@ -463,14 +463,14 @@ Speedup grows with N — the unique-expert pool savings compound. Throughput cli
 | + GEMM-tiled `matvec_bf16_n` | 1.88× |
 | + unique-expert pool | **2.59×** |
 
-The python entry point is `Engine.forward_batched(tokens, cache)`, parallel to `Engine.forward(tokens, cache)`. N=1 falls through to the token-serial path (batched overhead exceeds the win at single tokens). Numerics validated by `verify_nway.py` and `helpers/verify_vs_original.py`; the bench is `helpers/bench_prefill.py`.
+The python entry point is `Engine.forward_batched(tokens, cache)`, parallel to `Engine.forward(tokens, cache)`. N=1 falls through to the token-serial path (batched overhead exceeds the win at single tokens). Numerics validated by `verify_nway.py` and `moe_infer/helpers/verify_vs_original.py`; the bench is `moe_infer/helpers/bench_prefill.py`.
 
 ### Negative-result experiments
 
 Two well-known weight-compression techniques that failed on Qwen3.6 (the failures themselves are informative):
 
-- **Low-rank expert factorization** (`helpers/analyze_expert_lowrank.py`). Layer 0 alone is meaningfully low-rank (~28% storage saving at 99% variance). Layers 1–40 are rank-saturated: rank > 485 of 512 needed to keep 99% variance, and the low-rank decomposition is actually *larger* than the dense INT4 matrix (+21%). Verdict: experts have been trained to use full rank. Dead on 40 of 41 layers.
-- **Rotated quantization** (QuIP#-style, `helpers/analyze_rotated_quant.py`). Random orthogonal rotation gives ≤0.2% per-matrix cosine lift, *only* at INT2 where the absolute baseline is already broken. The per-group BF16-scale INT4 scheme (group size 64) already does the local outlier adaptation that rotation would unlock against coarser schemes.
+- **Low-rank expert factorization** (`moe_infer/helpers/analyze_expert_lowrank.py`). Layer 0 alone is meaningfully low-rank (~28% storage saving at 99% variance). Layers 1–40 are rank-saturated: rank > 485 of 512 needed to keep 99% variance, and the low-rank decomposition is actually *larger* than the dense INT4 matrix (+21%). Verdict: experts have been trained to use full rank. Dead on 40 of 41 layers.
+- **Rotated quantization** (QuIP#-style, `moe_infer/helpers/analyze_rotated_quant.py`). Random orthogonal rotation gives ≤0.2% per-matrix cosine lift, *only* at INT2 where the absolute baseline is already broken. The per-group BF16-scale INT4 scheme (group size 64) already does the local outlier adaptation that rotation would unlock against coarser schemes.
 
 ## Numerical Verification
 
@@ -570,7 +570,7 @@ moe_infer_rs/                   Rust engine + Python bindings
   Cargo.toml
   pyproject.toml
 
-helpers/                        Model conversion scripts
+moe_infer/helpers/                        Model conversion scripts
   convert.py                    One-step MLX → MoE-Infer conversion
   extract_weights.py            Non-expert weights → model_weights.bin + .json
   repack_experts_4bit.py        MLX 4-bit experts → packed_experts/

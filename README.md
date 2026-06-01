@@ -195,7 +195,7 @@ python -m moe_infer.dequantize data/Qwen3.6-35B-A3B-Strip/model_bq4 \
 python verify_nway.py
 
 # 4b. Quantization quality (vs original BF16 HF)
-python helpers/verify_vs_original.py
+python moe_infer/helpers/verify_vs_original.py
 ```
 
 Expected metrics on the 29-token test sequence (vocab_size=248,320):

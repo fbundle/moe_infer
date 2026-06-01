@@ -116,7 +116,7 @@ BF16 scales/biases: $S_{\text{expert}} \approx 1.77$~MB.
 
 Two real bugs in the baseline, both found by integrating against
 HuggingFace transformers as the reference (\texttt{verify\_nway.py},
-\texttt{helpers/verify\_vs\_original.py}).
+\texttt{moe_infer/helpers/verify\_vs\_original.py}).
 
 \paragraph{Norm-shift overgeneralization.} Qwen3.6 uses
 \emph{zero-centered} RMSNorm in most places (the quantization pipeline
@@ -315,7 +315,7 @@ weight matrices $W \in \mathbb{R}^{m \times n}$ might admit a low-rank
 approximation $W \approx U V^\top$ with $r \ll \min(m, n)$, reducing
 both storage and pread bandwidth. We measured singular value decay
 across all 41 MoE layers (script:
-\texttt{helpers/analyze\_expert\_lowrank.py}). Findings:
+\texttt{moe_infer/helpers/analyze\_expert\_lowrank.py}). Findings:
 \begin{itemize}
 \item Layer 0 alone is meaningfully low-rank: rank 282 of 512 captures
     99\% variance, $\sim 28\%$ storage saving.
@@ -342,7 +342,7 @@ matrix ops per forward, so INT3 is not viable either.
 \section{Telemetry Analysis}\label{sec:telemetry}
 
 We instrumented the engine to attribute time across GPU wait, disk
-I/O, and CPU routing (script: \texttt{helpers/bench\_io.py}). On M4,
+I/O, and CPU routing (script: \texttt{moe_infer/helpers/bench\_io.py}). On M4,
 Qwen3.6 full model, $N{=}63$ tokens, 5 runs:
 
 \begin{center}
