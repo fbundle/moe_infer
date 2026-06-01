@@ -24,7 +24,10 @@ use std::sync::Arc;
 use crate::cache::Cache;
 use crate::engine::{Engine, SignalCheckFn, TelemetryValue};
 use crate::error::MoEError;
+use crate::math::bf16_to_f32;
 use crate::model::Model;
+use crate::model::weights::WeightFile;
+use crate::constants::RMS_NORM_EPS;
 
 use crate::engine::gemma4_constants::Gemma4ModelConfig;
 use crate::engine::gemma4_metal_context::Gemma4MetalContext;
@@ -67,6 +70,149 @@ impl<C: Gemma4ModelConfig> Gemma4Fused<C> {
     }
 }
 
+impl<C: Gemma4ModelConfig> Gemma4Fused<C> {
+    /// Look up the embedding row for one token. Gemma 4 scales the embedding
+    /// by `sqrt(HIDDEN_DIM)` (the standard "embed_scale" trick that keeps
+    /// post-embedding magnitudes O(1)).
+    ///
+    /// Tries BF16 first (`embed_tokens.weight` as u16 array), then BQ4
+    /// (packed u32 + bf16 scales/biases). The BQ4 path mirrors qwen35's
+    /// `embed_lookup` because Gemma 4's BQ4 quantize pipeline will emit the
+    /// same on-disk format (per-row group quantization).
+    fn embed_lookup_row(wf: &WeightFile, token_id: usize, out: &mut [f32], hidden_dim: usize) {
+        let scale = (hidden_dim as f32).sqrt();
+
+        // BF16 path (unquantized weights, e.g. for verification against MLX).
+        if let Some(w) = wf.get_tensor_u16("language_model.model.embed_tokens.weight") {
+            let row = &w[token_id * hidden_dim..(token_id + 1) * hidden_dim];
+            for j in 0..hidden_dim {
+                out[j] = bf16_to_f32(row[j]) * scale;
+            }
+            return;
+        }
+
+        // BQ4 path: row-wise 4-bit packed with bf16 scale+bias per group.
+        // Same format as qwen35::fused_exp2::embed_lookup; only difference
+        // is the trailing `* scale` for Gemma's embed_scale.
+        let (Some(w), Some(s), Some(b)) = (
+            wf.get_tensor_u32("language_model.model.embed_tokens.weight"),
+            wf.get_tensor_u16("language_model.model.embed_tokens.scales"),
+            wf.get_tensor_u16("language_model.model.embed_tokens.biases"),
+        ) else {
+            out.fill(0.0);
+            return;
+        };
+        let w_info = wf.get_tensor_info("language_model.model.embed_tokens.weight").unwrap();
+        let packed_cols = w_info.shape[1];
+        let s_info = wf.get_tensor_info("language_model.model.embed_tokens.scales").unwrap();
+        let num_groups = s_info.shape[1];
+        let group_size = hidden_dim / num_groups;
+        let packed_per_group = group_size / 8;
+        let w_row = &w[token_id * packed_cols..];
+        let s_row = &s[token_id * num_groups..];
+        let b_row = &b[token_id * num_groups..];
+        for g in 0..num_groups {
+            let gscale = bf16_to_f32(s_row[g]);
+            let gbias  = bf16_to_f32(b_row[g]);
+            let base = g * group_size;
+            for p in 0..packed_per_group {
+                let packed = w_row[g * packed_per_group + p];
+                for n in 0..8 {
+                    let nibble = (packed >> (n * 4)) & 0xF;
+                    out[base + p * 8 + n] = ((nibble as f32) * gscale + gbias) * scale;
+                }
+            }
+        }
+    }
+
+    /// Final RMSNorm + tied lm_head matvec + logit softcap.
+    /// CPU implementation — single-token output, fine to keep in Rust for now
+    /// (vocab=262144 × hidden=2816 ≈ 0.7B ops, ~50 ms on M-series CPU). Will
+    /// move to Metal once the rest of the forward is on-GPU.
+    ///
+    /// `tied_embedding`: Gemma 4 ties lm_head to embed_tokens. We dequant the
+    /// embedding weight row-by-row (one row per vocab id) and dot with the
+    /// final-norm output. Same on-disk format as `embed_lookup_row`.
+    fn final_norm_lm_head_softcap(
+        wf: &WeightFile,
+        hidden: &mut [f32],
+        out_logits: &mut [f32],
+        hidden_dim: usize,
+        vocab_size: usize,
+        softcap: f32,
+    ) {
+        // ── Final RMSNorm with model.norm.weight ──────────────────────────
+        if let Some(fnw_u16) = wf.get_tensor_u16("language_model.model.norm.weight") {
+            let fnw: Vec<f32> = fnw_u16.iter().map(|&v| bf16_to_f32(v)).collect();
+            let sum_sq: f32 = hidden[..hidden_dim].iter().map(|v| v * v).sum();
+            let inv_rms = 1.0 / (sum_sq / hidden_dim as f32 + RMS_NORM_EPS).sqrt();
+            for i in 0..hidden_dim {
+                hidden[i] *= inv_rms * fnw[i];
+            }
+        }
+
+        // ── Tied lm_head: logits[v] = <hidden, embed_tokens[v]> ───────────
+        // Reuses `embed_lookup_row` to dequant each row into a scratch buf
+        // then dots with hidden. CRUCIAL: must NOT apply the sqrt-hidden
+        // embed_scale for lm_head; we strip it by re-dequantizing without
+        // the multiplier.
+        //
+        // Quick path: read the weight once, dot per row. Two cases:
+        //   - BF16 tensor → direct dot
+        //   - BQ4 tensor → dequant on the fly, dot
+        if let Some(w) = wf.get_tensor_u16("language_model.model.embed_tokens.weight") {
+            for v in 0..vocab_size {
+                let row = &w[v * hidden_dim..(v + 1) * hidden_dim];
+                let mut acc = 0.0f32;
+                for j in 0..hidden_dim {
+                    acc += hidden[j] * bf16_to_f32(row[j]);
+                }
+                out_logits[v] = softcap * (acc / softcap).tanh();
+            }
+            return;
+        }
+
+        // BQ4 path.
+        let (Some(w), Some(s), Some(b)) = (
+            wf.get_tensor_u32("language_model.model.embed_tokens.weight"),
+            wf.get_tensor_u16("language_model.model.embed_tokens.scales"),
+            wf.get_tensor_u16("language_model.model.embed_tokens.biases"),
+        ) else {
+            out_logits.fill(0.0);
+            return;
+        };
+        let w_info = wf.get_tensor_info("language_model.model.embed_tokens.weight").unwrap();
+        let packed_cols = w_info.shape[1];
+        let s_info = wf.get_tensor_info("language_model.model.embed_tokens.scales").unwrap();
+        let num_groups = s_info.shape[1];
+        let group_size = hidden_dim / num_groups;
+        let packed_per_group = group_size / 8;
+        let mut row = vec![0.0f32; hidden_dim];
+        for v in 0..vocab_size {
+            let w_row = &w[v * packed_cols..];
+            let s_row = &s[v * num_groups..];
+            let b_row = &b[v * num_groups..];
+            for g in 0..num_groups {
+                let gscale = bf16_to_f32(s_row[g]);
+                let gbias  = bf16_to_f32(b_row[g]);
+                let base = g * group_size;
+                for p in 0..packed_per_group {
+                    let packed = w_row[g * packed_per_group + p];
+                    for n in 0..8 {
+                        let nibble = (packed >> (n * 4)) & 0xF;
+                        row[base + p * 8 + n] = (nibble as f32) * gscale + gbias;
+                    }
+                }
+            }
+            let mut acc = 0.0f32;
+            for j in 0..hidden_dim {
+                acc += hidden[j] * row[j];
+            }
+            out_logits[v] = softcap * (acc / softcap).tanh();
+        }
+    }
+}
+
 impl<C: Gemma4ModelConfig> Engine for Gemma4Fused<C> {
     fn upload_cache(&self, _cache: &Cache) {
         // TODO: upload sliding-window ring buffers + full KV cache from CPU
@@ -79,21 +225,22 @@ impl<C: Gemma4ModelConfig> Engine for Gemma4Fused<C> {
     }
 
     fn engine_pos(&self) -> usize {
-        // TODO: read from context once added.
-        0
+        self.ctx.pos.get()
     }
 
-    fn embed_lookup(&self, _token_ids: &[i64], _embeddings: &mut [f32]) {
-        // TODO: dequantize a row of model.embed_tokens.weight.
-        // Note: Gemma 4 scales embeddings by sqrt(hidden_dim) before use
-        // (or applies an "embedding scale" — TODO: verify against HF model).
-        unimplemented!("Gemma4Fused::embed_lookup");
+    fn embed_lookup(&self, token_ids: &[i64], embeddings: &mut [f32]) {
+        let hidden_dim = C::HIDDEN_DIM;
+        let wf = &self.model.weight_file;
+        for (i, &id) in token_ids.iter().enumerate() {
+            let out = &mut embeddings[i * hidden_dim..(i + 1) * hidden_dim];
+            Self::embed_lookup_row(wf, id as usize, out, hidden_dim);
+        }
     }
 
     fn forward_hidden(
         &mut self,
-        _embeddings: &[f32],
-        _check_signal: SignalCheckFn<'_>,
+        embeddings: &[f32],
+        check_signal: SignalCheckFn<'_>,
         _mtp: bool,
     ) -> Result<Vec<f32>, MoEError> {
         // Per-token forward — VERIFIED against vendor/mlx-vlm/mlx_vlm/
@@ -259,7 +406,83 @@ impl<C: Gemma4ModelConfig> Engine for Gemma4Fused<C> {
         //     Phase 3 (quantize pipeline) complete so we have engine-format
         //     weights to load. Expected: max_diff ~ 1e-3 (lossy quant) or
         //     ~ 2e-5 (if we load BF16 unquantized directly).
-        unimplemented!("Gemma4Fused::forward_hidden — Phase 2 work, breakdown above");
+
+        let hidden_dim = C::HIDDEN_DIM;
+        let n_tokens   = embeddings.len() / hidden_dim;
+        let vocab_size = C::VOCAB_SIZE;
+        let num_layers = C::NUM_LAYERS;
+        let softcap    = C::FINAL_LOGIT_SOFTCAP;
+
+        let mut logits = vec![0.0f32; n_tokens * vocab_size];
+        if n_tokens == 0 {
+            return Ok(logits);
+        }
+
+        let mut pos = self.ctx.pos.get();
+        let mut hidden_cpu = vec![0.0f32; hidden_dim];
+
+        for ti in 0..n_tokens {
+            if check_signal() {
+                return Err(MoEError::Metal("interrupted".into()));
+            }
+
+            // Chunk [1]: bring this token's pre-scaled embedding in.
+            // `embeddings` was already produced by self.embed_lookup() so
+            // the sqrt(HIDDEN) scaling is already baked in.
+            hidden_cpu.copy_from_slice(&embeddings[ti * hidden_dim..(ti + 1) * hidden_dim]);
+
+            // Chunks [2,4,5]: per-layer forward. Sliding layers use the new
+            // attn_sdpa_sliding_causal + reused q/k_head_norm_rope with
+            // theta=10k. Full layers (head_dim=512, partial RoPE) need a
+            // separate kernel — see Task 4.
+            for layer in 0..num_layers {
+                if check_signal() {
+                    return Err(MoEError::Metal("interrupted".into()));
+                }
+                if C::is_full_attn_layer(layer) {
+                    unimplemented!(
+                        "Gemma 4 full-attention layer {} (every 6th, head_dim=512, \
+                         partial RoPE, attention_k_eq_v): needs a separate SDPA \
+                         kernel — see Task 4 (head_dim=512 SDPA) in Phase 2 plan.",
+                        layer
+                    );
+                }
+                let _ = (layer, pos, &self.weight_buffer, &self.expert_buffer);
+                unimplemented!(
+                    "Gemma 4 sliding-attention layer {} (head_dim=256, window=1024): \
+                     per-layer dispatcher not yet wired. Sliding-SDPA + \
+                     rms_norm_no_scale kernels are in place; remaining work is \
+                     pure orchestration (matvec dispatches + dual-FFN) in \
+                     fused_exp3.rs — see Task 3 in Phase 2 plan.",
+                    layer
+                );
+                #[allow(unreachable_code)]
+                {
+                    // Unreachable today; sketches the call structure so the
+                    // dispatcher can be added incrementally without changing
+                    // the surrounding control flow.
+                    pos = pos;
+                }
+            }
+
+            pos += 1;
+            self.ctx.pos.set(pos);
+
+            // Chunk [6]: final RMSNorm + tied lm_head matvec + logit_softcap.
+            // CPU implementation for now — single-token vocab=262144 dot is
+            // ~50 ms on M-series CPU; move to Metal once the per-layer
+            // dispatch is on-GPU and saturating the device.
+            Self::final_norm_lm_head_softcap(
+                &self.model.weight_file,
+                &mut hidden_cpu,
+                &mut logits[ti * vocab_size..(ti + 1) * vocab_size],
+                hidden_dim,
+                vocab_size,
+                softcap,
+            );
+        }
+
+        Ok(logits)
     }
 
     fn telemetry(&self) -> BTreeMap<String, TelemetryValue> {
