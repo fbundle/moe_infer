@@ -118,7 +118,9 @@ mod fused_exp1;
 #[path = "engine/qwen35_moe/fused_exp2.rs"]
 pub mod fused_exp2;
 #[path = "engine/qwen35_moe/fused_exp3.rs"]
-mod fused_exp3;
+pub mod fused_exp3;
+#[path = "engine/qwen35_moe/fused_exp4.rs"]
+mod fused_exp4;
 #[path = "engine/qwen35_moe/metal_context.rs"]
 pub mod metal_context;
 #[path = "engine/qwen35_moe/metal_kernels.rs"]
@@ -144,6 +146,7 @@ use crate::engine::qwen35_constants::{FullModel, StrippedModel};
 use crate::engine::fused_exp1::FusedExp1;
 use crate::engine::fused_exp2::FusedExp2;
 use crate::engine::fused_exp3::FusedExp3;
+use crate::engine::fused_exp4::FusedExp4;
 
 /// Type-erased engine holding one of the engine variants via trait object.
 pub struct DynEngine {
@@ -175,6 +178,10 @@ impl DynEngine {
                 Box::new(FusedExp3::<FullModel>::new(model, num_active_experts, expert_cache_count)?),
             ("Qwen35MoEFusedExp3", "Qwen3_5MoeForConditionalGeneration_Stripped") =>
                 Box::new(FusedExp3::<StrippedModel>::new(model, num_active_experts, expert_cache_count)?),
+            ("Qwen35MoEFusedExp4", "Qwen3_5MoeForConditionalGeneration") =>
+                Box::new(FusedExp4::<FullModel>::new(model, num_active_experts, expert_cache_count)?),
+            ("Qwen35MoEFusedExp4", "Qwen3_5MoeForConditionalGeneration_Stripped") =>
+                Box::new(FusedExp4::<StrippedModel>::new(model, num_active_experts, expert_cache_count)?),
             _ => return Err(MoEError::Config(format!(
                 "Unknown engine: engine_type={:?}, arch={:?}", engine_type, arch
             ))),
