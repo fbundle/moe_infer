@@ -135,8 +135,10 @@ mod gemma4_constants;
 mod gemma4_metal_context;
 #[path = "engine/gemma4_moe/metal_kernels.rs"]
 mod gemma4_metal_kernels;
-#[path = "engine/gemma4_moe/engine.rs"]
-mod gemma4_engine;
+#[path = "engine/gemma4_moe/fused_exp3.rs"]
+mod gemma4_fused_exp3;
+#[path = "engine/gemma4_moe/fused_exp4.rs"]
+mod gemma4_fused_exp4;
 
 use crate::engine::qwen35_constants::{FullModel, StrippedModel};
 use crate::engine::fused_exp1::FusedExp1;
