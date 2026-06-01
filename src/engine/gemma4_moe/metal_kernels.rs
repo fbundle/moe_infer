@@ -132,11 +132,209 @@ pub fn encode_logit_softcap(
     );
 }
 
-// TODO: dispatchers for sliding-attention RoPE variants
-// (q_head_norm_rope_gemma_sliding, q_head_norm_rope_gemma_full,
-//  k_head_norm_rope_gemma_sliding, k_head_norm_rope_gemma_full).
-// Probably reuse the qwen35_moe q_head_norm_rope kernel with different
-// parameters (rotary_dim, rope_theta) — depends on whether the partial
-// rotary case can be expressed with the existing kernel by passing
-// rotary_dim = head_dim/4. If so, no new kernel needed, just new
-// dispatcher.
+// ---------------------------------------------------------------------------
+// Shared-kernel dispatchers — Qwen3.6 kernels reachable via Gemma4MetalContext.
+// These mirror qwen35_moe::metal_kernels::encode_* but take our context type
+// because qwen's dispatchers expect a different MetalContext struct.
+// ---------------------------------------------------------------------------
+
+use crate::constants::{ROWS_PER_TG, TG_SIZE, RMS_NORM_EPS};
+
+/// Encode BF16 matvec: out[out_dim] = W_bf16[out_dim, in_dim] @ x[in_dim].
+pub fn encode_matvec_bf16(
+    ctx: &Gemma4MetalContext,
+    encoder: &ComputeCommandEncoderRef,
+    w_bf16: &BufferRef, w_offset: u64,
+    x: &BufferRef, x_offset: u64,
+    out: &BufferRef, o_offset: u64,
+    out_dim: u32,
+    in_dim: u32,
+) {
+    encoder.set_compute_pipeline_state(&ctx.matvec_bf16);
+    encoder.set_buffer(0, Some(w_bf16), w_offset);
+    encoder.set_buffer(1, Some(x), x_offset);
+    encoder.set_buffer(2, Some(out), o_offset);
+    unsafe {
+        set_u32(encoder, 3, out_dim);
+        set_u32(encoder, 4, in_dim);
+    }
+    let num_tgs = (out_dim + ROWS_PER_TG - 1) / ROWS_PER_TG;
+    encoder.dispatch_thread_groups(
+        MTLSize::new(num_tgs as u64, 1, 1),
+        MTLSize::new(TG_SIZE as u64, 1, 1),
+    );
+}
+
+/// Encode fused RMSNorm with per-channel BF16 weight.
+/// `out[i] = (x[i] * inv_rms) * bf16_to_f32(weight[i])`.
+pub fn encode_rms_norm_fused_bf16(
+    ctx: &Gemma4MetalContext,
+    encoder: &ComputeCommandEncoderRef,
+    x: &BufferRef, x_offset: u64,
+    weight: &BufferRef, w_offset: u64,
+    out: &BufferRef, o_offset: u64,
+    dim: u32,
+) {
+    encoder.set_compute_pipeline_state(&ctx.rms_norm_fused_bf16);
+    encoder.set_buffer(0, Some(x), x_offset);
+    encoder.set_buffer(1, Some(weight), w_offset);
+    encoder.set_buffer(2, Some(out), o_offset);
+    unsafe {
+        set_u32(encoder, 3, dim);
+        set_f32(encoder, 4, RMS_NORM_EPS);
+    }
+    encoder.dispatch_thread_groups(
+        MTLSize::new(1, 1, 1),
+        MTLSize::new(256, 1, 1),
+    );
+}
+
+/// Encode element-wise residual add: `out[i] = a[i] + b[i]`.
+pub fn encode_residual_add(
+    ctx: &Gemma4MetalContext,
+    encoder: &ComputeCommandEncoderRef,
+    a: &BufferRef, a_offset: u64,
+    b: &BufferRef, b_offset: u64,
+    out: &BufferRef, o_offset: u64,
+    dim: u32,
+) {
+    encoder.set_compute_pipeline_state(&ctx.residual_add);
+    encoder.set_buffer(0, Some(a), a_offset);
+    encoder.set_buffer(1, Some(b), b_offset);
+    encoder.set_buffer(2, Some(out), o_offset);
+    unsafe { set_u32(encoder, 3, dim); }
+    encoder.dispatch_thread_groups(
+        MTLSize::new(((dim + 255) / 256) as u64, 1, 1),
+        MTLSize::new(256, 1, 1),
+    );
+}
+
+/// Q head-norm + RoPE — Gemma 4 variant without query-gate split.
+/// `rotary_dim` is the number of head dims that get rotated: head_dim
+/// for sliding layers (full rotary), head_dim/4 for full layers
+/// (partial_rotary_factor=0.25).
+pub fn encode_q_head_norm_rope_no_gate(
+    ctx: &Gemma4MetalContext,
+    encoder: &ComputeCommandEncoderRef,
+    q_proj: &BufferRef, q_offset: u64,
+    q_norm_w: &BufferRef, w_offset: u64,
+    q_out: &BufferRef, o_offset: u64,
+    num_q_heads: u32,
+    head_dim: u32,
+    rotary_dim: u32,
+    rope_theta: f32,
+    pos: u32,
+) {
+    encoder.set_compute_pipeline_state(&ctx.q_head_norm_rope_no_gate);
+    encoder.set_buffer(0, Some(q_proj), q_offset);
+    encoder.set_buffer(1, Some(q_norm_w), w_offset);
+    encoder.set_buffer(2, Some(q_out), o_offset);
+    unsafe {
+        set_u32(encoder, 3, head_dim);
+        set_u32(encoder, 4, rotary_dim);
+        set_f32(encoder, 5, rope_theta);
+        set_u32(encoder, 6, pos);
+        set_f32(encoder, 7, RMS_NORM_EPS);
+    }
+    encoder.dispatch_thread_groups(
+        MTLSize::new(num_q_heads as u64, 1, 1),
+        MTLSize::new(head_dim as u64, 1, 1),
+    );
+}
+
+/// K head-norm + RoPE — qwen35's k_head_norm_rope is byte-compatible.
+/// In-place over `k_buf`.
+pub fn encode_k_head_norm_rope(
+    ctx: &Gemma4MetalContext,
+    encoder: &ComputeCommandEncoderRef,
+    k_buf: &BufferRef, k_offset: u64,
+    k_norm_w: &BufferRef, w_offset: u64,
+    num_kv_heads: u32,
+    head_dim: u32,
+    rotary_dim: u32,
+    rope_theta: f32,
+    pos: u32,
+) {
+    encoder.set_compute_pipeline_state(&ctx.k_head_norm_rope);
+    encoder.set_buffer(0, Some(k_buf), k_offset);
+    encoder.set_buffer(1, Some(k_norm_w), w_offset);
+    unsafe {
+        set_u32(encoder, 2, head_dim);
+        set_u32(encoder, 3, rotary_dim);
+        set_f32(encoder, 4, rope_theta);
+        set_u32(encoder, 5, pos);
+        set_f32(encoder, 6, RMS_NORM_EPS);
+    }
+    encoder.dispatch_thread_groups(
+        MTLSize::new(num_kv_heads as u64, 1, 1),
+        MTLSize::new(head_dim as u64, 1, 1),
+    );
+}
+
+/// KV-cache append — copies k and v at `pos` into the layer's caches.
+pub fn encode_kv_cache_append(
+    ctx: &Gemma4MetalContext,
+    encoder: &ComputeCommandEncoderRef,
+    k: &BufferRef,
+    v: &BufferRef,
+    k_cache: &BufferRef,
+    v_cache: &BufferRef,
+    pos: u32,
+    kv_dim: u32,
+) {
+    encoder.set_compute_pipeline_state(&ctx.kv_cache_append);
+    encoder.set_buffer(0, Some(k), 0);
+    encoder.set_buffer(1, Some(v), 0);
+    encoder.set_buffer(2, Some(k_cache), 0);
+    encoder.set_buffer(3, Some(v_cache), 0);
+    unsafe {
+        set_u32(encoder, 4, pos);
+        set_u32(encoder, 5, kv_dim);
+    }
+    encoder.dispatch_thread_groups(
+        MTLSize::new(((kv_dim + 255) / 256) as u64, 1, 1),
+        MTLSize::new(256, 1, 1),
+    );
+}
+
+/// Per-layer scalar multiply (Gemma 4's `layer_scalar`).
+pub fn encode_mul_scalar_bf16(
+    ctx: &Gemma4MetalContext,
+    encoder: &ComputeCommandEncoderRef,
+    buf: &BufferRef, buf_offset: u64,
+    scalar_bf16: &BufferRef, s_offset: u64,
+    dim: u32,
+) {
+    encoder.set_compute_pipeline_state(&ctx.mul_scalar_bf16);
+    encoder.set_buffer(0, Some(buf), buf_offset);
+    encoder.set_buffer(1, Some(scalar_bf16), s_offset);
+    unsafe { set_u32(encoder, 2, dim); }
+    encoder.dispatch_thread_groups(
+        MTLSize::new(((dim + 255) / 256) as u64, 1, 1),
+        MTLSize::new(256, 1, 1),
+    );
+}
+
+/// Router RMSNorm — weight is a single bf16 scalar `router.scale`; the
+/// effective per-channel scale is `router.scale * sqrt(hidden)^-1`.
+pub fn encode_rms_norm_router(
+    ctx: &Gemma4MetalContext,
+    encoder: &ComputeCommandEncoderRef,
+    x: &BufferRef, x_offset: u64,
+    scale_bf16: &BufferRef, s_offset: u64,
+    out: &BufferRef, o_offset: u64,
+    dim: u32,
+) {
+    encoder.set_compute_pipeline_state(&ctx.rms_norm_router);
+    encoder.set_buffer(0, Some(x), x_offset);
+    encoder.set_buffer(1, Some(scale_bf16), s_offset);
+    encoder.set_buffer(2, Some(out), o_offset);
+    unsafe {
+        set_u32(encoder, 3, dim);
+        set_f32(encoder, 4, RMS_NORM_EPS);
+    }
+    encoder.dispatch_thread_groups(
+        MTLSize::new(1, 1, 1),
+        MTLSize::new(256, 1, 1),
+    );
+}

@@ -71,6 +71,21 @@ impl<C: Gemma4ModelConfig> Gemma4Fused<C> {
 }
 
 impl<C: Gemma4ModelConfig> Gemma4Fused<C> {
+    /// Byte offset of a named tensor inside `weight_buffer.buf`. Returns
+    /// `None` if the tensor isn't in the manifest (used to skip optional
+    /// tensors like `v_proj` on full-attention layers).
+    fn tensor_offset(&self, name: &str) -> Option<u64> {
+        let ptr = self.model.weight_file.get_tensor_ptr(name)?;
+        let base = self.weight_buffer.base as usize;
+        Some((ptr as usize - base) as u64)
+    }
+
+    /// Tensor offset that MUST exist; panics with a clear message otherwise.
+    fn tensor_offset_required(&self, name: &str) -> u64 {
+        self.tensor_offset(name)
+            .unwrap_or_else(|| panic!("[gemma4-engine] required tensor missing: {}", name))
+    }
+
     /// Look up the embedding row for one token. Gemma 4 scales the embedding
     /// by `sqrt(HIDDEN_DIM)` (the standard "embed_scale" trick that keeps
     /// post-embedding magnitudes O(1)).
@@ -210,6 +225,200 @@ impl<C: Gemma4ModelConfig> Gemma4Fused<C> {
             }
             out_logits[v] = softcap * (acc / softcap).tanh();
         }
+    }
+
+    /// One sliding-attention layer's forward pass (single token).
+    ///
+    /// Operates entirely on the persistent GPU buffers in self.ctx, reading
+    /// quantized/BF16 weights from self.weight_buffer via byte offsets.
+    /// All BF16 path for now (matvec_bf16); will dispatch through a
+    /// per-tensor-dtype matvec once BQ4 quantize lands (Task 5).
+    ///
+    /// Status: ATTENTION BLOCK ONLY. The dual-FFN path panics with a clear
+    /// pointer at the bottom of this function. Splitting attention from FFN
+    /// lets us unit-validate the attention pipeline (rms_norm + matvec×4 +
+    /// q/k head_norm_rope + v_norm + kv_cache_append + sliding SDPA + o_proj
+    /// + residual_add) before piling FFN on top.
+    fn forward_sliding_layer(&mut self, layer: usize, pos: u32) -> Result<(), MoEError> {
+        use crate::engine::gemma4_metal_kernels as gk;
+        let hidden_dim   = C::HIDDEN_DIM as u32;
+        let head_dim     = C::HEAD_DIM as u32;
+        let n_q_heads    = C::NUM_ATTN_HEADS as u32;
+        let n_kv_heads   = C::NUM_KV_HEADS as u32;
+        let q_dim        = n_q_heads * head_dim;
+        let kv_dim       = n_kv_heads * head_dim;
+        let rope_theta   = C::ROPE_THETA_SLIDING as f32;
+        let sliding_win  = C::SLIDING_WINDOW as u32;
+
+        let prefix = format!("language_model.model.layers.{}", layer);
+        // ── Required tensor offsets (BF16 weights) ─────────────────────────
+        let off_input_ln   = self.tensor_offset_required(&format!("{}.input_layernorm.weight", prefix));
+        let off_q_proj_w   = self.tensor_offset_required(&format!("{}.self_attn.q_proj.weight", prefix));
+        let off_k_proj_w   = self.tensor_offset_required(&format!("{}.self_attn.k_proj.weight", prefix));
+        let off_v_proj_w   = self.tensor_offset_required(&format!("{}.self_attn.v_proj.weight", prefix));
+        let off_o_proj_w   = self.tensor_offset_required(&format!("{}.self_attn.o_proj.weight", prefix));
+        let off_q_norm_w   = self.tensor_offset_required(&format!("{}.self_attn.q_norm.weight", prefix));
+        let off_k_norm_w   = self.tensor_offset_required(&format!("{}.self_attn.k_norm.weight", prefix));
+        let off_post_attn_ln = self.tensor_offset_required(&format!("{}.post_attention_layernorm.weight", prefix));
+
+        let wbuf = &self.weight_buffer.buf;
+        let ctx = &self.ctx;
+
+        let cmd_buf = ctx.queue.new_command_buffer();
+        let enc = cmd_buf.new_compute_command_encoder();
+
+        // ── 1. input_layernorm: buf_hidden × input_layernorm.weight → buf_input_normed ──
+        gk::encode_rms_norm_fused_bf16(
+            ctx, enc,
+            &ctx.buf_hidden, 0,
+            wbuf, off_input_ln,
+            &ctx.buf_input_normed, 0,
+            hidden_dim,
+        );
+
+        // ── 2. Q / K / V projections (BF16 matvec) ──────────────────────────
+        gk::encode_matvec_bf16(
+            ctx, enc,
+            wbuf, off_q_proj_w,
+            &ctx.buf_input_normed, 0,
+            &ctx.buf_q, 0,
+            q_dim, hidden_dim,
+        );
+        gk::encode_matvec_bf16(
+            ctx, enc,
+            wbuf, off_k_proj_w,
+            &ctx.buf_input_normed, 0,
+            &ctx.buf_k, 0,
+            kv_dim, hidden_dim,
+        );
+        gk::encode_matvec_bf16(
+            ctx, enc,
+            wbuf, off_v_proj_w,
+            &ctx.buf_input_normed, 0,
+            &ctx.buf_v, 0,
+            kv_dim, hidden_dim,
+        );
+
+        // ── 3. Q head-norm + RoPE (no q_gate) ──────────────────────────────
+        // For sliding layers: rotary_dim = head_dim (full rotary).
+        gk::encode_q_head_norm_rope_no_gate(
+            ctx, enc,
+            &ctx.buf_q, 0,
+            wbuf, off_q_norm_w,
+            &ctx.buf_q, 0,                // in-place — reads then writes
+            n_q_heads, head_dim, head_dim,
+            rope_theta, pos,
+        );
+
+        // ── 4. K head-norm + RoPE (in-place on buf_k) ──────────────────────
+        gk::encode_k_head_norm_rope(
+            ctx, enc,
+            &ctx.buf_k, 0,
+            wbuf, off_k_norm_w,
+            n_kv_heads, head_dim, head_dim,
+            rope_theta, pos,
+        );
+
+        // ── 5. v_norm: RMSNorm-no-scale, per-head ──────────────────────────
+        gk::encode_rms_norm_no_scale(
+            ctx, enc,
+            &ctx.buf_v, 0,
+            &ctx.buf_v, 0,                // in-place
+            n_kv_heads, head_dim, crate::constants::RMS_NORM_EPS,
+        );
+
+        // ── 6. KV cache append at position `pos` ───────────────────────────
+        gk::encode_kv_cache_append(
+            ctx, enc,
+            &ctx.buf_k, &ctx.buf_v,
+            &ctx.kv_caches_k[layer], &ctx.kv_caches_v[layer],
+            pos, kv_dim,
+        );
+
+        // ── 7. Sliding-window causal SDPA → buf_attn_out ───────────────────
+        // heads_per_kv = num_q_heads / num_kv_heads (= 16/8 = 2 for sliding).
+        let heads_per_kv = n_q_heads / n_kv_heads;
+        gk::encode_attn_sdpa_sliding_causal(
+            ctx, enc,
+            &ctx.buf_q, 0,
+            &ctx.kv_caches_k[layer], &ctx.kv_caches_v[layer],
+            &ctx.buf_attn_out, 0,
+            pos + 1,                       // seq_len = pos + 1 (we just appended)
+            sliding_win,
+            n_q_heads, head_dim, kv_dim, heads_per_kv,
+        );
+
+        // ── 8. o_proj: buf_attn_out × o_proj.weight → buf_o_proj_out ───────
+        gk::encode_matvec_bf16(
+            ctx, enc,
+            wbuf, off_o_proj_w,
+            &ctx.buf_attn_out, 0,
+            &ctx.buf_o_proj_out, 0,
+            hidden_dim, q_dim,
+        );
+
+        // ── 9. post_attention_layernorm + residual ─────────────────────────
+        // h = residual + post_attention_layernorm(o_proj_out)
+        //   = buf_hidden + RMSNorm(buf_o_proj_out)
+        gk::encode_rms_norm_fused_bf16(
+            ctx, enc,
+            &ctx.buf_o_proj_out, 0,
+            wbuf, off_post_attn_ln,
+            &ctx.buf_post_attn_normed, 0,
+            hidden_dim,
+        );
+        gk::encode_residual_add(
+            ctx, enc,
+            &ctx.buf_hidden, 0,
+            &ctx.buf_post_attn_normed, 0,
+            &ctx.buf_hidden, 0,
+            hidden_dim,
+        );
+
+        enc.end_encoding();
+        cmd_buf.commit();
+        cmd_buf.wait_until_completed();
+
+        // ── 10. Dual FFN block — DEFERRED ──────────────────────────────────
+        // What's left for this layer (Task 3 remaining work):
+        //   residual = buf_hidden  (save before FFN)
+        //   Dense MLP path (always-on):
+        //     pre_feedforward_layernorm → buf_pre_ff_normed
+        //     mlp.gate_proj × buf_pre_ff_normed → buf_mlp_gate
+        //     mlp.up_proj   × buf_pre_ff_normed → buf_mlp_up
+        //     gelu_fused                         → buf_mlp_act
+        //     mlp.down_proj × buf_mlp_act       → buf_mlp_down
+        //     post_feedforward_layernorm_1      → buf_mlp_post
+        //   Router + experts:
+        //     rms_norm_router(buf_hidden, router.scale) → buf_router_normed
+        //     router.proj × buf_router_normed → buf_router_logits[num_experts]
+        //     CPU: top-K (K=8), softmax over K, scale by per_expert_scale
+        //     pre_feedforward_layernorm_2 → buf_pre_ff_normed_2
+        //     For ki in 0..K:
+        //       Load expert e=indices[ki] gate_up_proj + down_proj
+        //       (HF format: experts.gate_up_proj is [128, 2*moe_inter, hidden],
+        //        split halves for gate vs up)
+        //       gate_proj × buf_pre_ff_normed_2 → buf_expert_gate
+        //       up_proj   × buf_pre_ff_normed_2 → buf_expert_up
+        //       gelu_fused                       → buf_expert_act
+        //       down_proj × buf_expert_act       → tmp; buf_expert_out += w[ki]*tmp
+        //     post_feedforward_layernorm_2(buf_expert_out) → buf_expert_post
+        //   Combine + outer norm + residual + layer_scalar:
+        //     buf_ff_combined = buf_mlp_post + buf_expert_post  (residual_add)
+        //     post_feedforward_layernorm(buf_ff_combined) → buf_ff_outer_post
+        //     buf_hidden = residual + buf_ff_outer_post  (residual_add)
+        //     buf_hidden *= layer_scalar (mul_scalar_bf16)
+        unimplemented!(
+            "[gemma4-fused-exp3] sliding layer {} attention block ran; \
+             dual-FFN orchestration (~12 more kernel dispatches) still TODO. \
+             Helpers and dispatchers (gelu_fused, rms_norm_router, \
+             mul_scalar_bf16) are wired; only the Rust orchestration code in \
+             this function is missing. See bottom of forward_sliding_layer.",
+            layer
+        );
+
+        #[allow(unreachable_code)]
+        Ok(())
     }
 }
 
@@ -426,43 +635,39 @@ impl<C: Gemma4ModelConfig> Engine for Gemma4Fused<C> {
                 return Err(MoEError::Metal("interrupted".into()));
             }
 
-            // Chunk [1]: bring this token's pre-scaled embedding in.
-            // `embeddings` was already produced by self.embed_lookup() so
-            // the sqrt(HIDDEN) scaling is already baked in.
+            // Chunk [1]: bring this token's pre-scaled embedding into the GPU
+            // hidden buffer. `embeddings` is f32 already and includes the
+            // sqrt(HIDDEN) embed_scale (applied by self.embed_lookup_row).
             hidden_cpu.copy_from_slice(&embeddings[ti * hidden_dim..(ti + 1) * hidden_dim]);
+            {
+                let dst = self.ctx.buf_hidden.contents() as *mut f32;
+                unsafe {
+                    std::ptr::copy_nonoverlapping(hidden_cpu.as_ptr(), dst, hidden_dim);
+                }
+            }
 
-            // Chunks [2,4,5]: per-layer forward. Sliding layers use the new
-            // attn_sdpa_sliding_causal + reused q/k_head_norm_rope with
-            // theta=10k. Full layers (head_dim=512, partial RoPE) need a
-            // separate kernel — see Task 4.
+            // Chunks [2,4,5]: per-layer forward.
             for layer in 0..num_layers {
                 if check_signal() {
                     return Err(MoEError::Metal("interrupted".into()));
                 }
                 if C::is_full_attn_layer(layer) {
                     unimplemented!(
-                        "Gemma 4 full-attention layer {} (every 6th, head_dim=512, \
-                         partial RoPE, attention_k_eq_v): needs a separate SDPA \
-                         kernel — see Task 4 (head_dim=512 SDPA) in Phase 2 plan.",
+                        "Gemma 4 full-attention layer {} (head_dim=512, partial RoPE, \
+                         attention_k_eq_v): needs the head_dim=512 SDPA kernel — Task 4.",
                         layer
                     );
                 }
-                let _ = (layer, pos, &self.weight_buffer, &self.expert_buffer);
-                unimplemented!(
-                    "Gemma 4 sliding-attention layer {} (head_dim=256, window=1024): \
-                     per-layer dispatcher not yet wired. Sliding-SDPA + \
-                     rms_norm_no_scale kernels are in place; remaining work is \
-                     pure orchestration (matvec dispatches + dual-FFN) in \
-                     fused_exp3.rs — see Task 3 in Phase 2 plan.",
-                    layer
+                self.forward_sliding_layer(layer, pos as u32)?;
+            }
+
+            // Copy final hidden back to CPU for the lm_head pass.
+            unsafe {
+                std::ptr::copy_nonoverlapping(
+                    self.ctx.buf_hidden.contents() as *const f32,
+                    hidden_cpu.as_mut_ptr(),
+                    hidden_dim,
                 );
-                #[allow(unreachable_code)]
-                {
-                    // Unreachable today; sketches the call structure so the
-                    // dispatcher can be added incrementally without changing
-                    // the surrounding control flow.
-                    pos = pos;
-                }
             }
 
             pos += 1;

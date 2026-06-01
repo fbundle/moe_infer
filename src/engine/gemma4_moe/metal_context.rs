@@ -38,6 +38,9 @@ pub struct Gemma4MetalContext {
     pub logit_softcap: ComputePipelineState,
     pub attn_sdpa_sliding_causal: ComputePipelineState,
     pub rms_norm_no_scale: ComputePipelineState,
+    pub q_head_norm_rope_no_gate: ComputePipelineState,
+    pub mul_scalar_bf16: ComputePipelineState,
+    pub rms_norm_router: ComputePipelineState,
 
     // Persistent per-token buffers (single-token forward).
     pub buf_hidden: Buffer,
@@ -118,6 +121,9 @@ impl Gemma4MetalContext {
         let logit_softcap          = make("logit_softcap")?;
         let attn_sdpa_sliding_causal = make("attn_sdpa_sliding_causal")?;
         let rms_norm_no_scale      = make("rms_norm_no_scale")?;
+        let q_head_norm_rope_no_gate = make("q_head_norm_rope_no_gate")?;
+        let mul_scalar_bf16        = make("mul_scalar_bf16")?;
+        let rms_norm_router        = make("rms_norm_router")?;
 
         let hidden = C::HIDDEN_DIM;
         let n_q_heads = C::NUM_ATTN_HEADS;
@@ -197,6 +203,9 @@ impl Gemma4MetalContext {
             logit_softcap,
             attn_sdpa_sliding_causal,
             rms_norm_no_scale,
+            q_head_norm_rope_no_gate,
+            mul_scalar_bf16,
+            rms_norm_router,
         };
 
         Ok((ctx, weight_buffer, expert_buffer))
