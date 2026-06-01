@@ -16,6 +16,9 @@ mod timer;
 #[path = "quantize/qwen35_moe/bq4.rs"] pub mod bq4;
 #[path = "quantize/qwen35_moe/int4.rs"] pub mod int4;
 
+// Gemma 4 quantize pipeline — scaffold only.
+#[path = "quantize/gemma4_moe/mod.rs"] pub mod gemma4_bq4;
+
 #[cfg(feature = "python-bindings")]
 mod python_bindings;
 

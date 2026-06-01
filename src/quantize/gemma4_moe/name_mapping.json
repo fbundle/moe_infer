@@ -1,0 +1,44 @@
+{
+  "_comment": "Gemma 4 26B-A4B tensor name mapping. HF (Transformers) names → engine-internal names. Verified against the HF Gemma 4 architecture spec; field-by-field byte verification against actual weights is TODO and tagged accordingly in src/quantize/gemma4_moe/bq4.rs.",
+
+  "model.embed_tokens.weight": "model.embed_tokens.weight",
+  "model.embed_tokens.scales": "model.embed_tokens.scales",
+  "model.embed_tokens.biases": "model.embed_tokens.biases",
+
+  "model.norm.weight": "model.norm.weight",
+
+  "model.layers.{L}.input_layernorm.weight": "model.layers.{L}.input_layernorm.weight",
+  "model.layers.{L}.post_attention_layernorm.weight": "model.layers.{L}.post_attention_layernorm.weight",
+  "model.layers.{L}.pre_feedforward_layernorm.weight": "model.layers.{L}.pre_feedforward_layernorm.weight",
+  "model.layers.{L}.post_feedforward_layernorm.weight": "model.layers.{L}.post_feedforward_layernorm.weight",
+
+  "model.layers.{L}.self_attn.q_proj.weight": "model.layers.{L}.self_attn.q_proj.weight",
+  "model.layers.{L}.self_attn.q_proj.scales": "model.layers.{L}.self_attn.q_proj.scales",
+  "model.layers.{L}.self_attn.q_proj.biases": "model.layers.{L}.self_attn.q_proj.biases",
+  "model.layers.{L}.self_attn.k_proj.weight": "model.layers.{L}.self_attn.k_proj.weight",
+  "model.layers.{L}.self_attn.k_proj.scales": "model.layers.{L}.self_attn.k_proj.scales",
+  "model.layers.{L}.self_attn.k_proj.biases": "model.layers.{L}.self_attn.k_proj.biases",
+  "model.layers.{L}.self_attn.v_proj.weight": "model.layers.{L}.self_attn.v_proj.weight",
+  "model.layers.{L}.self_attn.v_proj.scales": "model.layers.{L}.self_attn.v_proj.scales",
+  "model.layers.{L}.self_attn.v_proj.biases": "model.layers.{L}.self_attn.v_proj.biases",
+  "model.layers.{L}.self_attn.o_proj.weight": "model.layers.{L}.self_attn.o_proj.weight",
+  "model.layers.{L}.self_attn.o_proj.scales": "model.layers.{L}.self_attn.o_proj.scales",
+  "model.layers.{L}.self_attn.o_proj.biases": "model.layers.{L}.self_attn.o_proj.biases",
+
+  "model.layers.{L}.self_attn.q_norm.weight": "model.layers.{L}.self_attn.q_norm.weight",
+  "model.layers.{L}.self_attn.k_norm.weight": "model.layers.{L}.self_attn.k_norm.weight",
+
+  "_comment_moe": "Router gate + expert weights. Gemma 4 typically uses 3D fused tensors `feed_forward.experts.{gate_up,down}_proj.weight` with shape [num_experts, ...]. TODO: verify against actual model.safetensors header — name may be `mlp.experts` or `feed_forward.experts`, and gate/up may be fused as `gate_up_proj` or split.",
+  "model.layers.{L}.feed_forward.router.weight": "model.layers.{L}.feed_forward.router.weight",
+  "model.layers.{L}.feed_forward.experts.gate_up_proj.weight": "model.layers.{L}.feed_forward.experts.gate_up_proj.weight",
+  "model.layers.{L}.feed_forward.experts.gate_up_proj.scales": "model.layers.{L}.feed_forward.experts.gate_up_proj.scales",
+  "model.layers.{L}.feed_forward.experts.gate_up_proj.biases": "model.layers.{L}.feed_forward.experts.gate_up_proj.biases",
+  "model.layers.{L}.feed_forward.experts.down_proj.weight": "model.layers.{L}.feed_forward.experts.down_proj.weight",
+  "model.layers.{L}.feed_forward.experts.down_proj.scales": "model.layers.{L}.feed_forward.experts.down_proj.scales",
+  "model.layers.{L}.feed_forward.experts.down_proj.biases": "model.layers.{L}.feed_forward.experts.down_proj.biases",
+
+  "_comment_lm_head": "Gemma 4 ties the lm_head to the embedding matrix (`tie_word_embeddings=true`). There is no separate `lm_head.weight` tensor in the source; the engine must dot-product final hidden states against `embed_tokens.weight^T` for logit computation. Quantize pipeline still emits an `lm_head.weight` view but it points at the same packed data as `embed_tokens.weight`.",
+  "lm_head.weight": "model.embed_tokens.weight",
+  "lm_head.scales": "model.embed_tokens.scales",
+  "lm_head.biases": "model.embed_tokens.biases"
+}
