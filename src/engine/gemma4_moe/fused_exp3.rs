@@ -35,6 +35,8 @@ pub struct Gemma4Fused<C: Gemma4ModelConfig> {
     pub num_active_experts: usize,
     pub timing: BTreeMap<String, TelemetryValue>,
     pub last_h_pre_norm: Vec<f32>,
+    pub weight_buffer: crate::engine::metal_context::WeightBuffer,
+    pub expert_buffer: crate::engine::metal_context::ExpertBuffer,
     _phantom: PhantomData<C>,
 }
 
@@ -45,12 +47,14 @@ impl<C: Gemma4ModelConfig> Gemma4Fused<C> {
         expert_cache_count: usize,
     ) -> Result<Self, MoEError> {
         C::validate_config(&model.config).map_err(MoEError::Config)?;
-        let ctx = Gemma4MetalContext::new::<C>(
+        let (ctx, weight_buffer, expert_buffer) = Gemma4MetalContext::new::<C>(
             &model.weight_file, num_active_experts, "Gemma4Fused", expert_cache_count,
         )?;
         Ok(Self {
             model,
             ctx,
+            weight_buffer,
+            expert_buffer,
             num_active_experts: if num_active_experts == 0 {
                 C::NUM_EXPERTS_PER_TOK
             } else {

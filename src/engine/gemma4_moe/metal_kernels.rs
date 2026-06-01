@@ -54,7 +54,7 @@ pub fn encode_gelu_fused(
     out: &BufferRef, out_offset: u64,
     dim: u32,
 ) {
-    let pipeline = ctx.gelu_fused.as_ref().expect("gelu_fused kernel not loaded");
+    let pipeline = &ctx.gelu_fused;
     encoder.set_compute_pipeline_state(pipeline);
     encoder.set_buffer(0, Some(gate), gate_offset);
     encoder.set_buffer(1, Some(up), up_offset);
@@ -75,7 +75,7 @@ pub fn encode_logit_softcap(
     vocab_size: u32,
     cap: f32,
 ) {
-    let pipeline = ctx.logit_softcap.as_ref().expect("logit_softcap kernel not loaded");
+    let pipeline = &ctx.logit_softcap;
     encoder.set_compute_pipeline_state(pipeline);
     encoder.set_buffer(0, Some(logits), logits_offset);
     unsafe {
