@@ -11,16 +11,10 @@
 //     against a reference implementation. Each carries a TODO with the
 //     verification step it needs.
 
-#include <metal_stdlib>
-using namespace metal;
-
-// Reuse the bf16_to_f32 helper from the qwen35 shader file. To keep the
-// two .metal files independent for now, redefine here. If we later merge
-// the engines into one shader library, deduplicate.
-inline float bf16_to_f32(uint16_t bf16) {
-    uint32_t bits = ((uint32_t)bf16) << 16;
-    return as_type<float>(bits);
-}
+// NOTE: This file is intended to be CONCATENATED after
+// engine/qwen35_moe/shaders.metal at compile time, so we don't repeat
+// #include <metal_stdlib>, `using namespace metal`, or `bf16_to_f32` —
+// they're inherited from the qwen35 source.
 
 // ============================================================================
 // Sliding-window causal attention (Gemma 4 sliding-attention layers).

@@ -10,7 +10,7 @@
 use std::ffi::c_void;
 use metal::*;
 
-use super::metal_context::Gemma4MetalContext;
+use crate::engine::gemma4_metal_context::Gemma4MetalContext;
 
 unsafe fn set_u32(encoder: &ComputeCommandEncoderRef, index: u64, value: u32) {
     let val: *const u32 = &value;

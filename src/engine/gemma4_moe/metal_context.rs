@@ -46,7 +46,7 @@ pub struct Gemma4MetalContext {
 }
 
 impl Gemma4MetalContext {
-    pub fn new<C: super::constants::Gemma4ModelConfig>(
+    pub fn new<C: crate::engine::gemma4_constants::Gemma4ModelConfig>(
         _wf: &crate::model::weights::WeightFile,
         _num_active_experts: usize,
         _label: &str,

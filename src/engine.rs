@@ -128,10 +128,15 @@ pub mod mtp;
 #[path = "engine/qwen35_moe/batched.rs"]
 pub mod batched;
 
-// Gemma 4 MoE engine — scaffold only, not yet registered in DynEngine.
-// See src/engine/gemma4_moe/ for status.
-#[path = "engine/gemma4_moe/mod.rs"]
-pub mod gemma4_moe;
+// Gemma 4 MoE engine — scaffold; not yet registered in DynEngine.
+#[path = "engine/gemma4_moe/constants.rs"]
+mod gemma4_constants;
+#[path = "engine/gemma4_moe/metal_context.rs"]
+mod gemma4_metal_context;
+#[path = "engine/gemma4_moe/metal_kernels.rs"]
+mod gemma4_metal_kernels;
+#[path = "engine/gemma4_moe/engine.rs"]
+mod gemma4_engine;
 
 use crate::engine::qwen35_constants::{FullModel, StrippedModel};
 use crate::engine::fused_exp1::FusedExp1;

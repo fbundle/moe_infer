@@ -9,7 +9,14 @@
 //!   - 5:1 sliding:full layer pattern (every 6th layer is full attention).
 //!   - Two RoPE configurations — sliding layers use theta=10k, full layers
 //!     use theta=1M with a 25% partial-rotary factor.
-//!   - No shared expert (the "always-on" expert that Qwen3.6 has).
+//!   - **Dual FFN per layer** (per MLX-LM source): a dense MLP at
+//!     INTERMEDIATE_SIZE=2112 running on every token, PLUS a sparse
+//!     experts path (128 experts, top-8) at MOE_INTERMEDIATE=704. Both
+//!     paths use their own pre/post FFN norms (hence the _1 / _2 suffix
+//!     variants in the tensor names). This is unlike Qwen3.6's shared-
+//!     expert design where the "shared" part is a small 512-dim expert;
+//!     in Gemma 4 the always-on path is the full dense MLP and the routed
+//!     experts are extras on top.
 //!   - GELU activation (gelu_pytorch_tanh) instead of SwiGLU.
 //!   - Tied input/output word embeddings (no separate lm_head matrix).
 //!   - Final logit softcapping: y = 30 * tanh(x / 30).
@@ -32,11 +39,13 @@ pub trait Gemma4ModelConfig: 'static {
     const VOCAB_SIZE: usize;
     const INTERMEDIATE_SIZE: usize;       // dense FFN intermediate (for non-MoE layers if any)
 
-    // MoE
+    // MoE (sparse experts path; runs on top of the always-on dense MLP)
     const NUM_EXPERTS: usize;
     const NUM_EXPERTS_PER_TOK: usize;
     const MOE_INTERMEDIATE: usize;        // per-expert intermediate size
-    // No SHARED_INTERMEDIATE — Gemma 4 has no shared expert.
+    // NOTE: Gemma 4 has no small "shared expert" like Qwen3.6. Instead it
+    // has the full dense MLP (sized INTERMEDIATE_SIZE) running on every
+    // token in parallel with the sparse experts. See `INTERMEDIATE_SIZE`.
 
     // Attention type pattern
     /// Length of one period of the attention pattern. For 26B-A4B this is 6

@@ -26,8 +26,8 @@ use crate::engine::{Engine, SignalCheckFn, TelemetryValue};
 use crate::error::MoEError;
 use crate::model::Model;
 
-use super::constants::Gemma4ModelConfig;
-use super::metal_context::Gemma4MetalContext;
+use crate::engine::gemma4_constants::Gemma4ModelConfig;
+use crate::engine::gemma4_metal_context::Gemma4MetalContext;
 
 pub struct Gemma4Fused<C: Gemma4ModelConfig> {
     pub model: Arc<Model>,
@@ -92,31 +92,69 @@ impl<C: Gemma4ModelConfig> Engine for Gemma4Fused<C> {
         _check_signal: SignalCheckFn<'_>,
         _mtp: bool,
     ) -> Result<Vec<f32>, MoEError> {
-        // Per-token forward outline (TODO: implement):
+        // Per-token forward outline (TODO: implement). Based on actual
+        // tensor names from unsloth/gemma-4-26b-a4b-it-UD-MLX-4bit:
         //
         // For each token:
         //   for each layer:
-        //     input_layernorm  → buf_input
-        //     q/k/v projections (matvec_bf16)
-        //     q_norm, k_norm
-        //     RoPE (sliding-variant for non-full, full-variant for full):
-        //       sliding: theta=10k, rotary_dim = head_dim
-        //       full:    theta=1M,  rotary_dim = head_dim / 4
+        //     # ── Attention block ─────────────────────────────────────
+        //     x = input_layernorm(hidden)
+        //     q = q_proj(x);  q = q_norm(q)
+        //     k = k_proj(x);  k = k_norm(k)
+        //     v = v_proj(x)
+        //     RoPE on q,k:
+        //       sliding layers (5 of 6): theta=10k, rotary_dim=head_dim
+        //       full layers (1 of 6):    theta=1M,  rotary_dim=head_dim/4
         //     KV write (sliding ring vs full append)
-        //     SDPA (sliding-masked vs full causal)
-        //     o_proj
-        //     residual + post_attention_layernorm
-        //     MoE: router → top-8 → 128 experts → no shared expert
-        //     pre_feedforward_layernorm before MoE? TODO: verify order
-        //     gelu-gated FFN per expert
-        //     down_proj
-        //     combine + residual + post_feedforward_layernorm
+        //     attn_out = SDPA(q, k_cache, v_cache):
+        //       sliding-masked for sliding layers (window=1024)
+        //       full causal for full layers
+        //     attn_out = o_proj(attn_out)
+        //     hidden = hidden + post_attention_layernorm(attn_out)
         //
-        // final_norm
-        // lm_head — tied: dot against embed_tokens.weight^T
-        // logit softcap: 30 * tanh(logits / 30)
+        //     # ── Dual FFN ────────────────────────────────────────────
+        //     # Dense MLP path (always on; intermediate_size=2112):
+        //     y_dense = pre_feedforward_layernorm(hidden)
+        //     dense_out = mlp_down(gelu(mlp_gate(y_dense)) * mlp_up(y_dense))
+        //     dense_out = post_feedforward_layernorm(dense_out)
+        //
+        //     # Sparse experts path (top-8 of 128; moe_intermediate=704):
+        //     y_expert = pre_feedforward_layernorm_2(hidden)
+        //     router_logits = router_proj(y_expert)
+        //     router_logits = router_logits * router.scale + router.per_expert_scale
+        //     router_logits = post_feedforward_layernorm_1(router_logits)  # ← TODO: verify
+        //     idx, weights = top_k(softmax(router_logits), k=8)
+        //     expert_out = 0
+        //     for ki in 0..8:
+        //       e = idx[ki]
+        //       gate = SwitchGLU.gate_proj[e] @ y_expert
+        //       up   = SwitchGLU.up_proj[e]   @ y_expert
+        //       act  = gelu(gate) * up
+        //       expert_out += weights[ki] * (SwitchGLU.down_proj[e] @ act)
+        //     expert_out = post_feedforward_layernorm_2(expert_out)
+        //
+        //     # Combine paths and apply per-layer scalar:
+        //     hidden = hidden + layer_scalar * (dense_out + expert_out)
+        //     # (the exact gating/scaling formula needs verification against
+        //     # mlx-lm's Gemma4DecoderLayer.forward — TODO.)
+        //
+        //   # ── Output ──────────────────────────────────────────────────
+        //   x = model.norm(hidden)
+        //   logits = x @ embed_tokens.weight.T   # tied — no separate lm_head
+        //   logits = 30 * tanh(logits / 30)      # final softcap
         //
         // Return logits[n, vocab_size].
+        //
+        // CRITICAL TODOs before this can be implemented:
+        //   1. Verify the dual-FFN combination formula against mlx-lm's
+        //      Gemma4DecoderLayer source. The naming `_1` / `_2` suggests
+        //      multiple stages but the actual graph topology needs reading.
+        //   2. Verify `layer_scalar` semantics — multiplicative on the
+        //      combined FFN output, or per-path, or something else.
+        //   3. Verify whether `pre_feedforward_layernorm_2` is on the
+        //      experts input or on something else (the router?).
+        //   4. Verify whether Q is scaled by 1/sqrt(head_dim) or by the
+        //      query_pre_attn_scalar (the config has both).
 
         unimplemented!("Gemma4Fused::forward_hidden — Phase 2 work");
     }
