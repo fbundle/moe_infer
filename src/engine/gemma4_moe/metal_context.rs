@@ -37,6 +37,7 @@ pub struct Gemma4MetalContext {
     pub gelu_fused: ComputePipelineState,
     pub logit_softcap: ComputePipelineState,
     pub attn_sdpa_sliding_causal: ComputePipelineState,
+    pub attn_sdpa_causal_h512: ComputePipelineState,
     pub rms_norm_no_scale: ComputePipelineState,
     pub q_head_norm_rope_no_gate: ComputePipelineState,
     pub mul_scalar_bf16: ComputePipelineState,
@@ -120,6 +121,7 @@ impl Gemma4MetalContext {
         let gelu_fused             = make("gelu_fused")?;
         let logit_softcap          = make("logit_softcap")?;
         let attn_sdpa_sliding_causal = make("attn_sdpa_sliding_causal")?;
+        let attn_sdpa_causal_h512  = make("attn_sdpa_causal_h512")?;
         let rms_norm_no_scale      = make("rms_norm_no_scale")?;
         let q_head_norm_rope_no_gate = make("q_head_norm_rope_no_gate")?;
         let mul_scalar_bf16        = make("mul_scalar_bf16")?;
@@ -141,8 +143,19 @@ impl Gemma4MetalContext {
 
         let alloc = |elements: usize| metal_buf_shared(&device, elements * 4);
 
-        let kv_caches_k: Vec<Buffer> = (0..num_layers).map(|_| alloc(crate::constants::MAX_SEQ * kv_dim_max)).collect();
-        let kv_caches_v: Vec<Buffer> = (0..num_layers).map(|_| alloc(crate::constants::MAX_SEQ * kv_dim_max)).collect();
+        // Per-layer KV cache. Sliding layers use NUM_KV_HEADS×HEAD_DIM (=8×256=2048);
+        // full layers use NUM_KV_HEADS_FULL×global_head_dim (=2×512=1024). The
+        // SDPA kernels stride by `kv_dim` so the cache layout must match exactly.
+        let sliding_kv_dim = C::NUM_KV_HEADS * C::HEAD_DIM;
+        let full_kv_dim    = C::NUM_KV_HEADS_FULL * global_head_dim;
+        let kv_dim_for_layer = |li: usize| -> usize {
+            if C::is_full_attn_layer(li) { full_kv_dim } else { sliding_kv_dim }
+        };
+        let kv_caches_k: Vec<Buffer> = (0..num_layers)
+            .map(|li| alloc(crate::constants::MAX_SEQ * kv_dim_for_layer(li))).collect();
+        let kv_caches_v: Vec<Buffer> = (0..num_layers)
+            .map(|li| alloc(crate::constants::MAX_SEQ * kv_dim_for_layer(li))).collect();
+        let _ = kv_dim_max;
 
         let mut expert_buffer = ExpertBuffer::new(&device, expert_size, hidden, moe_inter, moe_inter);
         if expert_cache_count > 0 {
@@ -202,6 +215,7 @@ impl Gemma4MetalContext {
             gelu_fused,
             logit_softcap,
             attn_sdpa_sliding_causal,
+            attn_sdpa_causal_h512,
             rms_norm_no_scale,
             q_head_norm_rope_no_gate,
             mul_scalar_bf16,

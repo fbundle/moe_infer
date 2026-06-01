@@ -62,6 +62,39 @@ pub fn encode_attn_sdpa_sliding_causal(
     );
 }
 
+/// Full causal SDPA for Gemma 4 full-attention layers — head_dim=512 hard-
+/// coded in the kernel; kv_dim and heads_per_kv passed at runtime.
+pub fn encode_attn_sdpa_causal_h512(
+    ctx: &Gemma4MetalContext,
+    encoder: &ComputeCommandEncoderRef,
+    q: &BufferRef, q_offset: u64,
+    k_cache: &BufferRef,
+    v_cache: &BufferRef,
+    out: &BufferRef, o_offset: u64,
+    seq_len: u32,
+    num_q_heads: u32,
+    kv_dim: u32,
+    heads_per_kv: u32,
+) {
+    let pipeline = &ctx.attn_sdpa_causal_h512;
+    encoder.set_compute_pipeline_state(pipeline);
+    encoder.set_buffer(0, Some(q), q_offset);
+    encoder.set_buffer(1, Some(k_cache), 0);
+    encoder.set_buffer(2, Some(v_cache), 0);
+    encoder.set_buffer(3, Some(out), o_offset);
+    let scale = 1.0f32 / (512.0f32).sqrt();
+    unsafe {
+        set_u32(encoder, 4, seq_len);
+        set_f32(encoder, 5, scale);
+        set_u32(encoder, 6, kv_dim);
+        set_u32(encoder, 7, heads_per_kv);
+    }
+    encoder.dispatch_thread_groups(
+        MTLSize::new(num_q_heads as u64, 1, 1),
+        MTLSize::new(256, 1, 1),
+    );
+}
+
 /// RMSNorm without learnable scale — for Gemma 4's v_norm on full layers.
 /// Per-head: dispatches num_heads threadgroups; each TG normalises its
 /// `head_dim` elements of `x` into `out`.

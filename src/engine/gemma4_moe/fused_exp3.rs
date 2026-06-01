@@ -375,30 +375,201 @@ impl<C: Gemma4ModelConfig> Gemma4Fused<C> {
             hidden_dim,
         );
 
-        // ── Dual FFN block (still on the same command buffer) ──────────────
-        // Save residual for the post-FFN add. Reuse buf_ff_combined as the
-        // residual mirror — cheap CPU copy of [HIDDEN_DIM] f32 once.
-        // (Alternative would be a Metal blit; the CPU memcpy on shared mem
-        //  is fine for hidden_dim=2816.)
-        let inter = C::INTERMEDIATE_SIZE as u32;
-        let moe_inter = C::MOE_INTERMEDIATE as u32;
-        let num_experts = C::NUM_EXPERTS as u32;
-
-        // Need to flush the attention block before the CPU peek for residual.
         enc.end_encoding();
         cmd_buf.commit();
         cmd_buf.wait_until_completed();
 
-        // Snapshot residual = buf_hidden (post-attention) into buf_ff_combined.
+        // ── Dual FFN block (shared with forward_full_layer) ─────────────────
+        self.forward_dual_ffn(&prefix)
+    }
+
+    /// One full-attention layer's forward pass (Gemma 4: every 6th layer in
+    /// 26B-A4B). Differences from forward_sliding_layer's attention block:
+    ///
+    ///   - head_dim = global_head_dim = 512 (vs 256 sliding)
+    ///   - num_kv_heads = NUM_KV_HEADS_FULL = 2 (vs 8 sliding)
+    ///   - NO v_proj weight (attention_k_eq_v=True): V = raw K, BEFORE k_norm
+    ///   - v_norm = rms_norm_no_scale (no learnable weight, same as sliding's)
+    ///   - RoPE: theta=1M, partial rotary (first 25% = head_dim/4 = 128 dims)
+    ///   - SDPA: full causal (no sliding-window restriction), head_dim=512
+    ///     kernel (`attn_sdpa_causal_h512`)
+    ///
+    /// The dual-FFN block is identical to sliding layers, so we reuse the
+    /// same orchestration code at the end. To avoid duplication we factor
+    /// the FFN block into `forward_dual_ffn` and call it from both layer
+    /// types.
+    fn forward_full_layer(&mut self, layer: usize, pos: u32) -> Result<(), MoEError> {
+        use crate::engine::gemma4_metal_kernels as gk;
+        let hidden_dim   = C::HIDDEN_DIM as u32;
+        let head_dim_full: u32 = (C::HEAD_DIM * 2) as u32;     // global_head_dim = 512
+        let n_q_heads    = C::NUM_ATTN_HEADS as u32;
+        let n_kv_heads_f = C::NUM_KV_HEADS_FULL as u32;
+        let q_dim_full   = n_q_heads * head_dim_full;          // 16*512 = 8192
+        let kv_dim_full  = n_kv_heads_f * head_dim_full;       // 2*512 = 1024
+        let rope_theta   = C::ROPE_THETA_FULL as f32;
+        let rotary_dim   = (head_dim_full as f32 * C::PARTIAL_ROTARY_FRACTION_FULL) as u32;
+        // For partial_rotary_factor=0.25, head_dim=512 → rotary_dim=128.
+        debug_assert!(rotary_dim > 0 && rotary_dim <= head_dim_full,
+                      "rotary_dim out of range: {} (head_dim={})", rotary_dim, head_dim_full);
+
+        let prefix = format!("language_model.model.layers.{}", layer);
+        let off_input_ln     = self.tensor_offset_required(&format!("{}.input_layernorm.weight", prefix));
+        let off_q_proj_w     = self.tensor_offset_required(&format!("{}.self_attn.q_proj.weight", prefix));
+        let off_k_proj_w     = self.tensor_offset_required(&format!("{}.self_attn.k_proj.weight", prefix));
+        let off_o_proj_w     = self.tensor_offset_required(&format!("{}.self_attn.o_proj.weight", prefix));
+        let off_q_norm_w     = self.tensor_offset_required(&format!("{}.self_attn.q_norm.weight", prefix));
+        let off_k_norm_w     = self.tensor_offset_required(&format!("{}.self_attn.k_norm.weight", prefix));
+        let off_post_attn_ln = self.tensor_offset_required(&format!("{}.post_attention_layernorm.weight", prefix));
+        // No v_proj on full layers — attention_k_eq_v=True (verified by
+        // safetensors inspection: layer 5 has no self_attn.v_proj.weight).
+
+        let wbuf = &self.weight_buffer.buf;
+        let ctx = &self.ctx;
+
+        // ── Attention block ─────────────────────────────────────────────────
+        let cmd_buf = ctx.queue.new_command_buffer();
+        let enc = cmd_buf.new_compute_command_encoder();
+
+        // 1. input_layernorm
+        gk::encode_rms_norm_fused_bf16(
+            ctx, enc,
+            &ctx.buf_hidden, 0,
+            wbuf, off_input_ln,
+            &ctx.buf_input_normed, 0,
+            hidden_dim,
+        );
+        // 2. Q projection (out = q_dim_full = 8192)
+        gk::encode_matvec_bf16(
+            ctx, enc,
+            wbuf, off_q_proj_w,
+            &ctx.buf_input_normed, 0,
+            &ctx.buf_q, 0,
+            q_dim_full, hidden_dim,
+        );
+        // 3. K projection (out = kv_dim_full = 1024) — also serves as raw V
+        gk::encode_matvec_bf16(
+            ctx, enc,
+            wbuf, off_k_proj_w,
+            &ctx.buf_input_normed, 0,
+            &ctx.buf_k, 0,
+            kv_dim_full, hidden_dim,
+        );
+
+        enc.end_encoding();
+        cmd_buf.commit();
+        cmd_buf.wait_until_completed();
+
+        // 4. V = raw K (before k_norm/RoPE). Copy on shared memory now,
+        //    before k_norm runs in-place on buf_k.
         unsafe {
             std::ptr::copy_nonoverlapping(
-                ctx.buf_hidden.contents() as *const f32,
-                ctx.buf_ff_combined.contents() as *mut f32,
-                C::HIDDEN_DIM,
+                ctx.buf_k.contents() as *const f32,
+                ctx.buf_v.contents() as *mut f32,
+                kv_dim_full as usize,
             );
         }
 
-        // ── Tensor offsets for the FFN block (all BF16) ────────────────────
+        // 5. Q head-norm + RoPE (partial rotary, theta=1M).
+        //    q_head_norm_rope_no_gate already supports head_dim up to 512
+        //    via its partial[512] threadgroup buffer.
+        let cmd_buf_qk = ctx.queue.new_command_buffer();
+        let enc_qk = cmd_buf_qk.new_compute_command_encoder();
+        gk::encode_q_head_norm_rope_no_gate(
+            ctx, enc_qk,
+            &ctx.buf_q, 0,
+            wbuf, off_q_norm_w,
+            &ctx.buf_q, 0,
+            n_q_heads, head_dim_full, rotary_dim,
+            rope_theta, pos,
+        );
+        // 6. K head-norm + RoPE — use q_head_norm_rope_no_gate for K too;
+        //    structurally identical (no gate split), and supports head_dim
+        //    up to 512 (qwen35's k_head_norm_rope only supports up to 256).
+        gk::encode_q_head_norm_rope_no_gate(
+            ctx, enc_qk,
+            &ctx.buf_k, 0,
+            wbuf, off_k_norm_w,
+            &ctx.buf_k, 0,
+            n_kv_heads_f, head_dim_full, rotary_dim,
+            rope_theta, pos,
+        );
+        // 7. v_norm (RMSNormNoScale, per-head)
+        gk::encode_rms_norm_no_scale(
+            ctx, enc_qk,
+            &ctx.buf_v, 0,
+            &ctx.buf_v, 0,
+            n_kv_heads_f, head_dim_full, crate::constants::RMS_NORM_EPS,
+        );
+        // 8. KV cache append (kv_dim = kv_dim_full = 1024)
+        gk::encode_kv_cache_append(
+            ctx, enc_qk,
+            &ctx.buf_k, &ctx.buf_v,
+            &ctx.kv_caches_k[layer], &ctx.kv_caches_v[layer],
+            pos, kv_dim_full,
+        );
+        // 9. Full-causal SDPA (head_dim=512 kernel)
+        let heads_per_kv_f = n_q_heads / n_kv_heads_f;
+        gk::encode_attn_sdpa_causal_h512(
+            ctx, enc_qk,
+            &ctx.buf_q, 0,
+            &ctx.kv_caches_k[layer], &ctx.kv_caches_v[layer],
+            &ctx.buf_attn_out, 0,
+            pos + 1,
+            n_q_heads, kv_dim_full, heads_per_kv_f,
+        );
+        // 10. o_proj: [hidden, q_dim_full]
+        gk::encode_matvec_bf16(
+            ctx, enc_qk,
+            wbuf, off_o_proj_w,
+            &ctx.buf_attn_out, 0,
+            &ctx.buf_o_proj_out, 0,
+            hidden_dim, q_dim_full,
+        );
+        // 11. post_attention_layernorm + first residual
+        gk::encode_rms_norm_fused_bf16(
+            ctx, enc_qk,
+            &ctx.buf_o_proj_out, 0,
+            wbuf, off_post_attn_ln,
+            &ctx.buf_post_attn_normed, 0,
+            hidden_dim,
+        );
+        gk::encode_residual_add(
+            ctx, enc_qk,
+            &ctx.buf_hidden, 0,
+            &ctx.buf_post_attn_normed, 0,
+            &ctx.buf_hidden, 0,
+            hidden_dim,
+        );
+
+        enc_qk.end_encoding();
+        cmd_buf_qk.commit();
+        cmd_buf_qk.wait_until_completed();
+
+        // ── Dual-FFN block (identical to sliding layers) ────────────────────
+        self.forward_dual_ffn(&prefix)
+    }
+
+    /// Dual-FFN block — extracted from forward_sliding_layer so full layers
+    /// can reuse it. Operates on buf_hidden in-place: reads the post-attention
+    /// hidden state, writes back the final layer output (after layer_scalar).
+    ///
+    /// Order:
+    ///   residual_snapshot = buf_hidden  (via CPU memcpy → buf_ff_combined)
+    ///   Dense MLP path → buf_mlp_post
+    ///   Router (norm + matvec + CPU top-K/softmax/per_expert_scale)
+    ///   Experts (K iterations, weighted CPU accumulate) → buf_expert_out
+    ///   post_feedforward_layernorm_2 → buf_expert_post
+    ///   combine: buf_mlp_post + buf_expert_post → buf_ff_outer_post
+    ///   outer post_feedforward_layernorm → buf_ff_outer_post (in-place)
+    ///   second residual: residual_snapshot + buf_ff_outer_post → buf_hidden
+    ///   layer_scalar: buf_hidden *= bf16 scalar
+    fn forward_dual_ffn(&mut self, prefix: &str) -> Result<(), MoEError> {
+        use crate::engine::gemma4_metal_kernels as gk;
+        let hidden_dim  = C::HIDDEN_DIM as u32;
+        let inter       = C::INTERMEDIATE_SIZE as u32;
+        let moe_inter   = C::MOE_INTERMEDIATE as u32;
+        let num_experts = C::NUM_EXPERTS as u32;
+
         let off_pre_ff_ln      = self.tensor_offset_required(&format!("{}.pre_feedforward_layernorm.weight", prefix));
         let off_pre_ff_ln_2    = self.tensor_offset_required(&format!("{}.pre_feedforward_layernorm_2.weight", prefix));
         let off_post_ff_ln     = self.tensor_offset_required(&format!("{}.post_feedforward_layernorm.weight", prefix));
@@ -414,129 +585,64 @@ impl<C: Gemma4ModelConfig> Gemma4Fused<C> {
         let off_experts_down   = self.tensor_offset_required(&format!("{}.experts.down_proj", prefix));
         let off_layer_scalar   = self.tensor_offset_required(&format!("{}.layer_scalar", prefix));
 
-        // ── Start a second command buffer for the dense MLP path + router ──
+        let wbuf = &self.weight_buffer.buf;
+        let ctx = &self.ctx;
+
+        // Snapshot residual.
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                ctx.buf_hidden.contents() as *const f32,
+                ctx.buf_ff_combined.contents() as *mut f32,
+                C::HIDDEN_DIM,
+            );
+        }
+
+        // Dense MLP path + Router (single cmd buf).
         let cmd_buf2 = ctx.queue.new_command_buffer();
         let enc2 = cmd_buf2.new_compute_command_encoder();
-
-        // Dense MLP path. mlp.gate_proj/up_proj have shape [INTERMEDIATE=2112, HIDDEN].
-        gk::encode_rms_norm_fused_bf16(
-            ctx, enc2,
-            &ctx.buf_hidden, 0,
-            wbuf, off_pre_ff_ln,
-            &ctx.buf_pre_ff_normed, 0,
-            hidden_dim,
-        );
-        gk::encode_matvec_bf16(
-            ctx, enc2,
-            wbuf, off_mlp_gate_w,
-            &ctx.buf_pre_ff_normed, 0,
-            &ctx.buf_mlp_gate, 0,
-            inter, hidden_dim,
-        );
-        gk::encode_matvec_bf16(
-            ctx, enc2,
-            wbuf, off_mlp_up_w,
-            &ctx.buf_pre_ff_normed, 0,
-            &ctx.buf_mlp_up, 0,
-            inter, hidden_dim,
-        );
-        gk::encode_gelu_fused(
-            ctx, enc2,
-            &ctx.buf_mlp_gate, 0,
-            &ctx.buf_mlp_up,   0,
-            &ctx.buf_mlp_act,  0,
-            inter,
-        );
-        // mlp.down_proj has shape [HIDDEN, INTERMEDIATE].
-        gk::encode_matvec_bf16(
-            ctx, enc2,
-            wbuf, off_mlp_down_w,
-            &ctx.buf_mlp_act, 0,
-            &ctx.buf_mlp_down, 0,
-            hidden_dim, inter,
-        );
-        gk::encode_rms_norm_fused_bf16(
-            ctx, enc2,
-            &ctx.buf_mlp_down, 0,
-            wbuf, off_post_ff_ln_1,
-            &ctx.buf_mlp_post, 0,
-            hidden_dim,
-        );
-
-        // Router. rms_norm_router uses per-channel router.scale × sqrt(hidden)^-1.
-        gk::encode_rms_norm_router(
-            ctx, enc2,
-            &ctx.buf_hidden, 0,
-            wbuf, off_router_scale,
-            &ctx.buf_router_normed, 0,
-            hidden_dim,
-        );
-        gk::encode_matvec_bf16(
-            ctx, enc2,
-            wbuf, off_router_proj,
-            &ctx.buf_router_normed, 0,
-            &ctx.buf_router_logits, 0,
-            num_experts, hidden_dim,
-        );
-
+        gk::encode_rms_norm_fused_bf16(ctx, enc2, &ctx.buf_hidden, 0, wbuf, off_pre_ff_ln, &ctx.buf_pre_ff_normed, 0, hidden_dim);
+        gk::encode_matvec_bf16(ctx, enc2, wbuf, off_mlp_gate_w, &ctx.buf_pre_ff_normed, 0, &ctx.buf_mlp_gate, 0, inter, hidden_dim);
+        gk::encode_matvec_bf16(ctx, enc2, wbuf, off_mlp_up_w,   &ctx.buf_pre_ff_normed, 0, &ctx.buf_mlp_up,   0, inter, hidden_dim);
+        gk::encode_gelu_fused(ctx, enc2, &ctx.buf_mlp_gate, 0, &ctx.buf_mlp_up, 0, &ctx.buf_mlp_act, 0, inter);
+        gk::encode_matvec_bf16(ctx, enc2, wbuf, off_mlp_down_w, &ctx.buf_mlp_act, 0, &ctx.buf_mlp_down, 0, hidden_dim, inter);
+        gk::encode_rms_norm_fused_bf16(ctx, enc2, &ctx.buf_mlp_down, 0, wbuf, off_post_ff_ln_1, &ctx.buf_mlp_post, 0, hidden_dim);
+        gk::encode_rms_norm_router(ctx, enc2, &ctx.buf_hidden, 0, wbuf, off_router_scale, &ctx.buf_router_normed, 0, hidden_dim);
+        gk::encode_matvec_bf16(ctx, enc2, wbuf, off_router_proj, &ctx.buf_router_normed, 0, &ctx.buf_router_logits, 0, num_experts, hidden_dim);
         enc2.end_encoding();
         cmd_buf2.commit();
         cmd_buf2.wait_until_completed();
 
-        // ── CPU: top-K over router_logits, then softmax over the K winners,
-        //        then multiply by per_expert_scale[indices].
+        // CPU: top-K + softmax + per_expert_scale.
         let logits_ptr = ctx.buf_router_logits.contents() as *const f32;
-        let logits: &[f32] = unsafe {
-            std::slice::from_raw_parts(logits_ptr, C::NUM_EXPERTS)
-        };
+        let logits: &[f32] = unsafe { std::slice::from_raw_parts(logits_ptr, C::NUM_EXPERTS) };
         let k = self.num_active_experts;
         let mut idx: Vec<usize> = (0..C::NUM_EXPERTS).collect();
         idx.sort_by(|&a, &b| logits[b].partial_cmp(&logits[a]).unwrap_or(std::cmp::Ordering::Equal));
         let top_idx: Vec<usize> = idx[..k].to_vec();
         let mut top_w: Vec<f32> = top_idx.iter().map(|&i| logits[i]).collect();
-        // Softmax over the top-K.
         let mx = top_w.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
         let mut sum = 0.0f32;
         for w in top_w.iter_mut() { *w = (*w - mx).exp(); sum += *w; }
         for w in top_w.iter_mut() { *w /= sum; }
-        // Multiply by per_expert_scale.
         let pes_ptr = self.weight_buffer.base as usize + off_per_expert_sc as usize;
         for (ki, &e) in top_idx.iter().enumerate() {
             let raw = unsafe { *(pes_ptr as *const u16).add(e) };
             top_w[ki] *= bf16_to_f32(raw);
         }
 
-        // ── Experts path. Each expert: gate (slice of gate_up_proj), up
-        //    (next slice), down (slice of down_proj). HF layout:
-        //      experts.gate_up_proj : [128, 2*moe_inter=1408, hidden=2816]
-        //        Per-expert slice  : [1408, 2816] (rows 0..704 gate, 704..1408 up)
-        //      experts.down_proj   : [128, hidden=2816, moe_inter=704]
-        //        Per-expert slice  : [2816, 704]
-        //    All BF16. Byte offsets are per-expert constants we add to the
-        //    base tensor offset.
-        // pre_feedforward_layernorm_2 → buf_pre_ff_normed_2 (input to experts).
+        // pre_feedforward_layernorm_2 → buf_pre_ff_normed_2.
         {
             let cb = ctx.queue.new_command_buffer();
             let e = cb.new_compute_command_encoder();
-            gk::encode_rms_norm_fused_bf16(
-                ctx, e,
-                &ctx.buf_hidden, 0,
-                wbuf, off_pre_ff_ln_2,
-                &ctx.buf_pre_ff_normed_2, 0,
-                hidden_dim,
-            );
+            gk::encode_rms_norm_fused_bf16(ctx, e, &ctx.buf_hidden, 0, wbuf, off_pre_ff_ln_2, &ctx.buf_pre_ff_normed_2, 0, hidden_dim);
             e.end_encoding();
             cb.commit();
             cb.wait_until_completed();
         }
 
-        // Zero buf_expert_out (we'll accumulate into it across K experts).
+        // Zero expert_out for accumulation.
         unsafe {
-            std::ptr::write_bytes(
-                ctx.buf_expert_out.contents() as *mut u8,
-                0,
-                C::HIDDEN_DIM * 4,
-            );
+            std::ptr::write_bytes(ctx.buf_expert_out.contents() as *mut u8, 0, C::HIDDEN_DIM * 4);
         }
 
         let bf16_bytes: u64 = 2;
@@ -550,94 +656,29 @@ impl<C: Gemma4ModelConfig> Gemma4Fused<C> {
             let expert_down_off = off_experts_down + e_u64 * per_expert_down_bytes;
             let cb = ctx.queue.new_command_buffer();
             let enc_e = cb.new_compute_command_encoder();
-            // gate weight = first [moe_inter, hidden] block at expert_gu_off
-            gk::encode_matvec_bf16(
-                ctx, enc_e,
-                wbuf, expert_gu_off,
-                &ctx.buf_pre_ff_normed_2, 0,
-                &ctx.buf_expert_gate, 0,
-                moe_inter, hidden_dim,
-            );
-            // up weight = next [moe_inter, hidden] block (shifted by gate_block_bytes)
-            gk::encode_matvec_bf16(
-                ctx, enc_e,
-                wbuf, expert_gu_off + gate_block_bytes,
-                &ctx.buf_pre_ff_normed_2, 0,
-                &ctx.buf_expert_up, 0,
-                moe_inter, hidden_dim,
-            );
-            gk::encode_gelu_fused(
-                ctx, enc_e,
-                &ctx.buf_expert_gate, 0,
-                &ctx.buf_expert_up,   0,
-                &ctx.buf_expert_act,  0,
-                moe_inter,
-            );
-            gk::encode_matvec_bf16(
-                ctx, enc_e,
-                wbuf, expert_down_off,
-                &ctx.buf_expert_act, 0,
-                &ctx.buf_expert_post, 0,
-                hidden_dim, moe_inter,
-            );
+            gk::encode_matvec_bf16(ctx, enc_e, wbuf, expert_gu_off,                     &ctx.buf_pre_ff_normed_2, 0, &ctx.buf_expert_gate, 0, moe_inter, hidden_dim);
+            gk::encode_matvec_bf16(ctx, enc_e, wbuf, expert_gu_off + gate_block_bytes,  &ctx.buf_pre_ff_normed_2, 0, &ctx.buf_expert_up,   0, moe_inter, hidden_dim);
+            gk::encode_gelu_fused(ctx, enc_e, &ctx.buf_expert_gate, 0, &ctx.buf_expert_up, 0, &ctx.buf_expert_act, 0, moe_inter);
+            gk::encode_matvec_bf16(ctx, enc_e, wbuf, expert_down_off, &ctx.buf_expert_act, 0, &ctx.buf_expert_post, 0, hidden_dim, moe_inter);
             enc_e.end_encoding();
             cb.commit();
             cb.wait_until_completed();
-            // CPU weighted-accumulate on shared memory.
             let post_ptr = ctx.buf_expert_post.contents() as *const f32;
             let out_ptr  = ctx.buf_expert_out.contents()  as *mut f32;
             let w_ki = top_w[ki];
             unsafe {
-                for j in 0..C::HIDDEN_DIM {
-                    *out_ptr.add(j) += *post_ptr.add(j) * w_ki;
-                }
+                for j in 0..C::HIDDEN_DIM { *out_ptr.add(j) += *post_ptr.add(j) * w_ki; }
             }
         }
 
-        // ── Outer FFN norms + combine + residual + layer_scalar ─────────────
+        // Outer FFN.
         let cmd_buf4 = ctx.queue.new_command_buffer();
         let enc4 = cmd_buf4.new_compute_command_encoder();
-
-        // post_feedforward_layernorm_2 on the experts sum.
-        gk::encode_rms_norm_fused_bf16(
-            ctx, enc4,
-            &ctx.buf_expert_out, 0,
-            wbuf, off_post_ff_ln_2,
-            &ctx.buf_expert_post, 0,
-            hidden_dim,
-        );
-        // Combine dense + experts: buf_ff_outer_post = buf_mlp_post + buf_expert_post
-        gk::encode_residual_add(
-            ctx, enc4,
-            &ctx.buf_mlp_post, 0,
-            &ctx.buf_expert_post, 0,
-            &ctx.buf_ff_outer_post, 0,
-            hidden_dim,
-        );
-        // Outer post_feedforward_layernorm on the combined FFN output.
-        gk::encode_rms_norm_fused_bf16(
-            ctx, enc4,
-            &ctx.buf_ff_outer_post, 0,
-            wbuf, off_post_ff_ln,
-            &ctx.buf_ff_outer_post, 0,             // in-place OK
-            hidden_dim,
-        );
-        // Second residual: buf_hidden = (saved residual in buf_ff_combined) + buf_ff_outer_post.
-        gk::encode_residual_add(
-            ctx, enc4,
-            &ctx.buf_ff_combined,  0,   // saved residual snapshot
-            &ctx.buf_ff_outer_post, 0,
-            &ctx.buf_hidden,        0,
-            hidden_dim,
-        );
-        // Apply per-layer scalar: buf_hidden *= bf16 layer_scalar[0].
-        gk::encode_mul_scalar_bf16(
-            ctx, enc4,
-            &ctx.buf_hidden, 0,
-            wbuf, off_layer_scalar,
-            hidden_dim,
-        );
-
+        gk::encode_rms_norm_fused_bf16(ctx, enc4, &ctx.buf_expert_out,     0, wbuf, off_post_ff_ln_2, &ctx.buf_expert_post, 0, hidden_dim);
+        gk::encode_residual_add(       ctx, enc4, &ctx.buf_mlp_post,       0, &ctx.buf_expert_post,   0, &ctx.buf_ff_outer_post, 0, hidden_dim);
+        gk::encode_rms_norm_fused_bf16(ctx, enc4, &ctx.buf_ff_outer_post,  0, wbuf, off_post_ff_ln,   &ctx.buf_ff_outer_post, 0, hidden_dim);
+        gk::encode_residual_add(       ctx, enc4, &ctx.buf_ff_combined,    0, &ctx.buf_ff_outer_post, 0, &ctx.buf_hidden, 0, hidden_dim);
+        gk::encode_mul_scalar_bf16(    ctx, enc4, &ctx.buf_hidden,         0, wbuf, off_layer_scalar, hidden_dim);
         enc4.end_encoding();
         cmd_buf4.commit();
         cmd_buf4.wait_until_completed();
@@ -876,13 +917,10 @@ impl<C: Gemma4ModelConfig> Engine for Gemma4Fused<C> {
                     return Err(MoEError::Metal("interrupted".into()));
                 }
                 if C::is_full_attn_layer(layer) {
-                    unimplemented!(
-                        "Gemma 4 full-attention layer {} (head_dim=512, partial RoPE, \
-                         attention_k_eq_v): needs the head_dim=512 SDPA kernel — Task 4.",
-                        layer
-                    );
+                    self.forward_full_layer(layer, pos as u32)?;
+                } else {
+                    self.forward_sliding_layer(layer, pos as u32)?;
                 }
-                self.forward_sliding_layer(layer, pos as u32)?;
             }
 
             // Copy final hidden back to CPU for the lm_head pass.

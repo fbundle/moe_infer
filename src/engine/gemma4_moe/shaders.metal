@@ -155,6 +155,135 @@ kernel void attn_sdpa_sliding_causal(
 }
 
 // ============================================================================
+// Full causal SDPA for head_dim=512 — Gemma 4 full-attention layers.
+//
+// Same online-softmax structure as attn_sdpa_sliding_causal, but:
+//   - HEAD_DIM = 512 (Gemma 4's global_head_dim), overriding the qwen35
+//     #define = 256 via a local constexpr.
+//   - V = HEAD_DIM/BD = 512/32 = 16 per-lane accumulator (vs 8 sliding).
+//   - No sliding-window restriction: attends [0, seq_len) (full causal).
+//   - kv_dim and heads_per_kv come from runtime constants because the
+//     5 full layers in 26B-A4B use num_global_key_value_heads=2 (not 8).
+//
+// Threadgroup memory: sg_partial[BN * 512] = 8*512 = 4096 floats = 16 KB.
+// Within Metal's 32 KB TG-memory budget.
+// ============================================================================
+
+kernel void attn_sdpa_causal_h512(
+    device const float* Q              [[buffer(0)]],   // [num_q_heads, 512]
+    device const float* K_cache        [[buffer(1)]],   // [max_seq, kv_dim]
+    device const float* V_cache        [[buffer(2)]],
+    device float*       output         [[buffer(3)]],   // [num_q_heads, 512]
+    constant uint&      seq_len        [[buffer(4)]],
+    constant float&     scale          [[buffer(5)]],
+    constant uint&      kv_dim         [[buffer(6)]],   // num_kv_heads * 512
+    constant uint&      heads_per_kv   [[buffer(7)]],   // num_q_heads / num_kv_heads
+    uint tgid       [[threadgroup_position_in_grid]],   // = query head index
+    uint simd_lane  [[thread_index_in_simdgroup]],
+    uint simd_group [[simdgroup_index_in_threadgroup]]
+) {
+    constexpr uint H  = 512;          // local override of HEAD_DIM
+    constexpr uint BD = 32;
+    constexpr uint BN = 8;
+    constexpr uint V  = H / BD;       // 16
+
+    uint h    = tgid;
+    uint kv_h = h / heads_per_kv;
+
+    device const float* qh = Q + h * H;
+    device const float* k_base = K_cache + kv_h * H;
+    device const float* v_base = V_cache + kv_h * H;
+
+    float q_vals[V];
+    float o_vals[V];
+    for (uint j = 0; j < V; j++) { o_vals[j] = 0.0f; }
+
+    constexpr float log2_e = 1.442695041f;
+    float q_scale = scale * log2_e;
+    uint elem_base = simd_lane * V;
+    for (uint j = 0; j < V; j++) {
+        q_vals[j] = q_scale * qh[elem_base + j];
+    }
+
+    float max_score = -1e30f;
+    float sum_exp   = 0.0f;
+
+    // Full causal: attend positions [0, seq_len).
+    for (uint pos = simd_group; pos < seq_len; pos += BN) {
+        device const float* kp = k_base + pos * kv_dim + elem_base;
+        device const float* vp = v_base + pos * kv_dim + elem_base;
+
+        float score = 0.0f;
+        for (uint j = 0; j < V; j++) {
+            score += q_vals[j] * kp[j];
+        }
+        score = simd_sum(score);
+
+        float new_max   = max(max_score, score);
+        float factor    = fast::exp2(max_score - new_max);
+        float exp_score = fast::exp2(score - new_max);
+
+        max_score = new_max;
+        sum_exp   = sum_exp * factor + exp_score;
+
+        for (uint j = 0; j < V; j++) {
+            o_vals[j] = o_vals[j] * factor + exp_score * vp[j];
+        }
+    }
+
+    threadgroup float sg_max[BD];
+    threadgroup float sg_sum[BN];
+    threadgroup float sg_partial[BN * H];
+
+    sg_max[simd_lane] = -1e30f;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    if (simd_lane == 0) {
+        sg_max[simd_group] = max_score;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    float local_max  = sg_max[simd_lane];
+    float global_max = simd_max(local_max);
+
+    float group_max     = simd_broadcast_first(max_score);
+    float group_sum     = simd_broadcast_first(sum_exp);
+    float rescale       = fast::exp2(group_max - global_max);
+    float rescaled_sum  = group_sum * rescale;
+
+    for (uint j = 0; j < V; j++) {
+        o_vals[j] *= rescale;
+    }
+    for (uint j = 0; j < V; j++) {
+        sg_partial[simd_group * H + elem_base + j] = o_vals[j];
+    }
+    if (simd_lane == 0) {
+        sg_sum[simd_group] = rescaled_sum;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    for (uint j = 0; j < V; j++) {
+        float sum = 0.0f;
+        for (uint g = 0; g < BN; g++) {
+            sum += sg_partial[g * H + elem_base + j];
+        }
+        o_vals[j] = sum;
+    }
+
+    float local_sum  = (simd_lane < BN) ? sg_sum[simd_lane] : 0.0f;
+    float global_sum = simd_sum(local_sum);
+
+    for (uint j = 0; j < V; j++) {
+        o_vals[j] = (global_sum == 0.0f) ? 0.0f : (o_vals[j] / global_sum);
+    }
+
+    device float* out_ptr = output + h * H + elem_base;
+    for (uint j = 0; j < V; j++) {
+        out_ptr[j] = o_vals[j];
+    }
+}
+
+// ============================================================================
 // RMSNorm without learnable weight — for Gemma 4's v_norm on full-attention
 // layers. Returns rms_norm(x) without multiplying by a weight vector.
 // Operates per-head: dispatches one TG per (token, head); each TG normalizes
