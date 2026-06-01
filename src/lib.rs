@@ -16,7 +16,7 @@ mod timer;
 #[path = "quantize/qwen35_moe/bq4.rs"] pub mod bq4;
 #[path = "quantize/qwen35_moe/int4.rs"] pub mod int4;
 
-// Gemma 4 quantize pipeline — scaffold only.
+// Gemma 4 quantize pipeline — BF16 passthrough (first-cut).
 #[path = "quantize/gemma4_moe/bq4.rs"] pub mod gemma4_bq4;
 
 #[cfg(feature = "python-bindings")]
@@ -33,6 +33,7 @@ fn _moe_infer_rs(m: &pyo3::Bound<'_, pyo3::types::PyModule>) -> pyo3::PyResult<(
     m.add_class::<python_bindings::Cache>()?;
     m.add_function(wrap_pyfunction!(python_bindings::record_engine_telemetry, m)?)?;
     m.add_function(wrap_pyfunction!(python_bindings::qwen35_moe_quantize, m)?)?;
+    m.add_function(wrap_pyfunction!(python_bindings::gemma4_moe_quantize, m)?)?;
     m.add_class::<python_bindings::PyHfRepo>()?;
     Ok(())
 }

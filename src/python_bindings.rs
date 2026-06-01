@@ -384,6 +384,22 @@ pub fn qwen35_moe_quantize(
     }
 }
 
+/// Gemma 4 26B-A4B HF→engine BF16 passthrough.
+///
+/// First-cut quantize (technically: no quantization). Renames tensors to
+/// the engine's expected names and writes them as BF16 to
+/// `model_weights.bin`. Sufficient for runtime validation of the Phase 2
+/// forward against MLX-VLM; INT4/INT8 dispatch comes later.
+#[pyfunction]
+#[pyo3(signature = (model_path, output_dir))]
+pub fn gemma4_moe_quantize(
+    model_path: &str,
+    output_dir: &str,
+) -> PyResult<()> {
+    crate::gemma4_bq4::quantize(model_path, output_dir)
+        .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(format!("{:?}", e)))
+}
+
 // ─── HfRepo (HF downloader exposed to Python) ────────────────────────────
 
 #[pyclass(unsendable)]
