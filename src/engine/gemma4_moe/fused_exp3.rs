@@ -375,49 +375,273 @@ impl<C: Gemma4ModelConfig> Gemma4Fused<C> {
             hidden_dim,
         );
 
+        // ── Dual FFN block (still on the same command buffer) ──────────────
+        // Save residual for the post-FFN add. Reuse buf_ff_combined as the
+        // residual mirror — cheap CPU copy of [HIDDEN_DIM] f32 once.
+        // (Alternative would be a Metal blit; the CPU memcpy on shared mem
+        //  is fine for hidden_dim=2816.)
+        let inter = C::INTERMEDIATE_SIZE as u32;
+        let moe_inter = C::MOE_INTERMEDIATE as u32;
+        let num_experts = C::NUM_EXPERTS as u32;
+
+        // Need to flush the attention block before the CPU peek for residual.
         enc.end_encoding();
         cmd_buf.commit();
         cmd_buf.wait_until_completed();
 
-        // ── 10. Dual FFN block — DEFERRED ──────────────────────────────────
-        // What's left for this layer (Task 3 remaining work):
-        //   residual = buf_hidden  (save before FFN)
-        //   Dense MLP path (always-on):
-        //     pre_feedforward_layernorm → buf_pre_ff_normed
-        //     mlp.gate_proj × buf_pre_ff_normed → buf_mlp_gate
-        //     mlp.up_proj   × buf_pre_ff_normed → buf_mlp_up
-        //     gelu_fused                         → buf_mlp_act
-        //     mlp.down_proj × buf_mlp_act       → buf_mlp_down
-        //     post_feedforward_layernorm_1      → buf_mlp_post
-        //   Router + experts:
-        //     rms_norm_router(buf_hidden, router.scale) → buf_router_normed
-        //     router.proj × buf_router_normed → buf_router_logits[num_experts]
-        //     CPU: top-K (K=8), softmax over K, scale by per_expert_scale
-        //     pre_feedforward_layernorm_2 → buf_pre_ff_normed_2
-        //     For ki in 0..K:
-        //       Load expert e=indices[ki] gate_up_proj + down_proj
-        //       (HF format: experts.gate_up_proj is [128, 2*moe_inter, hidden],
-        //        split halves for gate vs up)
-        //       gate_proj × buf_pre_ff_normed_2 → buf_expert_gate
-        //       up_proj   × buf_pre_ff_normed_2 → buf_expert_up
-        //       gelu_fused                       → buf_expert_act
-        //       down_proj × buf_expert_act       → tmp; buf_expert_out += w[ki]*tmp
-        //     post_feedforward_layernorm_2(buf_expert_out) → buf_expert_post
-        //   Combine + outer norm + residual + layer_scalar:
-        //     buf_ff_combined = buf_mlp_post + buf_expert_post  (residual_add)
-        //     post_feedforward_layernorm(buf_ff_combined) → buf_ff_outer_post
-        //     buf_hidden = residual + buf_ff_outer_post  (residual_add)
-        //     buf_hidden *= layer_scalar (mul_scalar_bf16)
-        unimplemented!(
-            "[gemma4-fused-exp3] sliding layer {} attention block ran; \
-             dual-FFN orchestration (~12 more kernel dispatches) still TODO. \
-             Helpers and dispatchers (gelu_fused, rms_norm_router, \
-             mul_scalar_bf16) are wired; only the Rust orchestration code in \
-             this function is missing. See bottom of forward_sliding_layer.",
-            layer
+        // Snapshot residual = buf_hidden (post-attention) into buf_ff_combined.
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                ctx.buf_hidden.contents() as *const f32,
+                ctx.buf_ff_combined.contents() as *mut f32,
+                C::HIDDEN_DIM,
+            );
+        }
+
+        // ── Tensor offsets for the FFN block (all BF16) ────────────────────
+        let off_pre_ff_ln      = self.tensor_offset_required(&format!("{}.pre_feedforward_layernorm.weight", prefix));
+        let off_pre_ff_ln_2    = self.tensor_offset_required(&format!("{}.pre_feedforward_layernorm_2.weight", prefix));
+        let off_post_ff_ln     = self.tensor_offset_required(&format!("{}.post_feedforward_layernorm.weight", prefix));
+        let off_post_ff_ln_1   = self.tensor_offset_required(&format!("{}.post_feedforward_layernorm_1.weight", prefix));
+        let off_post_ff_ln_2   = self.tensor_offset_required(&format!("{}.post_feedforward_layernorm_2.weight", prefix));
+        let off_mlp_gate_w     = self.tensor_offset_required(&format!("{}.mlp.gate_proj.weight", prefix));
+        let off_mlp_up_w       = self.tensor_offset_required(&format!("{}.mlp.up_proj.weight", prefix));
+        let off_mlp_down_w     = self.tensor_offset_required(&format!("{}.mlp.down_proj.weight", prefix));
+        let off_router_proj    = self.tensor_offset_required(&format!("{}.router.proj.weight", prefix));
+        let off_router_scale   = self.tensor_offset_required(&format!("{}.router.scale", prefix));
+        let off_per_expert_sc  = self.tensor_offset_required(&format!("{}.router.per_expert_scale", prefix));
+        let off_experts_gu     = self.tensor_offset_required(&format!("{}.experts.gate_up_proj", prefix));
+        let off_experts_down   = self.tensor_offset_required(&format!("{}.experts.down_proj", prefix));
+        let off_layer_scalar   = self.tensor_offset_required(&format!("{}.layer_scalar", prefix));
+
+        // ── Start a second command buffer for the dense MLP path + router ──
+        let cmd_buf2 = ctx.queue.new_command_buffer();
+        let enc2 = cmd_buf2.new_compute_command_encoder();
+
+        // Dense MLP path. mlp.gate_proj/up_proj have shape [INTERMEDIATE=2112, HIDDEN].
+        gk::encode_rms_norm_fused_bf16(
+            ctx, enc2,
+            &ctx.buf_hidden, 0,
+            wbuf, off_pre_ff_ln,
+            &ctx.buf_pre_ff_normed, 0,
+            hidden_dim,
+        );
+        gk::encode_matvec_bf16(
+            ctx, enc2,
+            wbuf, off_mlp_gate_w,
+            &ctx.buf_pre_ff_normed, 0,
+            &ctx.buf_mlp_gate, 0,
+            inter, hidden_dim,
+        );
+        gk::encode_matvec_bf16(
+            ctx, enc2,
+            wbuf, off_mlp_up_w,
+            &ctx.buf_pre_ff_normed, 0,
+            &ctx.buf_mlp_up, 0,
+            inter, hidden_dim,
+        );
+        gk::encode_gelu_fused(
+            ctx, enc2,
+            &ctx.buf_mlp_gate, 0,
+            &ctx.buf_mlp_up,   0,
+            &ctx.buf_mlp_act,  0,
+            inter,
+        );
+        // mlp.down_proj has shape [HIDDEN, INTERMEDIATE].
+        gk::encode_matvec_bf16(
+            ctx, enc2,
+            wbuf, off_mlp_down_w,
+            &ctx.buf_mlp_act, 0,
+            &ctx.buf_mlp_down, 0,
+            hidden_dim, inter,
+        );
+        gk::encode_rms_norm_fused_bf16(
+            ctx, enc2,
+            &ctx.buf_mlp_down, 0,
+            wbuf, off_post_ff_ln_1,
+            &ctx.buf_mlp_post, 0,
+            hidden_dim,
         );
 
-        #[allow(unreachable_code)]
+        // Router. rms_norm_router uses per-channel router.scale × sqrt(hidden)^-1.
+        gk::encode_rms_norm_router(
+            ctx, enc2,
+            &ctx.buf_hidden, 0,
+            wbuf, off_router_scale,
+            &ctx.buf_router_normed, 0,
+            hidden_dim,
+        );
+        gk::encode_matvec_bf16(
+            ctx, enc2,
+            wbuf, off_router_proj,
+            &ctx.buf_router_normed, 0,
+            &ctx.buf_router_logits, 0,
+            num_experts, hidden_dim,
+        );
+
+        enc2.end_encoding();
+        cmd_buf2.commit();
+        cmd_buf2.wait_until_completed();
+
+        // ── CPU: top-K over router_logits, then softmax over the K winners,
+        //        then multiply by per_expert_scale[indices].
+        let logits_ptr = ctx.buf_router_logits.contents() as *const f32;
+        let logits: &[f32] = unsafe {
+            std::slice::from_raw_parts(logits_ptr, C::NUM_EXPERTS)
+        };
+        let k = self.num_active_experts;
+        let mut idx: Vec<usize> = (0..C::NUM_EXPERTS).collect();
+        idx.sort_by(|&a, &b| logits[b].partial_cmp(&logits[a]).unwrap_or(std::cmp::Ordering::Equal));
+        let top_idx: Vec<usize> = idx[..k].to_vec();
+        let mut top_w: Vec<f32> = top_idx.iter().map(|&i| logits[i]).collect();
+        // Softmax over the top-K.
+        let mx = top_w.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+        let mut sum = 0.0f32;
+        for w in top_w.iter_mut() { *w = (*w - mx).exp(); sum += *w; }
+        for w in top_w.iter_mut() { *w /= sum; }
+        // Multiply by per_expert_scale.
+        let pes_ptr = self.weight_buffer.base as usize + off_per_expert_sc as usize;
+        for (ki, &e) in top_idx.iter().enumerate() {
+            let raw = unsafe { *(pes_ptr as *const u16).add(e) };
+            top_w[ki] *= bf16_to_f32(raw);
+        }
+
+        // ── Experts path. Each expert: gate (slice of gate_up_proj), up
+        //    (next slice), down (slice of down_proj). HF layout:
+        //      experts.gate_up_proj : [128, 2*moe_inter=1408, hidden=2816]
+        //        Per-expert slice  : [1408, 2816] (rows 0..704 gate, 704..1408 up)
+        //      experts.down_proj   : [128, hidden=2816, moe_inter=704]
+        //        Per-expert slice  : [2816, 704]
+        //    All BF16. Byte offsets are per-expert constants we add to the
+        //    base tensor offset.
+        // pre_feedforward_layernorm_2 → buf_pre_ff_normed_2 (input to experts).
+        {
+            let cb = ctx.queue.new_command_buffer();
+            let e = cb.new_compute_command_encoder();
+            gk::encode_rms_norm_fused_bf16(
+                ctx, e,
+                &ctx.buf_hidden, 0,
+                wbuf, off_pre_ff_ln_2,
+                &ctx.buf_pre_ff_normed_2, 0,
+                hidden_dim,
+            );
+            e.end_encoding();
+            cb.commit();
+            cb.wait_until_completed();
+        }
+
+        // Zero buf_expert_out (we'll accumulate into it across K experts).
+        unsafe {
+            std::ptr::write_bytes(
+                ctx.buf_expert_out.contents() as *mut u8,
+                0,
+                C::HIDDEN_DIM * 4,
+            );
+        }
+
+        let bf16_bytes: u64 = 2;
+        let per_expert_gu_bytes   = (2 * moe_inter * hidden_dim) as u64 * bf16_bytes;
+        let per_expert_down_bytes = (hidden_dim * moe_inter)    as u64 * bf16_bytes;
+        let gate_block_bytes      = (moe_inter * hidden_dim)    as u64 * bf16_bytes;
+
+        for (ki, &expert_idx) in top_idx.iter().enumerate() {
+            let e_u64 = expert_idx as u64;
+            let expert_gu_off   = off_experts_gu   + e_u64 * per_expert_gu_bytes;
+            let expert_down_off = off_experts_down + e_u64 * per_expert_down_bytes;
+            let cb = ctx.queue.new_command_buffer();
+            let enc_e = cb.new_compute_command_encoder();
+            // gate weight = first [moe_inter, hidden] block at expert_gu_off
+            gk::encode_matvec_bf16(
+                ctx, enc_e,
+                wbuf, expert_gu_off,
+                &ctx.buf_pre_ff_normed_2, 0,
+                &ctx.buf_expert_gate, 0,
+                moe_inter, hidden_dim,
+            );
+            // up weight = next [moe_inter, hidden] block (shifted by gate_block_bytes)
+            gk::encode_matvec_bf16(
+                ctx, enc_e,
+                wbuf, expert_gu_off + gate_block_bytes,
+                &ctx.buf_pre_ff_normed_2, 0,
+                &ctx.buf_expert_up, 0,
+                moe_inter, hidden_dim,
+            );
+            gk::encode_gelu_fused(
+                ctx, enc_e,
+                &ctx.buf_expert_gate, 0,
+                &ctx.buf_expert_up,   0,
+                &ctx.buf_expert_act,  0,
+                moe_inter,
+            );
+            gk::encode_matvec_bf16(
+                ctx, enc_e,
+                wbuf, expert_down_off,
+                &ctx.buf_expert_act, 0,
+                &ctx.buf_expert_post, 0,
+                hidden_dim, moe_inter,
+            );
+            enc_e.end_encoding();
+            cb.commit();
+            cb.wait_until_completed();
+            // CPU weighted-accumulate on shared memory.
+            let post_ptr = ctx.buf_expert_post.contents() as *const f32;
+            let out_ptr  = ctx.buf_expert_out.contents()  as *mut f32;
+            let w_ki = top_w[ki];
+            unsafe {
+                for j in 0..C::HIDDEN_DIM {
+                    *out_ptr.add(j) += *post_ptr.add(j) * w_ki;
+                }
+            }
+        }
+
+        // ── Outer FFN norms + combine + residual + layer_scalar ─────────────
+        let cmd_buf4 = ctx.queue.new_command_buffer();
+        let enc4 = cmd_buf4.new_compute_command_encoder();
+
+        // post_feedforward_layernorm_2 on the experts sum.
+        gk::encode_rms_norm_fused_bf16(
+            ctx, enc4,
+            &ctx.buf_expert_out, 0,
+            wbuf, off_post_ff_ln_2,
+            &ctx.buf_expert_post, 0,
+            hidden_dim,
+        );
+        // Combine dense + experts: buf_ff_outer_post = buf_mlp_post + buf_expert_post
+        gk::encode_residual_add(
+            ctx, enc4,
+            &ctx.buf_mlp_post, 0,
+            &ctx.buf_expert_post, 0,
+            &ctx.buf_ff_outer_post, 0,
+            hidden_dim,
+        );
+        // Outer post_feedforward_layernorm on the combined FFN output.
+        gk::encode_rms_norm_fused_bf16(
+            ctx, enc4,
+            &ctx.buf_ff_outer_post, 0,
+            wbuf, off_post_ff_ln,
+            &ctx.buf_ff_outer_post, 0,             // in-place OK
+            hidden_dim,
+        );
+        // Second residual: buf_hidden = (saved residual in buf_ff_combined) + buf_ff_outer_post.
+        gk::encode_residual_add(
+            ctx, enc4,
+            &ctx.buf_ff_combined,  0,   // saved residual snapshot
+            &ctx.buf_ff_outer_post, 0,
+            &ctx.buf_hidden,        0,
+            hidden_dim,
+        );
+        // Apply per-layer scalar: buf_hidden *= bf16 layer_scalar[0].
+        gk::encode_mul_scalar_bf16(
+            ctx, enc4,
+            &ctx.buf_hidden, 0,
+            wbuf, off_layer_scalar,
+            hidden_dim,
+        );
+
+        enc4.end_encoding();
+        cmd_buf4.commit();
+        cmd_buf4.wait_until_completed();
+
         Ok(())
     }
 }

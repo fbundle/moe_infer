@@ -283,22 +283,25 @@ kernel void mul_scalar_bf16(
 }
 
 // ============================================================================
-// Router RMS norm — RMSNorm with weight = `router.scale * sqrt(hidden)^-1`.
+// Router RMS norm — RMSNorm with per-channel BF16 weight (router.scale) and
+// an extra global multiplier sqrt(hidden_size)^-1.
+//
+// Confirmed against safetensors: router.scale shape = [hidden_size], BF16.
 //
 // MLX-VLM `Gemma4SparseMoeBlock.Router.__call__`:
-//     scale = self.scale * (self.hidden_size ** -0.5)
-//     hidden_normed = mx.fast.rms_norm(hidden, scale=scale, eps=eps)
+//     effective_weight = self.scale * (self.hidden_size ** -0.5)
+//     hidden_normed = mx.fast.rms_norm(hidden, weight=effective_weight, eps=eps)
 //     logits = self.proj(hidden_normed)
-// Here `self.scale` is a [1] bf16 tensor; the weight is BROADCAST (scalar)
-// not per-channel. Different from rms_norm_fused_bf16 which has a [dim] weight.
+// We fold the sqrt(hidden)^-1 factor inline rather than precomputing a
+// scaled weight buffer (host-side scratch would cost an extra dispatch).
 // ============================================================================
 
 kernel void rms_norm_router(
-    device const float*    x          [[buffer(0)]],
-    device const uint16_t* scale_bf16 [[buffer(1)]],   // [1] bf16
-    device float*          out        [[buffer(2)]],
-    constant uint&         dim        [[buffer(3)]],
-    constant float&        eps        [[buffer(4)]],
+    device const float*    x         [[buffer(0)]],
+    device const uint16_t* weight    [[buffer(1)]],   // [dim] bf16 — router.scale
+    device float*          out       [[buffer(2)]],
+    constant uint&         dim       [[buffer(3)]],
+    constant float&        eps       [[buffer(4)]],
     uint lid [[thread_position_in_threadgroup]]
 ) {
     threadgroup float ss[256];
@@ -315,10 +318,9 @@ kernel void rms_norm_router(
         threadgroup_barrier(mem_flags::mem_threadgroup);
     }
     float inv_rms = rsqrt(ss[0] / float(dim) + eps);
-    float scale = bf16_to_f32(scale_bf16[0]) * rsqrt(float(dim));
-    float effective = inv_rms * scale;
+    float global_scale = rsqrt(float(dim));   // sqrt(hidden)^-1 factor
     for (uint i = lid; i < dim; i += 256) {
-        out[i] = x[i] * effective;
+        out[i] = x[i] * inv_rms * bf16_to_f32(weight[i]) * global_scale;
     }
 }
 
