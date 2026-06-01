@@ -35,6 +35,11 @@ pub trait Gemma4ModelConfig: 'static {
     const NUM_LAYERS: usize;
     const NUM_ATTN_HEADS: usize;
     const NUM_KV_HEADS: usize;
+    /// num_global_key_value_heads — KV heads on FULL-attention layers (Gemma 4
+    /// uses 2 here vs 8 for sliding layers in 26B-A4B). The MLX-VLM config
+    /// field is `num_global_key_value_heads`. Different KV grouping → different
+    /// kv_dim and heads_per_kv passed into the head_dim=512 SDPA kernel.
+    const NUM_KV_HEADS_FULL: usize;
     const HEAD_DIM: usize;
     const VOCAB_SIZE: usize;
     const INTERMEDIATE_SIZE: usize;       // dense FFN intermediate (for non-MoE layers if any)
@@ -149,8 +154,19 @@ pub trait Gemma4ModelConfig: 'static {
         if cfg_num_experts != Self::NUM_EXPERTS {
             errs.push(format!("num_experts: config={}, const={}", cfg_num_experts, Self::NUM_EXPERTS));
         }
-        if get("num_experts_per_tok") != Self::NUM_EXPERTS_PER_TOK {
-            errs.push(format!("num_experts_per_tok: config={}, const={}", get("num_experts_per_tok"), Self::NUM_EXPERTS_PER_TOK));
+        // Gemma 4's HF config uses `top_k_experts`, not the more common
+        // `num_experts_per_tok` (MLX-VLM matches HF here). Check both spellings
+        // in case Google fixes the naming inconsistency upstream.
+        let top_k = c.get_usize("top_k_experts")
+            .or_else(|| c.get_usize("num_experts_per_tok"))
+            .unwrap_or(0);
+        if top_k != Self::NUM_EXPERTS_PER_TOK {
+            errs.push(format!("top_k_experts: config={}, const={}", top_k, Self::NUM_EXPERTS_PER_TOK));
+        }
+        // num_global_key_value_heads (full-attn layers; 26B-A4B uses 2 vs 8 sliding)
+        let full_kv = c.get_usize("num_global_key_value_heads").unwrap_or(Self::NUM_KV_HEADS);
+        if full_kv != Self::NUM_KV_HEADS_FULL {
+            errs.push(format!("num_global_key_value_heads: config={}, const={}", full_kv, Self::NUM_KV_HEADS_FULL));
         }
         if get("moe_intermediate_size") != Self::MOE_INTERMEDIATE {
             errs.push(format!("moe_intermediate_size: config={}, const={}", get("moe_intermediate_size"), Self::MOE_INTERMEDIATE));
@@ -224,6 +240,7 @@ impl Gemma4ModelConfig for Gemma4_26B_A4B {
     const NUM_LAYERS: usize = 30;
     const NUM_ATTN_HEADS: usize = 16;
     const NUM_KV_HEADS: usize = 8;
+    const NUM_KV_HEADS_FULL: usize = 2;
     const HEAD_DIM: usize = 256;
     const VOCAB_SIZE: usize = 262144;
     const INTERMEDIATE_SIZE: usize = 2112;
@@ -280,6 +297,7 @@ impl Gemma4ModelConfig for Gemma4Stripped {
     const NUM_LAYERS: usize = 6;               // one full attention period
     const NUM_ATTN_HEADS: usize = 16;
     const NUM_KV_HEADS: usize = 8;
+    const NUM_KV_HEADS_FULL: usize = 2;
     const HEAD_DIM: usize = 256;
     const VOCAB_SIZE: usize = 262144;
     const INTERMEDIATE_SIZE: usize = 2112;
