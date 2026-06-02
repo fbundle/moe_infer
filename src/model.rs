@@ -44,7 +44,21 @@ impl Model {
         let num_layers = config.get_usize("num_hidden_layers").unwrap()
             + config.get_usize("mtp_num_hidden_layers").unwrap_or(0);
 
+        // Per-layer packed_experts/ blobs are used by qwen35-style engines
+        // (FusedExp1..4 pread expert weights from these files). Gemma 4's
+        // engine reads experts inline from model_weights.bin via byte
+        // offsets, so it doesn't need them. If neither directory exists,
+        // skip the per-layer loading.
         let mut expert_files = Vec::with_capacity(num_layers);
+        let any_expert_dir = packed_dir.exists() && std::fs::read_dir(&packed_dir)
+            .map(|mut it| it.next().is_some()).unwrap_or(false)
+            || lz4_dir.exists() && std::fs::read_dir(&lz4_dir)
+                .map(|mut it| it.next().is_some()).unwrap_or(false);
+        if !any_expert_dir {
+            eprintln!("[model] {} layers hidden={} experts inline (no packed_experts/ — Gemma4-style)",
+                num_layers, hd);
+            return Ok(Model { config, weight_file: wf, expert_files });
+        }
         for layer in 0..num_layers {
             let lz4_path = lz4_dir.join(format!("layer_{:02}.bin", layer));
             if lz4_path.exists() {

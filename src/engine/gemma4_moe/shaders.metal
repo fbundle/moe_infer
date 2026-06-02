@@ -290,6 +290,68 @@ kernel void attn_sdpa_causal_h512(
 // its head_dim elements.
 // ============================================================================
 
+// ============================================================================
+// RMSNorm with per-channel BF16 weight — SAFE variant (no simd_sum with
+// masked lanes). The qwen35 rms_norm_fused_bf16 uses simd_sum after a
+// conditional, which is undefined when not all lanes participate. This
+// version uses loop-based reduction throughout.
+// ============================================================================
+
+// Plain copy test — verify GPU sees CPU-written buffer.
+kernel void copy_test(
+    device const float* src [[buffer(0)]],
+    device float*       dst [[buffer(1)]],
+    constant uint&      dim [[buffer(2)]],
+    uint tid [[thread_position_in_grid]]
+) {
+    if (tid < dim) dst[tid] = src[tid];
+}
+
+// Read input_layernorm.weight (bf16) and dump first 8 to floats.
+kernel void weight_dump(
+    device const uint16_t* w [[buffer(0)]],
+    device float*       dst [[buffer(1)]],
+    uint tid [[thread_position_in_grid]]
+) {
+    if (tid < 8) dst[tid] = bf16_to_f32(w[tid]);
+}
+
+// Hardcoded constant write — bypass everything.
+kernel void const_write(
+    device float* dst [[buffer(0)]],
+    constant uint& dim [[buffer(1)]],
+    uint tid [[thread_position_in_grid]]
+) {
+    if (tid < dim) dst[tid] = 7.5f;
+}
+
+kernel void rms_norm_safe(
+    device const float*    x       [[buffer(0)]],
+    device const uint16_t* weight  [[buffer(1)]],
+    device float*          out     [[buffer(2)]],
+    constant uint&         dim     [[buffer(3)]],
+    constant float&        eps     [[buffer(4)]],
+    uint lid       [[thread_position_in_threadgroup]]
+) {
+    threadgroup float ss[256];
+    float local = 0.0f;
+    for (uint i = lid; i < dim; i += 256) {
+        float v = x[i];
+        local += v * v;
+    }
+    ss[lid] = local;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint stride = 128; stride > 0; stride >>= 1) {
+        if (lid < stride) ss[lid] += ss[lid + stride];
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    float inv_rms = rsqrt(ss[0] / float(dim) + eps);
+    for (uint i = lid; i < dim; i += 256) {
+        float w = bf16_to_f32(weight[i]);
+        out[i] = x[i] * inv_rms * w;
+    }
+}
+
 kernel void rms_norm_no_scale(
     device const float* x         [[buffer(0)]],
     device float*       out       [[buffer(1)]],

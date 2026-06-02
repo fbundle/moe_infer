@@ -39,6 +39,10 @@ pub struct Gemma4MetalContext {
     pub attn_sdpa_sliding_causal: ComputePipelineState,
     pub attn_sdpa_causal_h512: ComputePipelineState,
     pub rms_norm_no_scale: ComputePipelineState,
+    pub rms_norm_safe: ComputePipelineState,
+    pub copy_test: ComputePipelineState,
+    pub weight_dump: ComputePipelineState,
+    pub const_write: ComputePipelineState,
     pub q_head_norm_rope_no_gate: ComputePipelineState,
     pub mul_scalar_bf16: ComputePipelineState,
     pub rms_norm_router: ComputePipelineState,
@@ -123,6 +127,10 @@ impl Gemma4MetalContext {
         let attn_sdpa_sliding_causal = make("attn_sdpa_sliding_causal")?;
         let attn_sdpa_causal_h512  = make("attn_sdpa_causal_h512")?;
         let rms_norm_no_scale      = make("rms_norm_no_scale")?;
+        let rms_norm_safe          = make("rms_norm_safe")?;
+        let copy_test              = make("copy_test")?;
+        let weight_dump            = make("weight_dump")?;
+        let const_write            = make("const_write")?;
         let q_head_norm_rope_no_gate = make("q_head_norm_rope_no_gate")?;
         let mul_scalar_bf16        = make("mul_scalar_bf16")?;
         let rms_norm_router        = make("rms_norm_router")?;
@@ -217,6 +225,10 @@ impl Gemma4MetalContext {
             attn_sdpa_sliding_causal,
             attn_sdpa_causal_h512,
             rms_norm_no_scale,
+            rms_norm_safe,
+            copy_test,
+            weight_dump,
+            const_write,
             q_head_norm_rope_no_gate,
             mul_scalar_bf16,
             rms_norm_router,

@@ -173,6 +173,40 @@ pub fn encode_logit_softcap(
 
 use crate::constants::{ROWS_PER_TG, TG_SIZE, RMS_NORM_EPS};
 
+/// Encode INT4 dequant matvec using the dequant_matvec_4bit_v3 kernel
+/// (group=64, bf16 scales+biases). Out_dim must be aligned to
+/// the kernel's ROWS_PER_TG; the matvec_v3 family handles that internally.
+pub fn encode_matvec_int4(
+    ctx: &Gemma4MetalContext,
+    encoder: &ComputeCommandEncoderRef,
+    w_packed: &BufferRef, w_offset: u64,
+    scales: &BufferRef,   s_offset: u64,
+    biases: &BufferRef,   b_offset: u64,
+    x: &BufferRef, x_offset: u64,
+    out: &BufferRef, o_offset: u64,
+    out_dim: u32,
+    in_dim: u32,
+) {
+    use crate::constants::{ROWS_PER_TG, TG_SIZE};
+    encoder.set_compute_pipeline_state(&ctx.dequant_matvec_4bit_v3);
+    encoder.set_buffer(0, Some(w_packed), w_offset);
+    encoder.set_buffer(1, Some(scales),   s_offset);
+    encoder.set_buffer(2, Some(biases),   b_offset);
+    encoder.set_buffer(3, Some(x),        x_offset);
+    encoder.set_buffer(4, Some(out),      o_offset);
+    let group_size: u32 = 64;
+    unsafe {
+        set_u32(encoder, 5, out_dim);
+        set_u32(encoder, 6, in_dim);
+        set_u32(encoder, 7, group_size);
+    }
+    let num_tgs = (out_dim + ROWS_PER_TG - 1) / ROWS_PER_TG;
+    encoder.dispatch_thread_groups(
+        MTLSize::new(num_tgs as u64, 1, 1),
+        MTLSize::new(TG_SIZE as u64, 1, 1),
+    );
+}
+
 /// Encode BF16 matvec: out[out_dim] = W_bf16[out_dim, in_dim] @ x[in_dim].
 pub fn encode_matvec_bf16(
     ctx: &Gemma4MetalContext,
@@ -208,7 +242,10 @@ pub fn encode_rms_norm_fused_bf16(
     out: &BufferRef, o_offset: u64,
     dim: u32,
 ) {
-    encoder.set_compute_pipeline_state(&ctx.rms_norm_fused_bf16);
+    // Use our SAFE variant — qwen35's rms_norm_fused_bf16 relies on
+    // simd_sum() with masked lanes (UB in some Metal versions) and
+    // produces zero output on M4 + concatenated source.
+    encoder.set_compute_pipeline_state(&ctx.rms_norm_safe);
     encoder.set_buffer(0, Some(x), x_offset);
     encoder.set_buffer(1, Some(weight), w_offset);
     encoder.set_buffer(2, Some(out), o_offset);

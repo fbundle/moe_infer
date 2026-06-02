@@ -47,15 +47,21 @@ impl Cache {
         let num_kv_heads = config.get_usize("num_key_value_heads").unwrap();
         let head_dim = config.get_usize("head_dim").unwrap();
         let kv_dim = num_kv_heads * head_dim;
-        let lnum_v_heads = config.get_usize("linear_num_value_heads").unwrap();
-        let lnum_k_heads = config.get_usize("linear_num_key_heads").unwrap();
-        let ltotal_key = lnum_k_heads * config.get_usize("linear_key_head_dim").unwrap();
-        let ltotal_value = lnum_v_heads * config.get_usize("linear_value_head_dim").unwrap();
+        // Linear-attention config fields are qwen3.6-specific. Models without
+        // them (Gemma 4, etc.) have all-full-attention layers — fall back to 0
+        // so the cache states are all Full.
+        let lnum_v_heads = config.get_usize("linear_num_value_heads").unwrap_or(0);
+        let lnum_k_heads = config.get_usize("linear_num_key_heads").unwrap_or(0);
+        let lkey_head_dim = config.get_usize("linear_key_head_dim").unwrap_or(0);
+        let lval_head_dim = config.get_usize("linear_value_head_dim").unwrap_or(0);
+        let ltotal_key = lnum_k_heads * lkey_head_dim;
+        let ltotal_value = lnum_v_heads * lval_head_dim;
         let lconv_dim = ltotal_key * 2 + ltotal_value;
+        let has_linear = lnum_v_heads > 0 && lnum_k_heads > 0;
 
         let mut states = Vec::with_capacity(num_layers);
         for layer in 0..num_layers {
-            if (layer + 1) % FULL_ATTN_INTERVAL == 0 {
+            if !has_linear || (layer + 1) % FULL_ATTN_INTERVAL == 0 {
                 states.push(State::Full(FullState::new(MAX_SEQ, kv_dim)));
             } else {
                 states.push(State::Linear(LinearState::new(

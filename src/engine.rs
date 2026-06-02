@@ -147,6 +147,8 @@ use crate::engine::fused_exp1::FusedExp1;
 use crate::engine::fused_exp2::FusedExp2;
 use crate::engine::fused_exp3::FusedExp3;
 use crate::engine::fused_exp4::FusedExp4;
+use crate::engine::gemma4_constants::{Gemma4_26B_A4B, Gemma4Stripped};
+use crate::engine::gemma4_fused_exp3::Gemma4Fused;
 
 /// Type-erased engine holding one of the engine variants via trait object.
 pub struct DynEngine {
@@ -182,6 +184,10 @@ impl DynEngine {
                 Box::new(FusedExp4::<FullModel>::new(model, num_active_experts, expert_cache_count)?),
             ("Qwen35MoEFusedExp4", "Qwen3_5MoeForConditionalGeneration_Stripped") =>
                 Box::new(FusedExp4::<StrippedModel>::new(model, num_active_experts, expert_cache_count)?),
+            ("Gemma4MoEFused", "Gemma4ForConditionalGeneration") =>
+                Box::new(Gemma4Fused::<Gemma4_26B_A4B>::new(model, num_active_experts, expert_cache_count)?),
+            ("Gemma4MoEFused", "Gemma4ForConditionalGeneration_Stripped") =>
+                Box::new(Gemma4Fused::<Gemma4Stripped>::new(model, num_active_experts, expert_cache_count)?),
             _ => return Err(MoEError::Config(format!(
                 "Unknown engine: engine_type={:?}, arch={:?}", engine_type, arch
             ))),

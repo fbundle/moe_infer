@@ -726,16 +726,34 @@ pub struct WeightBuffer {
 
 impl WeightBuffer {
     /// Create a Metal buffer wrapping the weight file mmap.
+    ///
+    /// Two requirements from Apple Silicon Metal:
+    ///   1. `length` must be a multiple of the system page size (16 KB on M-series).
+    ///      Otherwise `newBufferWithBytesNoCopy` returns nil → zero-length buffer
+    ///      → all GPU reads see zeros.
+    ///   2. `length` must be ≤ `device.maxBufferLength` (on M4 base: ~9.5 GB).
+    ///      Larger weights need to be split across multiple buffers.
     pub fn new(device: &Device, wf: &WeightFile) -> Self {
         let data = wf.data_ptr();
         let size = wf.size;
+        let page = 16 * 1024usize;
+        let padded_size = (size + page - 1) / page * page;
+        let max_buf = device.max_buffer_length() as usize;
+        if padded_size > max_buf {
+            eprintln!(
+                "[gpu-weight] WARNING: weight file is {:.2} GB but device max_buffer_length is {:.2} GB. \
+                 Metal will reject the no-copy buffer → ALL GPU weight reads will return zeros. \
+                 Need to either (a) split into multiple buffers, or (b) shrink the model.",
+                padded_size as f64 / 1e9, max_buf as f64 / 1e9);
+        }
         let buf = device.new_buffer_with_bytes_no_copy(
             data as *mut std::ffi::c_void,
-            size as u64,
+            padded_size as u64,
             MTLResourceOptions::StorageModeShared,
             None,
         );
-        eprintln!("[gpu-weight] Wrapped {:.2} GB weight file in Metal buffer", size as f64 / 1e9);
+        eprintln!("[gpu-weight] Wrapped {:.2} GB weight file (padded {:.2} GB) — Metal buf len={:.2} GB",
+            size as f64 / 1e9, padded_size as f64 / 1e9, buf.length() as f64 / 1e9);
         WeightBuffer { buf, base: data }
     }
 

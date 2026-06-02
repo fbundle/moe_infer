@@ -86,6 +86,104 @@ impl<C: Gemma4ModelConfig> Gemma4Fused<C> {
             .unwrap_or_else(|| panic!("[gemma4-engine] required tensor missing: {}", name))
     }
 
+    /// Looks up `prefix.weight` and dispatches the matvec kernel matching
+    /// the tensor's dtype: matvec_bf16 for BF16, dequant_matvec_4bit_v3
+    /// for INT4 (with scales+biases sibling tensors).
+    fn encode_matvec_auto(
+        &self,
+        encoder: &metal::ComputeCommandEncoderRef,
+        prefix: &str,
+        x: &metal::BufferRef, x_offset: u64,
+        out: &metal::BufferRef, o_offset: u64,
+        out_dim: u32, in_dim: u32,
+    ) {
+        use crate::engine::gemma4_metal_kernels as gk;
+        let weight_name = format!("{}.weight", prefix);
+        let info = self.model.weight_file.get_tensor_info(&weight_name)
+            .unwrap_or_else(|| panic!("[gemma4-engine] missing tensor info: {}", weight_name));
+        let dtype = info.dtype.as_str();
+        let w_off = self.tensor_offset_required(&weight_name);
+        let wbuf = &self.weight_buffer.buf;
+        eprintln!("[matvec_auto] {} dtype={} out_dim={} in_dim={} w_off={}", prefix, dtype, out_dim, in_dim, w_off);
+        match dtype {
+            "bf16" => {
+                gk::encode_matvec_bf16(&self.ctx, encoder,
+                    wbuf, w_off, x, x_offset, out, o_offset, out_dim, in_dim);
+            }
+            // "u32" is the engine's wire name for INT4 (per dtype.rs)
+            "u32" | "int4" => {
+                let s_off = self.tensor_offset_required(&format!("{}.scales", prefix));
+                let b_off = self.tensor_offset_required(&format!("{}.biases", prefix));
+                gk::encode_matvec_int4(&self.ctx, encoder,
+                    wbuf, w_off, wbuf, s_off, wbuf, b_off,
+                    x, x_offset, out, o_offset, out_dim, in_dim);
+            }
+            _ => panic!("[gemma4-engine] unsupported dtype '{}' for {}", dtype, weight_name),
+        }
+    }
+
+    /// Per-expert matvec for tensors quantized as a single big 2D matrix
+    /// (`experts.gate_up_proj`, `experts.down_proj`). Computes byte offset
+    /// for expert e's row block within the merged tensor, then dispatches
+    /// matvec on that slice. For INT4, scales and biases are sliced in
+    /// parallel by the same row-block stride.
+    ///
+    /// `tensor_base_name` is e.g. "experts.gate_up_proj" — the engine looks
+    /// up `{base}.weight` / `.scales` / `.biases` for INT4, or just `{base}`
+    /// for the BF16 fallback.
+    /// `expert_idx` selects which expert's slice to use.
+    /// `row_offset` and `row_count` select a sub-block within the expert
+    /// (e.g. rows 0..moe_inter for gate, rows moe_inter..2*moe_inter for up).
+    #[allow(clippy::too_many_arguments)]
+    fn encode_matvec_expert_slice(
+        &self,
+        encoder: &metal::ComputeCommandEncoderRef,
+        tensor_base: &str,
+        expert_idx: usize,
+        rows_per_expert: u32,
+        row_offset: u32,
+        row_count: u32,
+        x: &metal::BufferRef, x_offset: u64,
+        out: &metal::BufferRef, o_offset: u64,
+        in_dim: u32,
+    ) {
+        use crate::engine::gemma4_metal_kernels as gk;
+        // Try INT4 layout first (look for .weight + .scales + .biases triple).
+        let weight_name = format!("{}.weight", tensor_base);
+        let info = self.model.weight_file.get_tensor_info(&weight_name);
+        let wbuf = &self.weight_buffer.buf;
+        if let Some(_info) = info {
+            // INT4 path. Per-row stride: packed weight = in_dim/8 u32 = in_dim/2 bytes.
+            // The whole merged tensor is [num_experts * rows_per_expert, in_dim] INT4.
+            const GS: u32 = 64;
+            let groups_per_row = in_dim / GS;
+            let w_off_base = self.tensor_offset_required(&weight_name);
+            let s_off_base = self.tensor_offset_required(&format!("{}.scales", tensor_base));
+            let b_off_base = self.tensor_offset_required(&format!("{}.biases", tensor_base));
+            let expert_row0 = expert_idx as u64 * rows_per_expert as u64 + row_offset as u64;
+            // Per-row sizes: weight = in_dim/2 bytes, scales/biases = groups_per_row*2 bytes
+            let w_bytes_per_row = (in_dim / 2) as u64;
+            let sb_bytes_per_row = (groups_per_row * 2) as u64;
+            let w_off = w_off_base + expert_row0 * w_bytes_per_row;
+            let s_off = s_off_base + expert_row0 * sb_bytes_per_row;
+            let b_off = b_off_base + expert_row0 * sb_bytes_per_row;
+            gk::encode_matvec_int4(&self.ctx, encoder,
+                wbuf, w_off, wbuf, s_off, wbuf, b_off,
+                x, x_offset, out, o_offset, row_count, in_dim);
+            return;
+        }
+        // BF16 fallback: tensor stored under tensor_base (no .weight suffix in
+        // the BF16 quantize path because we keep the HF name).
+        let bf16_base_off = self.tensor_offset_required(tensor_base);
+        let bf16_bytes: u64 = 2;
+        let rows_offset_bytes = (expert_idx as u64 * rows_per_expert as u64
+                                 + row_offset as u64)
+                                * in_dim as u64 * bf16_bytes;
+        gk::encode_matvec_bf16(&self.ctx, encoder,
+            wbuf, bf16_base_off + rows_offset_bytes,
+            x, x_offset, out, o_offset, row_count, in_dim);
+    }
+
     /// Look up the embedding row for one token. Gemma 4 scales the embedding
     /// by `sqrt(HIDDEN_DIM)` (the standard "embed_scale" trick that keeps
     /// post-embedding magnitudes O(1)).
@@ -96,9 +194,11 @@ impl<C: Gemma4ModelConfig> Gemma4Fused<C> {
     /// same on-disk format (per-row group quantization).
     fn embed_lookup_row(wf: &WeightFile, token_id: usize, out: &mut [f32], hidden_dim: usize) {
         let scale = (hidden_dim as f32).sqrt();
+        let info = wf.get_tensor_info("language_model.model.embed_tokens.weight");
 
         // BF16 path (unquantized weights, e.g. for verification against MLX).
-        if let Some(w) = wf.get_tensor_u16("language_model.model.embed_tokens.weight") {
+        if info.map(|t| t.dtype == "bf16").unwrap_or(false) {
+            let w = wf.get_tensor_u16("language_model.model.embed_tokens.weight").unwrap();
             let row = &w[token_id * hidden_dim..(token_id + 1) * hidden_dim];
             for j in 0..hidden_dim {
                 out[j] = bf16_to_f32(row[j]) * scale;
@@ -175,7 +275,10 @@ impl<C: Gemma4ModelConfig> Gemma4Fused<C> {
         // Quick path: read the weight once, dot per row. Two cases:
         //   - BF16 tensor → direct dot
         //   - BQ4 tensor → dequant on the fly, dot
-        if let Some(w) = wf.get_tensor_u16("language_model.model.embed_tokens.weight") {
+        let lm_info = wf.get_tensor_info("language_model.model.embed_tokens.weight");
+        let is_bf16 = lm_info.map(|t| t.dtype == "bf16").unwrap_or(false);
+        if is_bf16 {
+            let w = wf.get_tensor_u16("language_model.model.embed_tokens.weight").unwrap();
             for v in 0..vocab_size {
                 let row = &w[v * hidden_dim..(v + 1) * hidden_dim];
                 let mut acc = 0.0f32;
@@ -251,12 +354,9 @@ impl<C: Gemma4ModelConfig> Gemma4Fused<C> {
         let sliding_win  = C::SLIDING_WINDOW as u32;
 
         let prefix = format!("language_model.model.layers.{}", layer);
-        // ── Required tensor offsets (BF16 weights) ─────────────────────────
+        // BF16-only tensor offsets (norms). Matmul weights are looked up by
+        // encode_matvec_auto which dispatches BF16 or INT4 per tensor dtype.
         let off_input_ln   = self.tensor_offset_required(&format!("{}.input_layernorm.weight", prefix));
-        let off_q_proj_w   = self.tensor_offset_required(&format!("{}.self_attn.q_proj.weight", prefix));
-        let off_k_proj_w   = self.tensor_offset_required(&format!("{}.self_attn.k_proj.weight", prefix));
-        let off_v_proj_w   = self.tensor_offset_required(&format!("{}.self_attn.v_proj.weight", prefix));
-        let off_o_proj_w   = self.tensor_offset_required(&format!("{}.self_attn.o_proj.weight", prefix));
         let off_q_norm_w   = self.tensor_offset_required(&format!("{}.self_attn.q_norm.weight", prefix));
         let off_k_norm_w   = self.tensor_offset_required(&format!("{}.self_attn.k_norm.weight", prefix));
         let off_post_attn_ln = self.tensor_offset_required(&format!("{}.post_attention_layernorm.weight", prefix));
@@ -264,53 +364,183 @@ impl<C: Gemma4ModelConfig> Gemma4Fused<C> {
         let wbuf = &self.weight_buffer.buf;
         let ctx = &self.ctx;
 
+        // GPU weight_dump: read input_layernorm.weight from GPU
+        {
+            let cb = ctx.queue.new_command_buffer();
+            let e1 = cb.new_compute_command_encoder();
+            e1.set_compute_pipeline_state(&ctx.weight_dump);
+            e1.set_buffer(0, Some(wbuf), off_input_ln);
+            e1.set_buffer(1, Some(&ctx.buf_input_normed), 0);
+            e1.dispatch_thread_groups(metal::MTLSize::new(1, 1, 1), metal::MTLSize::new(8, 1, 1));
+            e1.end_encoding(); cb.commit(); cb.wait_until_completed();
+            let p = ctx.buf_input_normed.contents() as *const f32;
+            let f8: Vec<f32> = unsafe { (0..8).map(|i| *p.add(i)).collect() };
+            eprintln!("[gemma4-fwd]   L{} GPU weight_dump @ off={} first8={:?}", layer, off_input_ln, f8);
+        }
+        // GPU read at OFFSET 0 (should work — first bytes of file)
+        {
+            let cb = ctx.queue.new_command_buffer();
+            let e1 = cb.new_compute_command_encoder();
+            e1.set_compute_pipeline_state(&ctx.weight_dump);
+            e1.set_buffer(0, Some(wbuf), 0);
+            e1.set_buffer(1, Some(&ctx.buf_input_normed), 0);
+            e1.dispatch_thread_groups(metal::MTLSize::new(1, 1, 1), metal::MTLSize::new(8, 1, 1));
+            e1.end_encoding(); cb.commit(); cb.wait_until_completed();
+            let p = ctx.buf_input_normed.contents() as *const f32;
+            let f8: Vec<f32> = unsafe { (0..8).map(|i| *p.add(i)).collect() };
+            eprintln!("[gemma4-fwd]   L{} GPU weight_dump @ off=0 first8={:?}", layer, f8);
+        }
+        // GPU buffer length
+        eprintln!("[gemma4-fwd]   wbuf length: {}", wbuf.length());
+        // GPU const_write: verify GPU writes to buf_input_normed
+        {
+            let cb = ctx.queue.new_command_buffer();
+            let e1 = cb.new_compute_command_encoder();
+            e1.set_compute_pipeline_state(&ctx.const_write);
+            e1.set_buffer(0, Some(&ctx.buf_input_normed), 0);
+            let dim_u32 = 16u32;
+            let dim_ptr: *const u32 = &dim_u32;
+            e1.set_bytes(1, 4, dim_ptr as *const std::ffi::c_void);
+            e1.dispatch_thread_groups(metal::MTLSize::new(1, 1, 1), metal::MTLSize::new(16, 1, 1));
+            e1.end_encoding(); cb.commit(); cb.wait_until_completed();
+            let p = ctx.buf_input_normed.contents() as *const f32;
+            let f5: Vec<f32> = unsafe { (0..5).map(|i| *p.add(i)).collect() };
+            eprintln!("[gemma4-fwd]   L{} GPU const_write first5={:?} (expect 7.5)", layer, f5);
+        }
+        // GPU copy_test: verify GPU sees CPU-written buf_hidden
+        {
+            let cb = ctx.queue.new_command_buffer();
+            let e1 = cb.new_compute_command_encoder();
+            e1.set_compute_pipeline_state(&ctx.copy_test);
+            e1.set_buffer(0, Some(&ctx.buf_hidden), 0);
+            e1.set_buffer(1, Some(&ctx.buf_input_normed), 0);
+            let dim_u32 = C::HIDDEN_DIM as u32;
+            let dim_ptr: *const u32 = &dim_u32;
+            e1.set_bytes(2, 4, dim_ptr as *const std::ffi::c_void);
+            e1.dispatch_thread_groups(
+                metal::MTLSize::new(((C::HIDDEN_DIM as u64 + 255)/256) as u64, 1, 1),
+                metal::MTLSize::new(256, 1, 1),
+            );
+            e1.end_encoding(); cb.commit(); cb.wait_until_completed();
+            let p = ctx.buf_input_normed.contents() as *const f32;
+            let s: f32 = unsafe { (0..C::HIDDEN_DIM).map(|i| { let v = *p.add(i); v*v }).sum() };
+            let f5: Vec<f32> = unsafe { (0..5).map(|i| *p.add(i)).collect() };
+            eprintln!("[gemma4-fwd]   L{} GPU copy_test ||copy||={:.4} first5={:?}", layer, s.sqrt(), f5);
+        }
+        // GPU input_layernorm via safe rms_norm kernel
+        {
+            let cb = ctx.queue.new_command_buffer();
+            let e1 = cb.new_compute_command_encoder();
+            gk::encode_rms_norm_fused_bf16(ctx, e1, &ctx.buf_hidden, 0, wbuf, off_input_ln, &ctx.buf_input_normed, 0, hidden_dim);
+            e1.end_encoding(); cb.commit(); cb.wait_until_completed();
+            let p = ctx.buf_input_normed.contents() as *const f32;
+            let s: f32 = unsafe { (0..C::HIDDEN_DIM).map(|i| { let v = *p.add(i); v*v }).sum() };
+            eprintln!("[gemma4-fwd]   L{} GPU(safe) input_normed ||x||={:.4}", layer, s.sqrt());
+        }
+        // CPU q_proj matvec test
+        {
+            let w_name = format!("{}.self_attn.q_proj.weight", prefix);
+            let s_name = format!("{}.self_attn.q_proj.scales", prefix);
+            let b_name = format!("{}.self_attn.q_proj.biases", prefix);
+            let w = self.model.weight_file.get_tensor_u32(&w_name).unwrap();
+            let s = self.model.weight_file.get_tensor_u16(&s_name).unwrap();
+            let b = self.model.weight_file.get_tensor_u16(&b_name).unwrap();
+            let xp = ctx.buf_input_normed.contents() as *const f32;
+            let outp = ctx.buf_q.contents() as *mut f32;
+            const GS: usize = 64;
+            let in_dim = C::HIDDEN_DIM;
+            let num_groups = in_dim / GS;
+            let packed_per_row = in_dim / 8;
+            // First 4 rows only
+            unsafe {
+                for r in 0..(q_dim as usize) {
+                    let mut acc = 0.0f32;
+                    for g in 0..num_groups {
+                        let scl = bf16_to_f32(s[r * num_groups + g]);
+                        let bia = bf16_to_f32(b[r * num_groups + g]);
+                        for p in 0..8 {
+                            let packed = w[r * packed_per_row + g * 8 + p];
+                            for n in 0..8 {
+                                let nibble = (packed >> (n * 4)) & 0xF;
+                                let val = (nibble as f32) * scl + bia;
+                                acc += val * *xp.add(g * GS + p * 8 + n);
+                            }
+                        }
+                    }
+                    *outp.add(r) = acc;
+                }
+            }
+            let s: f32 = unsafe { (0..(q_dim as usize)).map(|i| { let v = *outp.add(i); v*v }).sum() };
+            eprintln!("[gemma4-fwd]   L{} CPU q_proj ||q||={:.4}", layer, s.sqrt());
+        }
+        // ISOLATED k_proj test
+        {
+            let cb = ctx.queue.new_command_buffer();
+            let e1 = cb.new_compute_command_encoder();
+            self.encode_matvec_auto(e1, &format!("{}.self_attn.k_proj", prefix),
+                &ctx.buf_input_normed, 0, &ctx.buf_k, 0, kv_dim, hidden_dim);
+            e1.end_encoding();
+            cb.commit();
+            cb.wait_until_completed();
+            let p = ctx.buf_k.contents() as *const f32;
+            let s: f32 = unsafe { (0..(kv_dim as usize)).map(|i| { let v = *p.add(i); v*v }).sum() };
+            let f5: Vec<f32> = unsafe { (0..5).map(|i| *p.add(i)).collect() };
+            eprintln!("[gemma4-fwd]   L{} ISOLATED k_proj ||k||={:.4} first5={:?}", layer, s.sqrt(), f5);
+        }
+
         let cmd_buf = ctx.queue.new_command_buffer();
         let enc = cmd_buf.new_compute_command_encoder();
 
-        // ── 1. input_layernorm: buf_hidden × input_layernorm.weight → buf_input_normed ──
-        gk::encode_rms_norm_fused_bf16(
-            ctx, enc,
-            &ctx.buf_hidden, 0,
-            wbuf, off_input_ln,
-            &ctx.buf_input_normed, 0,
-            hidden_dim,
-        );
+        // 2. V projection (k already done above).
+        let _ = q_dim;
+        self.encode_matvec_auto(enc, &format!("{}.self_attn.v_proj", prefix),
+            &ctx.buf_input_normed, 0, &ctx.buf_v, 0, kv_dim, hidden_dim);
 
-        // ── 2. Q / K / V projections (BF16 matvec) ──────────────────────────
-        gk::encode_matvec_bf16(
-            ctx, enc,
-            wbuf, off_q_proj_w,
-            &ctx.buf_input_normed, 0,
-            &ctx.buf_q, 0,
-            q_dim, hidden_dim,
-        );
-        gk::encode_matvec_bf16(
-            ctx, enc,
-            wbuf, off_k_proj_w,
-            &ctx.buf_input_normed, 0,
-            &ctx.buf_k, 0,
-            kv_dim, hidden_dim,
-        );
-        gk::encode_matvec_bf16(
-            ctx, enc,
-            wbuf, off_v_proj_w,
-            &ctx.buf_input_normed, 0,
-            &ctx.buf_v, 0,
-            kv_dim, hidden_dim,
-        );
+        // CPU q_head_norm_rope (DEBUG bypass)
+        {
+            let qp = ctx.buf_q.contents() as *mut f32;
+            let wp = (self.weight_buffer.base as usize + off_q_norm_w as usize) as *const u16;
+            let hd = head_dim as usize;
+            let rd = head_dim as usize;
+            let nh = n_q_heads as usize;
+            unsafe {
+                for h in 0..nh {
+                    let base = h * hd;
+                    let mut sum_sq = 0.0f32;
+                    for i in 0..hd { let v = *qp.add(base + i); sum_sq += v*v; }
+                    let inv_rms = 1.0 / (sum_sq / hd as f32 + crate::constants::RMS_NORM_EPS).sqrt();
+                    let mut q_normed = vec![0.0f32; hd];
+                    for i in 0..hd {
+                        let w = bf16_to_f32(*wp.add(i));
+                        q_normed[i] = *qp.add(base + i) * inv_rms * w;
+                    }
+                    let rot_half = rd / 2;
+                    for tid in 0..hd {
+                        if tid < rd {
+                            let (theta, pair) = if tid < rot_half {
+                                ((pos as f32) * (rope_theta).powf(-2.0 * tid as f32 / rd as f32), q_normed[tid + rot_half])
+                            } else {
+                                let p2 = tid - rot_half;
+                                ((pos as f32) * (rope_theta).powf(-2.0 * p2 as f32 / rd as f32), q_normed[p2])
+                            };
+                            let (cos_t, sin_t) = (theta.cos(), theta.sin());
+                            let out = if tid < rot_half {
+                                q_normed[tid] * cos_t - pair * sin_t
+                            } else {
+                                pair * sin_t + q_normed[tid] * cos_t
+                            };
+                            *qp.add(base + tid) = out;
+                        } else {
+                            *qp.add(base + tid) = q_normed[tid];
+                        }
+                    }
+                }
+            }
+            let s: f32 = unsafe { (0..(q_dim as usize)).map(|i| { let v = *qp.add(i); v*v }).sum() };
+            eprintln!("[gemma4-fwd]   L{} CPU q_head_norm_rope ||q||={:.4}", layer, s.sqrt());
+        }
 
-        // ── 3. Q head-norm + RoPE (no q_gate) ──────────────────────────────
-        // For sliding layers: rotary_dim = head_dim (full rotary).
-        gk::encode_q_head_norm_rope_no_gate(
-            ctx, enc,
-            &ctx.buf_q, 0,
-            wbuf, off_q_norm_w,
-            &ctx.buf_q, 0,                // in-place — reads then writes
-            n_q_heads, head_dim, head_dim,
-            rope_theta, pos,
-        );
-
-        // ── 4. K head-norm + RoPE (in-place on buf_k) ──────────────────────
+        // 4. K head-norm + RoPE
         gk::encode_k_head_norm_rope(
             ctx, enc,
             &ctx.buf_k, 0,
@@ -348,14 +578,9 @@ impl<C: Gemma4ModelConfig> Gemma4Fused<C> {
             n_q_heads, head_dim, kv_dim, heads_per_kv,
         );
 
-        // ── 8. o_proj: buf_attn_out × o_proj.weight → buf_o_proj_out ───────
-        gk::encode_matvec_bf16(
-            ctx, enc,
-            wbuf, off_o_proj_w,
-            &ctx.buf_attn_out, 0,
-            &ctx.buf_o_proj_out, 0,
-            hidden_dim, q_dim,
-        );
+        // 8. o_proj (auto-dispatched BF16 or INT4)
+        self.encode_matvec_auto(enc, &format!("{}.self_attn.o_proj", prefix),
+            &ctx.buf_attn_out, 0, &ctx.buf_o_proj_out, 0, hidden_dim, q_dim);
 
         // ── 9. post_attention_layernorm + residual ─────────────────────────
         // h = residual + post_attention_layernorm(o_proj_out)
@@ -378,6 +603,26 @@ impl<C: Gemma4ModelConfig> Gemma4Fused<C> {
         enc.end_encoding();
         cmd_buf.commit();
         cmd_buf.wait_until_completed();
+
+        // Debug: ||hidden||^2 after attention block
+        {
+            let p = self.ctx.buf_hidden.contents() as *const f32;
+            let h_sq: f32 = unsafe { (0..C::HIDDEN_DIM).map(|i| { let v = *p.add(i); v*v }).sum() };
+            let qp = self.ctx.buf_q.contents() as *const f32;
+            let q_sq: f32 = unsafe { (0..(C::NUM_ATTN_HEADS * C::HEAD_DIM)).map(|i| { let v = *qp.add(i); v*v }).sum() };
+            let op = self.ctx.buf_o_proj_out.contents() as *const f32;
+            let o_sq: f32 = unsafe { (0..C::HIDDEN_DIM).map(|i| { let v = *op.add(i); v*v }).sum() };
+            let pn = self.ctx.buf_post_attn_normed.contents() as *const f32;
+            let pn_sq: f32 = unsafe { (0..C::HIDDEN_DIM).map(|i| { let v = *pn.add(i); v*v }).sum() };
+            let ap = self.ctx.buf_attn_out.contents() as *const f32;
+            let a_sq: f32 = unsafe { (0..(C::NUM_ATTN_HEADS*C::HEAD_DIM)).map(|i| { let v = *ap.add(i); v*v }).sum() };
+            let kp = self.ctx.buf_k.contents() as *const f32;
+            let k_sq: f32 = unsafe { (0..(C::NUM_KV_HEADS*C::HEAD_DIM)).map(|i| { let v = *kp.add(i); v*v }).sum() };
+            let vp = self.ctx.buf_v.contents() as *const f32;
+            let v_sq: f32 = unsafe { (0..(C::NUM_KV_HEADS*C::HEAD_DIM)).map(|i| { let v = *vp.add(i); v*v }).sum() };
+            eprintln!("[gemma4-fwd]   L{} attn-out: ||q||={:.4} ||k||={:.4} ||v||={:.4} ||attn||={:.4} ||o_proj||={:.4} ||post_attn_normed||={:.4} ||hidden||={:.4}",
+                layer, q_sq.sqrt(), k_sq.sqrt(), v_sq.sqrt(), a_sq.sqrt(), o_sq.sqrt(), pn_sq.sqrt(), h_sq.sqrt());
+        }
 
         // ── Dual FFN block (shared with forward_full_layer) ─────────────────
         self.forward_dual_ffn(&prefix)
@@ -414,46 +659,24 @@ impl<C: Gemma4ModelConfig> Gemma4Fused<C> {
 
         let prefix = format!("language_model.model.layers.{}", layer);
         let off_input_ln     = self.tensor_offset_required(&format!("{}.input_layernorm.weight", prefix));
-        let off_q_proj_w     = self.tensor_offset_required(&format!("{}.self_attn.q_proj.weight", prefix));
-        let off_k_proj_w     = self.tensor_offset_required(&format!("{}.self_attn.k_proj.weight", prefix));
-        let off_o_proj_w     = self.tensor_offset_required(&format!("{}.self_attn.o_proj.weight", prefix));
         let off_q_norm_w     = self.tensor_offset_required(&format!("{}.self_attn.q_norm.weight", prefix));
         let off_k_norm_w     = self.tensor_offset_required(&format!("{}.self_attn.k_norm.weight", prefix));
         let off_post_attn_ln = self.tensor_offset_required(&format!("{}.post_attention_layernorm.weight", prefix));
-        // No v_proj on full layers — attention_k_eq_v=True (verified by
-        // safetensors inspection: layer 5 has no self_attn.v_proj.weight).
+        // No v_proj on full layers (attention_k_eq_v).
 
         let wbuf = &self.weight_buffer.buf;
         let ctx = &self.ctx;
 
-        // ── Attention block ─────────────────────────────────────────────────
         let cmd_buf = ctx.queue.new_command_buffer();
         let enc = cmd_buf.new_compute_command_encoder();
 
-        // 1. input_layernorm
         gk::encode_rms_norm_fused_bf16(
-            ctx, enc,
-            &ctx.buf_hidden, 0,
-            wbuf, off_input_ln,
-            &ctx.buf_input_normed, 0,
-            hidden_dim,
-        );
-        // 2. Q projection (out = q_dim_full = 8192)
-        gk::encode_matvec_bf16(
-            ctx, enc,
-            wbuf, off_q_proj_w,
-            &ctx.buf_input_normed, 0,
-            &ctx.buf_q, 0,
-            q_dim_full, hidden_dim,
-        );
-        // 3. K projection (out = kv_dim_full = 1024) — also serves as raw V
-        gk::encode_matvec_bf16(
-            ctx, enc,
-            wbuf, off_k_proj_w,
-            &ctx.buf_input_normed, 0,
-            &ctx.buf_k, 0,
-            kv_dim_full, hidden_dim,
-        );
+            ctx, enc, &ctx.buf_hidden, 0, wbuf, off_input_ln,
+            &ctx.buf_input_normed, 0, hidden_dim);
+        self.encode_matvec_auto(enc, &format!("{}.self_attn.q_proj", prefix),
+            &ctx.buf_input_normed, 0, &ctx.buf_q, 0, q_dim_full, hidden_dim);
+        self.encode_matvec_auto(enc, &format!("{}.self_attn.k_proj", prefix),
+            &ctx.buf_input_normed, 0, &ctx.buf_k, 0, kv_dim_full, hidden_dim);
 
         enc.end_encoding();
         cmd_buf.commit();
@@ -518,13 +741,8 @@ impl<C: Gemma4ModelConfig> Gemma4Fused<C> {
             n_q_heads, kv_dim_full, heads_per_kv_f,
         );
         // 10. o_proj: [hidden, q_dim_full]
-        gk::encode_matvec_bf16(
-            ctx, enc_qk,
-            wbuf, off_o_proj_w,
-            &ctx.buf_attn_out, 0,
-            &ctx.buf_o_proj_out, 0,
-            hidden_dim, q_dim_full,
-        );
+        self.encode_matvec_auto(enc_qk, &format!("{}.self_attn.o_proj", prefix),
+            &ctx.buf_attn_out, 0, &ctx.buf_o_proj_out, 0, hidden_dim, q_dim_full);
         // 11. post_attention_layernorm + first residual
         gk::encode_rms_norm_fused_bf16(
             ctx, enc_qk,
@@ -575,14 +793,14 @@ impl<C: Gemma4ModelConfig> Gemma4Fused<C> {
         let off_post_ff_ln     = self.tensor_offset_required(&format!("{}.post_feedforward_layernorm.weight", prefix));
         let off_post_ff_ln_1   = self.tensor_offset_required(&format!("{}.post_feedforward_layernorm_1.weight", prefix));
         let off_post_ff_ln_2   = self.tensor_offset_required(&format!("{}.post_feedforward_layernorm_2.weight", prefix));
-        let off_mlp_gate_w     = self.tensor_offset_required(&format!("{}.mlp.gate_proj.weight", prefix));
-        let off_mlp_up_w       = self.tensor_offset_required(&format!("{}.mlp.up_proj.weight", prefix));
-        let off_mlp_down_w     = self.tensor_offset_required(&format!("{}.mlp.down_proj.weight", prefix));
-        let off_router_proj    = self.tensor_offset_required(&format!("{}.router.proj.weight", prefix));
+        // mlp.{gate,up,down}_proj and router.proj are looked up by
+        // encode_matvec_auto — no upfront offset probe.
         let off_router_scale   = self.tensor_offset_required(&format!("{}.router.scale", prefix));
         let off_per_expert_sc  = self.tensor_offset_required(&format!("{}.router.per_expert_scale", prefix));
-        let off_experts_gu     = self.tensor_offset_required(&format!("{}.experts.gate_up_proj", prefix));
-        let off_experts_down   = self.tensor_offset_required(&format!("{}.experts.down_proj", prefix));
+        // experts.{gate_up,down}_proj lookups happen inside
+        // encode_matvec_expert_slice (the name structure differs between
+        // BF16 — single tensor at the base name — and INT4 — three
+        // sibling tensors at .weight/.scales/.biases).
         let off_layer_scalar   = self.tensor_offset_required(&format!("{}.layer_scalar", prefix));
 
         let wbuf = &self.weight_buffer.buf;
@@ -597,17 +815,21 @@ impl<C: Gemma4ModelConfig> Gemma4Fused<C> {
             );
         }
 
-        // Dense MLP path + Router (single cmd buf).
+        // Dense MLP path + Router.
         let cmd_buf2 = ctx.queue.new_command_buffer();
         let enc2 = cmd_buf2.new_compute_command_encoder();
         gk::encode_rms_norm_fused_bf16(ctx, enc2, &ctx.buf_hidden, 0, wbuf, off_pre_ff_ln, &ctx.buf_pre_ff_normed, 0, hidden_dim);
-        gk::encode_matvec_bf16(ctx, enc2, wbuf, off_mlp_gate_w, &ctx.buf_pre_ff_normed, 0, &ctx.buf_mlp_gate, 0, inter, hidden_dim);
-        gk::encode_matvec_bf16(ctx, enc2, wbuf, off_mlp_up_w,   &ctx.buf_pre_ff_normed, 0, &ctx.buf_mlp_up,   0, inter, hidden_dim);
+        self.encode_matvec_auto(enc2, &format!("{}.mlp.gate_proj", prefix),
+            &ctx.buf_pre_ff_normed, 0, &ctx.buf_mlp_gate, 0, inter, hidden_dim);
+        self.encode_matvec_auto(enc2, &format!("{}.mlp.up_proj", prefix),
+            &ctx.buf_pre_ff_normed, 0, &ctx.buf_mlp_up, 0, inter, hidden_dim);
         gk::encode_gelu_fused(ctx, enc2, &ctx.buf_mlp_gate, 0, &ctx.buf_mlp_up, 0, &ctx.buf_mlp_act, 0, inter);
-        gk::encode_matvec_bf16(ctx, enc2, wbuf, off_mlp_down_w, &ctx.buf_mlp_act, 0, &ctx.buf_mlp_down, 0, hidden_dim, inter);
+        self.encode_matvec_auto(enc2, &format!("{}.mlp.down_proj", prefix),
+            &ctx.buf_mlp_act, 0, &ctx.buf_mlp_down, 0, hidden_dim, inter);
         gk::encode_rms_norm_fused_bf16(ctx, enc2, &ctx.buf_mlp_down, 0, wbuf, off_post_ff_ln_1, &ctx.buf_mlp_post, 0, hidden_dim);
         gk::encode_rms_norm_router(ctx, enc2, &ctx.buf_hidden, 0, wbuf, off_router_scale, &ctx.buf_router_normed, 0, hidden_dim);
-        gk::encode_matvec_bf16(ctx, enc2, wbuf, off_router_proj, &ctx.buf_router_normed, 0, &ctx.buf_router_logits, 0, num_experts, hidden_dim);
+        self.encode_matvec_auto(enc2, &format!("{}.router.proj", prefix),
+            &ctx.buf_router_normed, 0, &ctx.buf_router_logits, 0, num_experts, hidden_dim);
         enc2.end_encoding();
         cmd_buf2.commit();
         cmd_buf2.wait_until_completed();
@@ -645,21 +867,30 @@ impl<C: Gemma4ModelConfig> Gemma4Fused<C> {
             std::ptr::write_bytes(ctx.buf_expert_out.contents() as *mut u8, 0, C::HIDDEN_DIM * 4);
         }
 
-        let bf16_bytes: u64 = 2;
-        let per_expert_gu_bytes   = (2 * moe_inter * hidden_dim) as u64 * bf16_bytes;
-        let per_expert_down_bytes = (hidden_dim * moe_inter)    as u64 * bf16_bytes;
-        let gate_block_bytes      = (moe_inter * hidden_dim)    as u64 * bf16_bytes;
-
+        // Experts loop. gate_up_proj is [num_experts, 2*moe_inter, hidden];
+        // first moe_inter rows of each expert are gate, next moe_inter are up.
+        // down_proj is [num_experts, hidden, moe_inter]. encode_matvec_expert_slice
+        // computes per-expert byte offsets in both INT4 (3 sibling tensors) and
+        // BF16 (single tensor) layouts.
         for (ki, &expert_idx) in top_idx.iter().enumerate() {
-            let e_u64 = expert_idx as u64;
-            let expert_gu_off   = off_experts_gu   + e_u64 * per_expert_gu_bytes;
-            let expert_down_off = off_experts_down + e_u64 * per_expert_down_bytes;
             let cb = ctx.queue.new_command_buffer();
             let enc_e = cb.new_compute_command_encoder();
-            gk::encode_matvec_bf16(ctx, enc_e, wbuf, expert_gu_off,                     &ctx.buf_pre_ff_normed_2, 0, &ctx.buf_expert_gate, 0, moe_inter, hidden_dim);
-            gk::encode_matvec_bf16(ctx, enc_e, wbuf, expert_gu_off + gate_block_bytes,  &ctx.buf_pre_ff_normed_2, 0, &ctx.buf_expert_up,   0, moe_inter, hidden_dim);
+            // gate = rows [0, moe_inter) of expert
+            self.encode_matvec_expert_slice(
+                enc_e, &format!("{}.experts.gate_up_proj", prefix),
+                expert_idx, 2 * moe_inter, 0, moe_inter,
+                &ctx.buf_pre_ff_normed_2, 0, &ctx.buf_expert_gate, 0, hidden_dim);
+            // up = rows [moe_inter, 2*moe_inter) of expert
+            self.encode_matvec_expert_slice(
+                enc_e, &format!("{}.experts.gate_up_proj", prefix),
+                expert_idx, 2 * moe_inter, moe_inter, moe_inter,
+                &ctx.buf_pre_ff_normed_2, 0, &ctx.buf_expert_up, 0, hidden_dim);
             gk::encode_gelu_fused(ctx, enc_e, &ctx.buf_expert_gate, 0, &ctx.buf_expert_up, 0, &ctx.buf_expert_act, 0, moe_inter);
-            gk::encode_matvec_bf16(ctx, enc_e, wbuf, expert_down_off, &ctx.buf_expert_act, 0, &ctx.buf_expert_post, 0, hidden_dim, moe_inter);
+            // down = rows [0, hidden) of expert, in_dim=moe_inter
+            self.encode_matvec_expert_slice(
+                enc_e, &format!("{}.experts.down_proj", prefix),
+                expert_idx, hidden_dim, 0, hidden_dim,
+                &ctx.buf_expert_act, 0, &ctx.buf_expert_post, 0, moe_inter);
             enc_e.end_encoding();
             cb.commit();
             cb.wait_until_completed();
@@ -921,6 +1152,13 @@ impl<C: Gemma4ModelConfig> Engine for Gemma4Fused<C> {
                 } else {
                     self.forward_sliding_layer(layer, pos as u32)?;
                 }
+                // Debug trace: norm of hidden after this layer
+                let h_sq: f32 = unsafe {
+                    let p = self.ctx.buf_hidden.contents() as *const f32;
+                    (0..hidden_dim).map(|i| { let v = *p.add(i); v*v }).sum()
+                };
+                eprintln!("[gemma4-fwd] layer={} (full={}) ||h||^2={:.4}", layer, C::is_full_attn_layer(layer), h_sq);
+                if h_sq.is_nan() || h_sq > 1e20 || h_sq == 0.0 { break; }
             }
 
             // Copy final hidden back to CPU for the lm_head pass.
@@ -931,6 +1169,11 @@ impl<C: Gemma4ModelConfig> Engine for Gemma4Fused<C> {
                     hidden_dim,
                 );
             }
+            let h_in: f32 = embeddings[ti * hidden_dim..(ti + 1) * hidden_dim].iter().map(|v| v*v).sum();
+            let h_out: f32 = hidden_cpu.iter().map(|v| v*v).sum();
+            let h_nz = hidden_cpu.iter().filter(|v| **v != 0.0).count();
+            eprintln!("[gemma4-fwd] tok={} pos={} ||embed||^2={:.4} ||hidden||^2={:.4} nz={}/{}",
+                ti, pos, h_in, h_out, h_nz, hidden_dim);
 
             pos += 1;
             self.ctx.pos.set(pos);

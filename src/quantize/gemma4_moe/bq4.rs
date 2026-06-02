@@ -1,9 +1,7 @@
-//! Gemma 4 26B-A4B BF16-passthrough quantize pipeline.
+//! Gemma 4 26B-A4B BQ4 quantize pipeline.
 //!
-//! For Phase 2 / first-cut validation: NOT actually quantizing. Just
-//! renames HF tensors to the engine's expected names and writes them as
-//! BF16 to `model_weights.bin`. The engine's BF16 matvec path handles
-//! everything without further conversion.
+//! Quantizes matmul weights to INT4 (group=64), keeps norms/scalars at
+//! BF16. Net: ~12 GB on-disk vs ~48 GB BF16 — fits in 16 GB Mac RAM.
 //!
 //! Why no INT4/INT8 yet:
 //!   - forward_sliding_layer/forward_full_layer dispatch matvec_bf16
@@ -162,6 +160,80 @@ fn is_vision_tensor(hf_name: &str) -> bool {
         || hf_name.starts_with("multimodal_projector.")
 }
 
+// ─── DType selection ─────────────────────────────────────────────────────────
+//
+// INT4 for all matmul weights (per MLX-LM's quant_predicate). BF16 for norms,
+// per-channel/per-expert scalars, and the routing weights. Embed_tokens IS
+// INT4 (the engine dequantizes one row at a time at lookup time).
+
+fn classify_dtype(engine_name: &str, layer_types: &[String]) -> DType {
+    // Tensors that MUST stay BF16 (norms, scalars, 1D weights).
+    let bf16_suffixes: &[&str] = &[
+        "input_layernorm.weight",
+        "post_attention_layernorm.weight",
+        "pre_feedforward_layernorm.weight",
+        "pre_feedforward_layernorm_2.weight",
+        "post_feedforward_layernorm.weight",
+        "post_feedforward_layernorm_1.weight",
+        "post_feedforward_layernorm_2.weight",
+        "q_norm.weight",
+        "k_norm.weight",
+        "router.scale",
+        "router.per_expert_scale",
+        "layer_scalar",
+        "model.norm.weight",
+    ];
+    if bf16_suffixes.iter().any(|s| engine_name.ends_with(s)) {
+        return DType::Bf16;
+    }
+    // Full-layer o_proj has in_dim = 16*512 = 8192 which exceeds the INT4
+    // dequant kernel's threadgroup x_shared[4096] budget. Keep those at
+    // BF16. Sliding-layer o_proj has in_dim=4096 — fits.
+    if engine_name.ends_with(".self_attn.o_proj.weight") {
+        if let Some(li) = extract_layer_idx(engine_name) {
+            if layer_types.get(li).map(|s| s == "full_attention").unwrap_or(false) {
+                return DType::Bf16;
+            }
+        }
+    }
+    // Everything else is INT4: q/k/v_proj, sliding-layer o_proj,
+    // mlp.{gate,up,down}, router.proj, experts.{gate_up,down}_proj,
+    // embed_tokens.
+    DType::Int4
+}
+
+/// Identifies the ZeroCenteredRMSNorm tensors in Gemma 4. These apply
+/// `x * (1 + w)`; our kernel does `x * w`, so we shift the stored weight
+/// by +1 at quantize time.
+fn is_zero_centered_norm(engine_name: &str) -> bool {
+    // Every norm in Gemma 4's decoder is zero-centered, INCLUDING q_norm
+    // and k_norm (per the MLX-VLM Gemma 4 source: every RMSNorm in the
+    // text model is Gemma4RMSNorm = zero-centered).
+    let zc_suffixes: &[&str] = &[
+        ".input_layernorm.weight",
+        ".post_attention_layernorm.weight",
+        ".pre_feedforward_layernorm.weight",
+        ".pre_feedforward_layernorm_2.weight",
+        ".post_feedforward_layernorm.weight",
+        ".post_feedforward_layernorm_1.weight",
+        ".post_feedforward_layernorm_2.weight",
+        ".self_attn.q_norm.weight",
+        ".self_attn.k_norm.weight",
+    ];
+    if zc_suffixes.iter().any(|s| engine_name.ends_with(s)) {
+        return true;
+    }
+    // Final model norm.
+    engine_name == "language_model.model.norm.weight"
+}
+
+fn extract_layer_idx(name: &str) -> Option<usize> {
+    let i = name.find("layers.")? + 7;
+    let rest = &name[i..];
+    let end = rest.find('.').unwrap_or(rest.len());
+    rest[..end].parse().ok()
+}
+
 // ─── Scheme ─────────────────────────────────────────────────────────────────
 pub struct Gemma4Bf16Scheme {
     params: Gemma4Params,
@@ -196,16 +268,36 @@ impl QuantScheme for Gemma4Bf16Scheme {
         let engine_name = self.name_map.get(hf_name)
             .cloned()
             .unwrap_or_else(|| {
-                eprintln!("[gemma4-bf16] WARN: unmapped tensor {} — passing through unchanged", hf_name);
+                eprintln!("[gemma4-bq4] WARN: unmapped tensor {} — passing through unchanged", hf_name);
                 hf_name.to_string()
             });
+        let quant = classify_dtype(&engine_name, &self.params.layer_types);
         WeightClass {
             name: engine_name,
-            quant: DType::Bf16,
+            quant,
             // Even expert tensors get WeightKind::Normal — we DO NOT split them
             // per-expert. forward_dual_ffn reads per-expert slices via byte
             // arithmetic directly off the merged tensor.
             kind: WeightKind::Normal,
+        }
+    }
+
+    fn sanitize(&self, engine_name: &str, values: &mut [f32], shape: &mut Vec<usize>) {
+        // Reshape 3D experts tensors to 2D so INT4 group-quant runs per-row.
+        if engine_name.ends_with(".experts.gate_up_proj")
+            || engine_name.ends_with(".experts.down_proj")
+        {
+            if shape.len() == 3 {
+                let (e, r, c) = (shape[0], shape[1], shape[2]);
+                *shape = vec![e * r, c];
+            }
+        }
+        // Gemma 4 uses ZeroCenteredRMSNorm: applies `x * (1 + w)` rather than
+        // `x * w`. Our kernel does the latter, so we bake `+1` into the
+        // stored weight at quantize time (same trick as qwen35's
+        // is_qwen36 shift).
+        if is_zero_centered_norm(engine_name) {
+            for v in values.iter_mut() { *v += 1.0; }
         }
     }
 
