@@ -458,6 +458,123 @@ kernel void q_head_norm_rope_no_gate(
 }
 
 // ============================================================================
+// BF16 matvec for in_dim > 4096 — needed for Gemma 4 full-layer o_proj
+// where in_dim = num_heads * global_head_dim = 16 * 512 = 8192.
+// qwen35's matvec_bf16 has x_shared[4096] which silently overflows for
+// larger in_dim. Same kernel structure but with x_shared[8192].
+// Uses ~32 KB threadgroup memory (within Apple Silicon's 32 KB budget).
+// ============================================================================
+kernel void matvec_bf16_h8192(
+    device const uint16_t* W_bf16 [[buffer(0)]],
+    device const float*    x      [[buffer(1)]],
+    device float*          out    [[buffer(2)]],
+    constant uint&         out_dim [[buffer(3)]],
+    constant uint&         in_dim  [[buffer(4)]],
+    uint tgid       [[threadgroup_position_in_grid]],
+    uint lid        [[thread_position_in_threadgroup]],
+    uint simd_lane  [[thread_index_in_simdgroup]],
+    uint simd_group [[simdgroup_index_in_threadgroup]]
+) {
+    uint row = tgid * ROWS_PER_TG + simd_group;
+    threadgroup float x_shared[8192];
+    for (uint i = lid; i < in_dim; i += 256) {
+        x_shared[i] = x[i];
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (row >= out_dim) return;
+    device const uint16_t* w_row = W_bf16 + row * in_dim;
+    float acc = 0.0f;
+    for (uint col = simd_lane; col < in_dim; col += 32) {
+        acc += bf16_to_f32(w_row[col]) * x_shared[col];
+    }
+    float sum = simd_sum(acc);
+    if (simd_lane == 0) {
+        out[row] = sum;
+    }
+}
+
+// ============================================================================
+// Q/K head norm + RoPE — Gemma 4 FULL-attention ProportionalRoPE variant.
+//
+// Differs from q_head_norm_rope_no_gate in two ways:
+//
+//   1. The rotated dims aren't the first `rotary_dim` — they are the FIRST
+//      half of the rotated_dims taken from the LEFT half of the head, AND
+//      the first half of the rotated_dims taken from the RIGHT half of the
+//      head (where left = head[0..head_dim/2], right = head[head_dim/2..]).
+//
+//   2. The rotation angle exponents are scaled by the FULL head_dim (not
+//      rotary_dim) → "proportional" RoPE.
+//
+// Matches `ProportionalRoPE` in vendor/mlx-vlm/mlx_vlm/models/gemma4/
+// rope_utils.py. Used for Gemma 4 26B-A4B full-attention layers with
+// head_dim=512 and partial_rotary_factor=0.25 → rotary_dim=128.
+//
+// Dispatch: num_q_heads × head_dim threads (same as no_gate variant).
+// Constraint: head_dim ≤ 512 (partial[512] threadgroup buffer).
+// ============================================================================
+
+kernel void q_head_norm_rope_proportional(
+    device const float*    q_proj      [[buffer(0)]],
+    device const uint16_t* q_norm_w    [[buffer(1)]],
+    device float*          q_out       [[buffer(2)]],
+    constant uint&         head_dim    [[buffer(3)]],
+    constant uint&         rotary_dim  [[buffer(4)]],
+    constant float&        rope_theta  [[buffer(5)]],
+    constant uint&         pos         [[buffer(6)]],
+    constant float&        eps         [[buffer(7)]],
+    uint head [[threadgroup_position_in_grid]],
+    uint tid  [[thread_position_in_threadgroup]]
+) {
+    uint base = head * head_dim;
+    float q_val = q_proj[base + tid];
+
+    // RMS norm reduction over head_dim threads.
+    threadgroup float partial[512];
+    partial[tid] = q_val * q_val;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (tid == 0) {
+        float s = 0;
+        for (uint i = 0; i < head_dim; i++) s += partial[i];
+        partial[0] = s;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    float inv_rms = rsqrt(partial[0] / float(head_dim) + eps);
+
+    // Normalised value (RMSNorm × q_norm.weight)
+    q_val *= inv_rms * bf16_to_f32(q_norm_w[tid]);
+
+    // ProportionalRoPE: rotate (tid, tid + head_dim/2) for tid < rotary_dim/2
+    // AND (tid - head_dim/2, tid) for tid in [head_dim/2, head_dim/2 + rotary_dim/2).
+    // Angle index i ∈ [0, rotary_dim/2) where i = tid (left) or tid - head_dim/2 (right).
+    // freq exponent uses head_dim (not rotary_dim) — that's the "proportional" part.
+    uint rot_half = rotary_dim / 2;
+    uint hd_half  = head_dim / 2;
+    bool is_left  = tid < rot_half;
+    bool is_right = (tid >= hd_half) && (tid < hd_half + rot_half);
+    if (is_left || is_right) {
+        uint i = is_left ? tid : (tid - hd_half);
+        float theta = float(pos) * pow(rope_theta, -2.0f * float(i) / float(head_dim));
+        float cos_t = cos(theta);
+        float sin_t = sin(theta);
+        // Pair value: for left lane, pair is normed right[tid+hd_half]; for
+        // right lane, pair is normed left[tid-hd_half]. Both read q_proj and
+        // apply RMSNorm+weight to match.
+        uint pair_idx = is_left ? (tid + hd_half) : (tid - hd_half);
+        float pair_val = q_proj[base + pair_idx]
+                         * inv_rms * bf16_to_f32(q_norm_w[pair_idx]);
+        if (is_left) {
+            q_out[base + tid] = q_val * cos_t - pair_val * sin_t;
+        } else {
+            // q_out[right] = right*cos + left*sin
+            q_out[base + tid] = pair_val * sin_t + q_val * cos_t;
+        }
+    } else {
+        q_out[base + tid] = q_val;
+    }
+}
+
+// ============================================================================
 // Outer (post-residual) multiply by per-layer `layer_scalar`.
 // Multiplies a [HIDDEN_DIM] buffer in-place by a single bf16 scalar.
 // ============================================================================

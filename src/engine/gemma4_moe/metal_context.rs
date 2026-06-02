@@ -44,6 +44,8 @@ pub struct Gemma4MetalContext {
     pub weight_dump: ComputePipelineState,
     pub const_write: ComputePipelineState,
     pub q_head_norm_rope_no_gate: ComputePipelineState,
+    pub q_head_norm_rope_proportional: ComputePipelineState,
+    pub matvec_bf16_h8192: ComputePipelineState,
     pub mul_scalar_bf16: ComputePipelineState,
     pub rms_norm_router: ComputePipelineState,
 
@@ -132,6 +134,8 @@ impl Gemma4MetalContext {
         let weight_dump            = make("weight_dump")?;
         let const_write            = make("const_write")?;
         let q_head_norm_rope_no_gate = make("q_head_norm_rope_no_gate")?;
+        let q_head_norm_rope_proportional = make("q_head_norm_rope_proportional")?;
+        let matvec_bf16_h8192      = make("matvec_bf16_h8192")?;
         let mul_scalar_bf16        = make("mul_scalar_bf16")?;
         let rms_norm_router        = make("rms_norm_router")?;
 
@@ -230,6 +234,8 @@ impl Gemma4MetalContext {
             weight_dump,
             const_write,
             q_head_norm_rope_no_gate,
+            q_head_norm_rope_proportional,
+            matvec_bf16_h8192,
             mul_scalar_bf16,
             rms_norm_router,
         };

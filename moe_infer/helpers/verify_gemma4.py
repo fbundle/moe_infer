@@ -133,10 +133,22 @@ def _load_mlx_reference(mlx_dir: str, token_ids: list[int]) -> np.ndarray:
     return arr
 
 
-def _load_our_engine_logits(our_dir: str, token_ids: list[int]) -> np.ndarray:
-    """Run our engine's forward on the SAME token ids. Return logits [N, V]."""
+def _load_our_engine_logits(our_dir: str, token_ids: list[int], capture: str | None = None) -> np.ndarray:
+    """Run our engine's forward on the SAME token ids. Return logits [N, V].
+
+    When ``capture`` is set, the engine writes per-layer hidden states to
+    that path (binary, see fused_exp3.rs GEMMA4_CAPTURE_HIDDEN).
+    """
+    import os
     import _moe_infer_rs as r
 
+    if capture is not None:
+        os.environ["GEMMA4_CAPTURE_HIDDEN"] = capture
+        # Remove stale capture from a previous run.
+        try:
+            os.remove(capture)
+        except FileNotFoundError:
+            pass
     print(f"[ours] loading {our_dir}", file=sys.stderr)
     m = r.Model(our_dir)
     e = r.Engine(m, "Gemma4MoEFused", 0)
@@ -145,6 +157,31 @@ def _load_our_engine_logits(our_dir: str, token_ids: list[int]) -> np.ndarray:
     print(f"[ours] forward(N={len(token_ids)})...", file=sys.stderr)
     logits = e.forward(arr, c)
     return np.asarray(logits)
+
+
+def _read_our_captured_hidden(path: str) -> list[np.ndarray]:
+    """Parse the binary file written by fused_exp3.rs::forward_hidden.
+
+    File is a sequence of token records:
+        u32 token_idx
+        u32 num_layers
+        u32 hidden_dim
+        f32 * num_layers * hidden_dim
+    Returns list[N] of [num_layers, hidden_dim] arrays.
+    """
+    import struct
+    with open(path, "rb") as f:
+        data = f.read()
+    out: list[np.ndarray] = []
+    off = 0
+    while off < len(data):
+        ti, num_layers, hidden_dim = struct.unpack_from("<III", data, off)
+        off += 12
+        vals = np.frombuffer(data, dtype=np.float32, count=num_layers * hidden_dim, offset=off)
+        off += num_layers * hidden_dim * 4
+        out.append(vals.reshape(num_layers, hidden_dim).copy())
+        _ = ti
+    return out
 
 
 def _compare(mlx_logits: np.ndarray, our_logits: np.ndarray, label: str = "") -> None:
@@ -190,8 +227,35 @@ def main() -> None:
     print(f"token ids: {ids}", file=sys.stderr)
 
     mlx_logits = _load_mlx_reference(args.mlx_dir, ids)
-    our_logits = _load_our_engine_logits(args.our_dir, ids)
+    our_capture_path = "/tmp/gemma4_our_hidden.bin"
+    our_logits = _load_our_engine_logits(args.our_dir, ids, capture=our_capture_path)
     _compare(mlx_logits, our_logits, label=f"N={len(ids)}")
+
+    # Per-layer hidden state diff (from /tmp captures).
+    try:
+        import os
+        mlx_hidden_npz = np.load("/tmp/gemma4_mlx_hidden.npz")
+        ours_per_tok = _read_our_captured_hidden(our_capture_path)
+        print("\n── Per-layer hidden (cos / mae / max_diff) ──")
+        n_layers = max(int(k.split("_")[1]) for k in mlx_hidden_npz.files) + 1
+        for li in range(n_layers):
+            mh = np.asarray(mlx_hidden_npz[f"layer_{li}"], dtype=np.float32)
+            # MLX shape: [B=1, L=N, hidden_dim]. Compare position-by-position.
+            if mh.ndim == 3:
+                mh = mh[0]
+            # Our shape: per-token [num_layers, hidden_dim]. Last token only.
+            for ti in range(len(ours_per_tok)):
+                oh = ours_per_tok[ti][li]
+                mh_t = mh[ti] if mh.ndim == 2 else mh
+                cos = float(np.dot(mh_t, oh) / (np.linalg.norm(mh_t) * np.linalg.norm(oh) + 1e-30))
+                mae = float(np.mean(np.abs(mh_t - oh)))
+                mx = float(np.max(np.abs(mh_t - oh)))
+                if ti == 0:
+                    print(f"  L{li:02} tok{ti} cos={cos:.5f} mae={mae:.3f} max_diff={mx:.3f}")
+                else:
+                    print(f"        tok{ti} cos={cos:.5f} mae={mae:.3f} max_diff={mx:.3f}")
+    except FileNotFoundError as e:
+        print(f"\n(no per-layer hidden capture: {e})", file=sys.stderr)
 
 
 if __name__ == "__main__":

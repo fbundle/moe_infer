@@ -523,12 +523,12 @@ impl<C: Gemma4ModelConfig> Gemma4Fused<C> {
             );
         }
 
-        // 5. Q head-norm + RoPE (partial rotary, theta=1M).
-        //    q_head_norm_rope_no_gate already supports head_dim up to 512
-        //    via its partial[512] threadgroup buffer.
+        // 5. Q head-norm + ProportionalRoPE (full-attn: partial rotary,
+        //    theta=1M, cross-half pairing — see
+        //    vendor/mlx-vlm/mlx_vlm/models/gemma4/rope_utils.py).
         let cmd_buf_qk = ctx.queue.new_command_buffer();
         let enc_qk = cmd_buf_qk.new_compute_command_encoder();
-        gk::encode_q_head_norm_rope_no_gate(
+        gk::encode_q_head_norm_rope_proportional(
             ctx, enc_qk,
             &ctx.buf_q, 0,
             wbuf, off_q_norm_w,
@@ -536,10 +536,8 @@ impl<C: Gemma4ModelConfig> Gemma4Fused<C> {
             n_q_heads, head_dim_full, rotary_dim,
             rope_theta, pos,
         );
-        // 6. K head-norm + RoPE — use q_head_norm_rope_no_gate for K too;
-        //    structurally identical (no gate split), and supports head_dim
-        //    up to 512 (qwen35's k_head_norm_rope only supports up to 256).
-        gk::encode_q_head_norm_rope_no_gate(
+        // 6. K head-norm + ProportionalRoPE — same kernel as Q (K has no gate).
+        gk::encode_q_head_norm_rope_proportional(
             ctx, enc_qk,
             &ctx.buf_k, 0,
             wbuf, off_k_norm_w,
@@ -571,9 +569,16 @@ impl<C: Gemma4ModelConfig> Gemma4Fused<C> {
             pos + 1,
             n_q_heads, kv_dim_full, heads_per_kv_f,
         );
-        // 10. o_proj: [hidden, q_dim_full]
-        self.encode_matvec_auto(enc_qk, &format!("{}.self_attn.o_proj", prefix),
-            &ctx.buf_attn_out, 0, &ctx.buf_o_proj_out, 0, hidden_dim, q_dim_full);
+        // 10. o_proj: [hidden, q_dim_full=8192]. Standard matvec_bf16 uses
+        //     x_shared[4096] which truncates the dot-product. Use the
+        //     h8192 variant. Full-layer o_proj is kept BF16 in classify_dtype
+        //     so the auto path would route to matvec_bf16 (buggy here).
+        let off_o_proj_w = self.tensor_offset_required(&format!("{}.self_attn.o_proj.weight", prefix));
+        gk::encode_matvec_bf16_h8192(
+            ctx, enc_qk, wbuf, off_o_proj_w,
+            &ctx.buf_attn_out, 0, &ctx.buf_o_proj_out, 0,
+            hidden_dim, q_dim_full,
+        );
         // 11. post_attention_layernorm + first residual
         gk::encode_rms_norm_fused_bf16(
             ctx, enc_qk,
@@ -997,6 +1002,13 @@ impl<C: Gemma4ModelConfig> Engine for Gemma4Fused<C> {
 
             // Chunks [2,4,5]: per-layer forward.
             let debug_layers = std::env::var("GEMMA4_DEBUG_LAYERS").is_ok();
+            let capture_path = std::env::var("GEMMA4_CAPTURE_HIDDEN").ok();
+            // capture_buf[layer * hidden_dim..]: per-layer post-layer hidden
+            // state for the LAST token only (we overwrite each token; the
+            // capture is intended for single-token prompts during bisection).
+            let mut capture_buf: Option<Vec<f32>> = if capture_path.is_some() {
+                Some(vec![0.0f32; num_layers * hidden_dim])
+            } else { None };
             for layer in 0..num_layers {
                 if check_signal() {
                     return Err(MoEError::Metal("interrupted".into()));
@@ -1006,6 +1018,12 @@ impl<C: Gemma4ModelConfig> Engine for Gemma4Fused<C> {
                 } else {
                     self.forward_sliding_layer(layer, pos as u32)?;
                 }
+                if let Some(buf) = capture_buf.as_mut() {
+                    let p = self.ctx.buf_hidden.contents() as *const f32;
+                    unsafe {
+                        std::ptr::copy_nonoverlapping(p, buf.as_mut_ptr().add(layer * hidden_dim), hidden_dim);
+                    }
+                }
                 if debug_layers {
                     let p = self.ctx.buf_hidden.contents() as *const f32;
                     let sq: f32 = unsafe { (0..hidden_dim).map(|i| { let v = *p.add(i); v*v }).sum() };
@@ -1013,6 +1031,23 @@ impl<C: Gemma4ModelConfig> Engine for Gemma4Fused<C> {
                     eprintln!("[gemma4-fwd]  tok={} pos={} L{:02} (full={}) ||h||={:.3} max={:.3}",
                         ti, pos, layer, C::is_full_attn_layer(layer), sq.sqrt(), mx);
                 }
+            }
+            if let (Some(buf), Some(path)) = (capture_buf, capture_path.as_ref()) {
+                // Append (tok index, num_layers, hidden_dim, f32 data) as a
+                // simple binary blob. Reader can deserialise.
+                let mut bytes: Vec<u8> = Vec::with_capacity(12 + buf.len() * 4);
+                bytes.extend_from_slice(&(ti as u32).to_le_bytes());
+                bytes.extend_from_slice(&(num_layers as u32).to_le_bytes());
+                bytes.extend_from_slice(&(hidden_dim as u32).to_le_bytes());
+                for v in &buf {
+                    bytes.extend_from_slice(&v.to_le_bytes());
+                }
+                use std::io::Write;
+                let mut f = std::fs::OpenOptions::new()
+                    .create(true).append(true).open(path).unwrap();
+                f.write_all(&bytes).unwrap();
+                eprintln!("[gemma4-fwd] captured {} layers × {} floats → {}",
+                    num_layers, hidden_dim, path);
             }
 
             // Copy final hidden back to CPU for the lm_head pass.

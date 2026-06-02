@@ -211,6 +211,33 @@ pub fn encode_matvec_int4(
     );
 }
 
+/// BF16 matvec for large in_dim (4096 < in_dim ≤ 8192). Used for Gemma 4
+/// full-layer o_proj where in_dim = 16*512 = 8192. The standard
+/// matvec_bf16 kernel has x_shared[4096] which silently overflows beyond.
+pub fn encode_matvec_bf16_h8192(
+    ctx: &Gemma4MetalContext,
+    encoder: &ComputeCommandEncoderRef,
+    w_bf16: &BufferRef, w_offset: u64,
+    x: &BufferRef, x_offset: u64,
+    out: &BufferRef, o_offset: u64,
+    out_dim: u32,
+    in_dim: u32,
+) {
+    encoder.set_compute_pipeline_state(&ctx.matvec_bf16_h8192);
+    encoder.set_buffer(0, Some(w_bf16), w_offset);
+    encoder.set_buffer(1, Some(x), x_offset);
+    encoder.set_buffer(2, Some(out), o_offset);
+    unsafe {
+        set_u32(encoder, 3, out_dim);
+        set_u32(encoder, 4, in_dim);
+    }
+    let num_tgs = (out_dim + ROWS_PER_TG - 1) / ROWS_PER_TG;
+    encoder.dispatch_thread_groups(
+        MTLSize::new(num_tgs as u64, 1, 1),
+        MTLSize::new(TG_SIZE as u64, 1, 1),
+    );
+}
+
 /// Encode BF16 matvec: out[out_dim] = W_bf16[out_dim, in_dim] @ x[in_dim].
 pub fn encode_matvec_bf16(
     ctx: &Gemma4MetalContext,
@@ -300,6 +327,40 @@ pub fn encode_q_head_norm_rope_no_gate(
     pos: u32,
 ) {
     encoder.set_compute_pipeline_state(&ctx.q_head_norm_rope_no_gate);
+    encoder.set_buffer(0, Some(q_proj), q_offset);
+    encoder.set_buffer(1, Some(q_norm_w), w_offset);
+    encoder.set_buffer(2, Some(q_out), o_offset);
+    unsafe {
+        set_u32(encoder, 3, head_dim);
+        set_u32(encoder, 4, rotary_dim);
+        set_f32(encoder, 5, rope_theta);
+        set_u32(encoder, 6, pos);
+        set_f32(encoder, 7, RMS_NORM_EPS);
+    }
+    encoder.dispatch_thread_groups(
+        MTLSize::new(num_q_heads as u64, 1, 1),
+        MTLSize::new(head_dim as u64, 1, 1),
+    );
+}
+
+/// Q head-norm + Proportional RoPE — Gemma 4 full-attention layers.
+/// Pairs dim i with dim i + head_dim/2 (NOT i + rotary_dim/2 like the
+/// standard "no_gate" variant) and uses head_dim as the angle base.
+/// See vendor/mlx-vlm/mlx_vlm/models/gemma4/rope_utils.py::ProportionalRoPE.
+#[allow(clippy::too_many_arguments)]
+pub fn encode_q_head_norm_rope_proportional(
+    ctx: &Gemma4MetalContext,
+    encoder: &ComputeCommandEncoderRef,
+    q_proj: &BufferRef, q_offset: u64,
+    q_norm_w: &BufferRef, w_offset: u64,
+    q_out: &BufferRef, o_offset: u64,
+    num_q_heads: u32,
+    head_dim: u32,
+    rotary_dim: u32,
+    rope_theta: f32,
+    pos: u32,
+) {
+    encoder.set_compute_pipeline_state(&ctx.q_head_norm_rope_proportional);
     encoder.set_buffer(0, Some(q_proj), q_offset);
     encoder.set_buffer(1, Some(q_norm_w), w_offset);
     encoder.set_buffer(2, Some(q_out), o_offset);
