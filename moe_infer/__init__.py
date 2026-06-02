@@ -37,6 +37,7 @@ from moe_infer._core import (
 )
 from moe_infer.generation import generate_from
 from moe_infer.hub import load_tokenizer, load_vision_encoder
+from moe_infer.gemma4_moe.pipeline import Gemma4MoEPipeline
 from moe_infer.pipeline import Pipeline
 from moe_infer.qwen35_moe.pipeline import Qwen35MoEPipeline
 from moe_infer.sampling import sample, softmax
@@ -44,6 +45,7 @@ from moe_infer.sampling import sample, softmax
 __all__ = [
     "Cache",
     "Engine",
+    "Gemma4MoEPipeline",
     "HfRepo",
     "Model",
     "Pipeline",
