@@ -292,15 +292,19 @@ impl QuantScheme for Gemma4Bf16Scheme {
         WeightClass { name: engine_name, quant, kind: WeightKind::Normal }
     }
 
-    fn sanitize(&self, engine_name: &str, values: &mut [f32], _shape: &mut Vec<usize>) {
-        // Gemma 4 uses ZeroCenteredRMSNorm: applies `x * (1 + w)` rather
-        // than `x * w`. Our kernel does the latter, so we bake `+1` into
-        // the stored weight at quantize time.
-        if is_zero_centered_norm(engine_name) {
-            for v in values.iter_mut() { *v += 1.0; }
-        }
-        // Experts handled by process_experts_common via WeightKind::Expert,
-        // not sanitize — no 3D-to-2D reshape needed here anymore.
+    fn sanitize(&self, _engine_name: &str, _values: &mut [f32], _shape: &mut Vec<usize>) {
+        // Empirically (verified vs mlx-vlm at hash a4d6e2c5 of
+        // mlx-vlm/models/gemma4/language.py): Gemma 4's HF safetensors
+        // already store ABSOLUTE norm weights (range [1.6, 30.6] for
+        // input_layernorm.weight at layer 0). MLX-VLM uses them directly
+        // via mx.fast.rms_norm(x, weight, eps) with no `+1` shift. So we
+        // must NOT add 1 here — that would double-shift and skew every
+        // attention/FFN block.
+        //
+        // The earlier `+1` we had was wrong. Discovered by diff vs
+        // mlx-vlm — without sanitize, the engine produces text-shaped
+        // output; with sanitize it produced shape-of-text gibberish.
+        // Experts handled by process_experts_common via WeightKind::Expert.
     }
 
     fn process_experts(

@@ -38,7 +38,7 @@ pub fn encode_attn_sdpa_sliding_causal(
     seq_len: u32,
     sliding_window: u32,
     num_q_heads: u32,
-    head_dim: u32,
+    _head_dim: u32,
     kv_dim: u32,
     heads_per_kv: u32,
 ) {
@@ -48,7 +48,10 @@ pub fn encode_attn_sdpa_sliding_causal(
     encoder.set_buffer(1, Some(k_cache), 0);
     encoder.set_buffer(2, Some(v_cache), 0);
     encoder.set_buffer(3, Some(out), o_offset);
-    let scale = 1.0f32 / (head_dim as f32).sqrt();
+    // Gemma 4 hardcodes self.scale = 1.0 in MLX-VLM (language.py:164).
+    // No 1/sqrt(head_dim) factor — q_norm's per-head magnitude already
+    // balances the score range.
+    let scale = 1.0f32;
     unsafe {
         set_u32(encoder, 4, seq_len);
         set_u32(encoder, 5, sliding_window);
@@ -82,7 +85,8 @@ pub fn encode_attn_sdpa_causal_h512(
     encoder.set_buffer(1, Some(k_cache), 0);
     encoder.set_buffer(2, Some(v_cache), 0);
     encoder.set_buffer(3, Some(out), o_offset);
-    let scale = 1.0f32 / (512.0f32).sqrt();
+    // Gemma 4 hardcodes self.scale = 1.0 — see encode_attn_sdpa_sliding_causal.
+    let scale = 1.0f32;
     unsafe {
         set_u32(encoder, 4, seq_len);
         set_f32(encoder, 5, scale);

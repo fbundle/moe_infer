@@ -996,6 +996,7 @@ impl<C: Gemma4ModelConfig> Engine for Gemma4Fused<C> {
             }
 
             // Chunks [2,4,5]: per-layer forward.
+            let debug_layers = std::env::var("GEMMA4_DEBUG_LAYERS").is_ok();
             for layer in 0..num_layers {
                 if check_signal() {
                     return Err(MoEError::Metal("interrupted".into()));
@@ -1004,6 +1005,13 @@ impl<C: Gemma4ModelConfig> Engine for Gemma4Fused<C> {
                     self.forward_full_layer(layer, pos as u32)?;
                 } else {
                     self.forward_sliding_layer(layer, pos as u32)?;
+                }
+                if debug_layers {
+                    let p = self.ctx.buf_hidden.contents() as *const f32;
+                    let sq: f32 = unsafe { (0..hidden_dim).map(|i| { let v = *p.add(i); v*v }).sum() };
+                    let mx: f32 = unsafe { (0..hidden_dim).map(|i| (*p.add(i)).abs()).fold(0.0f32, f32::max) };
+                    eprintln!("[gemma4-fwd]  tok={} pos={} L{:02} (full={}) ||h||={:.3} max={:.3}",
+                        ti, pos, layer, C::is_full_attn_layer(layer), sq.sqrt(), mx);
                 }
             }
 
