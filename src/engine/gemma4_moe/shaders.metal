@@ -533,10 +533,13 @@ kernel void gelu_fused(
 ) {
     if (tid >= dim) return;
     float g = gate[tid];
-    // gelu_pytorch_tanh
+    // gelu_pytorch_tanh; use metal::precise::tanh to avoid fast-math
+    // NaN behaviour for moderately large inner arguments.
     float g3 = g * g * g;
-    float inner = 0.7978845608f * (g + 0.044715f * g3);  // sqrt(2/pi) ≈ 0.7978845608
-    float gelu_g = 0.5f * g * (1.0f + tanh(inner));
+    float inner = 0.7978845608f * (g + 0.044715f * g3);
+    // Clamp inner to safe range; tanh saturates anyway.
+    inner = clamp(inner, -20.0f, 20.0f);
+    float gelu_g = 0.5f * g * (1.0f + metal::precise::tanh(inner));
     out[tid] = gelu_g * up[tid];
 }
 

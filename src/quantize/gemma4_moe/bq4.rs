@@ -35,6 +35,7 @@ use std::path::Path;
 use crate::dtype::DType;
 use crate::hf_util::HfRepo;
 use crate::quantize::{QuantScheme, WeightClass, WeightKind};
+use crate::qwen35_moe_common::process_experts_common;
 use crate::error::MoEError;
 
 /// Embedded name map (HF→engine).
@@ -271,47 +272,59 @@ impl QuantScheme for Gemma4Bf16Scheme {
                 eprintln!("[gemma4-bq4] WARN: unmapped tensor {} — passing through unchanged", hf_name);
                 hf_name.to_string()
             });
-        let quant = classify_dtype(&engine_name, &self.params.layer_types);
-        WeightClass {
-            name: engine_name,
-            quant,
-            // Even expert tensors get WeightKind::Normal — we DO NOT split them
-            // per-expert. forward_dual_ffn reads per-expert slices via byte
-            // arithmetic directly off the merged tensor.
-            kind: WeightKind::Normal,
-        }
-    }
-
-    fn sanitize(&self, engine_name: &str, values: &mut [f32], shape: &mut Vec<usize>) {
-        // Reshape 3D experts tensors to 2D so INT4 group-quant runs per-row.
-        if engine_name.ends_with(".experts.gate_up_proj")
-            || engine_name.ends_with(".experts.down_proj")
+        // Route experts to per-layer packed_experts/ blobs (qwen35-style).
+        // This keeps the model_weights.bin file under Apple Silicon's
+        // max_buffer_length cap (~9.5 GB on M4): with experts streamed
+        // via pread+ExpertBuffer, the remaining non-expert weights are
+        // only ~1.5 GB.
+        if engine_name.contains(".experts.gate_up_proj")
+            || engine_name.contains(".experts.down_proj")
         {
-            if shape.len() == 3 {
-                let (e, r, c) = (shape[0], shape[1], shape[2]);
-                *shape = vec![e * r, c];
+            if let Some(layer) = extract_layer_idx(&engine_name) {
+                return WeightClass {
+                    name: engine_name,
+                    quant: DType::Int4,
+                    kind: WeightKind::Expert(layer),
+                };
             }
         }
-        // Gemma 4 uses ZeroCenteredRMSNorm: applies `x * (1 + w)` rather than
-        // `x * w`. Our kernel does the latter, so we bake `+1` into the
-        // stored weight at quantize time (same trick as qwen35's
-        // is_qwen36 shift).
+        let quant = classify_dtype(&engine_name, &self.params.layer_types);
+        WeightClass { name: engine_name, quant, kind: WeightKind::Normal }
+    }
+
+    fn sanitize(&self, engine_name: &str, values: &mut [f32], _shape: &mut Vec<usize>) {
+        // Gemma 4 uses ZeroCenteredRMSNorm: applies `x * (1 + w)` rather
+        // than `x * w`. Our kernel does the latter, so we bake `+1` into
+        // the stored weight at quantize time.
         if is_zero_centered_norm(engine_name) {
             for v in values.iter_mut() { *v += 1.0; }
         }
+        // Experts handled by process_experts_common via WeightKind::Expert,
+        // not sanitize — no 3D-to-2D reshape needed here anymore.
     }
 
     fn process_experts(
         &self,
-        _repo: &HfRepo,
-        _weight_map: &HashMap<String, String>,
-        _classified: &[(String, WeightClass)],
-        _output_dir: &Path,
+        repo: &HfRepo,
+        weight_map: &HashMap<String, String>,
+        classified: &[(String, WeightClass)],
+        output_dir: &Path,
     ) -> Result<usize, String> {
-        // No-op: experts are written inline by the shard pass because their
-        // WeightClass::kind is Normal. The engine reads them via byte
-        // strides — no per-layer split needed.
-        Ok(0)
+        // Reuse qwen35's expert packer. The Gemma 4 HF layout
+        //   experts.gate_up_proj : [E, 2*I, H]   (first I rows = gate, next I = up)
+        //   experts.down_proj    : [E, H, I]
+        // matches qwen35's fused gate_up_proj layout exactly — the function
+        // splits gate/up by row halves and INT4-quantizes per-row with
+        // group=64. Output: packed_experts/layer_XX.bin per layer.
+        process_experts_common(
+            self.params.moe_intermediate,
+            self.params.hidden_dim,
+            self.params.num_experts,
+            classified,
+            repo,
+            weight_map,
+            output_dir,
+        )
     }
 
     fn write_manifest_config(
