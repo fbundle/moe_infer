@@ -13,6 +13,8 @@ use crate::engine::{SignalCheckFn, TelemetryValue, set_record_telemetry, DynEngi
 use crate::bq4::{BQ4Scheme, QwenVersion};
 use crate::hf_util::HfRepo;
 use crate::int4::Int4Scheme;
+use crate::qwen35_dense_int4::DenseInt4Scheme;
+use crate::qwen35_dense_bq4::DenseBQ4Scheme;
 
 // ─── Opaque snapshot wrapper (for speculative-decoding rollback) ────────────
 
@@ -380,6 +382,75 @@ pub fn qwen35_moe_quantize(
         }
         _ => Err(pyo3::exceptions::PyValueError::new_err(
             format!("Unknown scheme: {}. Expected 'bq4' or 'int4'.", scheme)
+        )),
+    }
+}
+
+/// Qwen3.5 dense (e.g. Qwen3.5-4B) → INT4 group=64.
+///
+/// All 2D weights INT4-quantized; norms stay BF16; A_log stays FP32;
+/// conv1d.weight gets moveaxis(2→1) for the linear-attn block. No
+/// expert pass (no packed_experts/ directory) since the dense variant
+/// has no MoE block.
+#[pyfunction]
+#[pyo3(signature = (model_path, output_dir, *, version="3.5", scheme="int4"))]
+pub fn qwen35_dense_quantize(
+    model_path: &str,
+    output_dir: &str,
+    version: &str,
+    scheme: &str,
+) -> PyResult<()> {
+    let qwen_version = match version {
+        "3.5" => QwenVersion::V35,
+        "3.6" => QwenVersion::V36,
+        _ => return Err(pyo3::exceptions::PyValueError::new_err(
+            format!("Unknown version: {}. Expected '3.5' or '3.6'.", version)
+        )),
+    };
+
+    let config_dir = if std::path::Path::new(model_path).is_dir() {
+        std::path::PathBuf::from(model_path)
+    } else {
+        let repo = crate::hf_util::HfRepo::from_hf(model_path)
+            .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e))?;
+        repo.ensure("config.json")
+            .map_err(|e| pyo3::exceptions::PyIOError::new_err(e))?;
+        repo.path().to_path_buf()
+    };
+
+    let config_json = std::fs::read_to_string(config_dir.join("config.json"))
+        .map_err(|e| pyo3::exceptions::PyIOError::new_err(e.to_string()))?;
+    let arch = {
+        let v: serde_json::Value = serde_json::from_str(&config_json)
+            .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))?;
+        v["architectures"][0].as_str()
+            .unwrap_or("Qwen3_5ForConditionalGeneration")
+            .to_string()
+    };
+
+    if arch != "Qwen3_5ForConditionalGeneration"
+        && arch != "Qwen3_5ForConditionalGeneration_Stripped"
+    {
+        return Err(pyo3::exceptions::PyValueError::new_err(
+            format!("Unexpected architecture for dense scheme: {} (want Qwen3_5ForConditionalGeneration[_Stripped])", arch)
+        ));
+    }
+
+    match scheme {
+        "int4" => {
+            let s = DenseInt4Scheme::new(&config_dir, qwen_version)
+                .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e))?;
+            crate::quantize::run(model_path, output_dir, &s)
+                .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e))
+        }
+        "bq4" => {
+            let s = DenseBQ4Scheme::new(&config_dir, qwen_version)
+                .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e))?;
+            crate::quantize::run(model_path, output_dir, &s)
+                .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e))
+        }
+        _ => Err(pyo3::exceptions::PyValueError::new_err(
+            format!("Unknown scheme: {}. Expected 'int4' or 'bq4'.", scheme)
         )),
     }
 }

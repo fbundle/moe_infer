@@ -39,8 +39,10 @@ impl Model {
         let packed_dir = dir.join("packed_experts");
         let lz4_dir = dir.join("packed_experts_lz4");
         let hd = config.get_usize("hidden_size").unwrap();
-        let mi = config.get_usize("moe_intermediate_size").unwrap();
-        let expert_size = config::expert_size_4bit(hd, mi, 64);
+        // Dense models (Qwen3.5-4B) have no `moe_intermediate_size`; treat as 0 →
+        // expert_size is unused because expert_files stays empty in that case.
+        let mi = config.get_usize("moe_intermediate_size").unwrap_or(0);
+        let expert_size = if mi > 0 { config::expert_size_4bit(hd, mi, 64) } else { 0 };
         let num_layers = config.get_usize("num_hidden_layers").unwrap()
             + config.get_usize("mtp_num_hidden_layers").unwrap_or(0);
 

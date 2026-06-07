@@ -37,12 +37,86 @@ pub fn encode_matvec_offset(
     group_size: u32,
     use_fast: i32,
 ) {
-    let pipeline = if use_fast >= 3 {
+    // Variant picker for in_dim > 4096 INT4 matvecs. Env var `MATVEC_V3_VARIANT`
+    // selects one of: tiled (default), large, sbcache, splitk, fast.
+    // The default `tiled` is the safe v3-style 4096-element tile loop.
+    let need_large_int4 = use_fast >= 3 && in_dim > 4096;
+    let variant = if need_large_int4 {
+        std::env::var("MATVEC_V3_VARIANT").unwrap_or_else(|_| "tiled".to_string())
+    } else {
+        String::new()
+    };
+
+    // Handle split-K specially — it's a 2-pass dispatch with a partials buffer.
+    if need_large_int4 && variant == "splitk"
+        && ctx.matvec_v3_splitk_pass1.is_some()
+        && ctx.matvec_v3_splitk_pass2.is_some()
+        && ctx.buf_splitk_partials.is_some()
+    {
+        const K_SPLIT: u32 = 4;
+        let p1 = ctx.matvec_v3_splitk_pass1.as_ref().unwrap();
+        let p2 = ctx.matvec_v3_splitk_pass2.as_ref().unwrap();
+        let partials = ctx.buf_splitk_partials.as_ref().unwrap();
+
+        // Pass 1: 1D linearised grid = num_row_tiles * K_SPLIT.
+        let num_row_tiles = (out_dim + ROWS_PER_TG - 1) / ROWS_PER_TG;
+        encoder.set_compute_pipeline_state(p1);
+        encoder.set_buffer(0, Some(w_packed), w_offset);
+        encoder.set_buffer(1, Some(scales), s_offset);
+        encoder.set_buffer(2, Some(biases), b_offset);
+        encoder.set_buffer(3, Some(x), x_offset);
+        encoder.set_buffer(4, Some(partials), 0);
+        unsafe {
+            set_u32(encoder, 5, out_dim);
+            set_u32(encoder, 6, in_dim);
+            set_u32(encoder, 7, group_size);
+            set_u32(encoder, 8, num_row_tiles);
+        }
+        encoder.dispatch_thread_groups(
+            MTLSize::new((num_row_tiles as u64) * (K_SPLIT as u64), 1, 1),
+            MTLSize::new(TG_SIZE as u64, 1, 1),
+        );
+
+        // Pass 2: reduce K_SPLIT partials per output row.
+        encoder.set_compute_pipeline_state(p2);
+        encoder.set_buffer(0, Some(partials), 0);
+        encoder.set_buffer(1, Some(out), o_offset);
+        unsafe { set_u32(encoder, 2, out_dim); }
+        let tgs = (out_dim + 255) / 256;
+        encoder.dispatch_thread_groups(
+            MTLSize::new(tgs as u64, 1, 1),
+            MTLSize::new(256, 1, 1),
+        );
+        return;
+    }
+
+    // Single-dispatch variants.
+    let pipeline = if need_large_int4 {
+        match variant.as_str() {
+            "large"   if ctx.matvec_v3_tiled_large.is_some()
+                      => ctx.matvec_v3_tiled_large.as_ref().unwrap(),
+            "sbcache" if ctx.matvec_v3_tiled_sbcache.is_some()
+                      => ctx.matvec_v3_tiled_sbcache.as_ref().unwrap(),
+            "fast"    => &ctx.matvec_fast,
+            // "tiled" (default) and any unknown name → 4096-tile variant.
+            _ if ctx.matvec_v3_tiled.is_some()
+                      => ctx.matvec_v3_tiled.as_ref().unwrap(),
+            _         => &ctx.matvec_fast,
+        }
+    } else if use_fast >= 3 {
         &ctx.matvec_v3
     } else if use_fast >= 1 {
         &ctx.matvec_fast
     } else {
         &ctx.matvec_naive
+    };
+
+    // Dispatch shape: v3-style (ROWS_PER_TG tile) for all variants except
+    // explicit "fast" fallback which uses 64-thread-per-row.
+    let use_fast = if need_large_int4 {
+        if variant == "fast" { 1 } else { 3 }
+    } else {
+        use_fast
     };
 
     encoder.set_compute_pipeline_state(pipeline);
@@ -153,6 +227,56 @@ pub fn encode_matvec_int8_offset(
         MTLSize::new(TG_SIZE as u64, 1, 1),
     );
 }
+
+// ---------------------------------------------------------------------------
+// Fused gate_proj + up_proj + SwiGLU
+// ---------------------------------------------------------------------------
+
+/// Encode the fused gate+up+SwiGLU dispatch. Replaces a separate gate matvec,
+/// up matvec, and elementwise swiglu with a single kernel that reads x once
+/// into shared memory and computes both projections + activation per row.
+#[allow(clippy::too_many_arguments)]
+pub fn encode_fused_gate_up_swiglu(
+    ctx: &MetalContext,
+    encoder: &ComputeCommandEncoderRef,
+    gate_w: &BufferRef, gate_w_off: u64,
+    gate_s: &BufferRef, gate_s_off: u64,
+    gate_b: &BufferRef, gate_b_off: u64,
+    up_w:   &BufferRef, up_w_off:   u64,
+    up_s:   &BufferRef, up_s_off:   u64,
+    up_b:   &BufferRef, up_b_off:   u64,
+    x:      &BufferRef, x_off:      u64,
+    out:    &BufferRef, out_off:    u64,
+    out_dim: u32,
+    in_dim:  u32,
+    group_size: u32,
+) -> bool {
+    let pipeline = match ctx.fused_gate_up_swiglu_v3.as_ref() {
+        Some(p) => p,
+        None => return false,
+    };
+    encoder.set_compute_pipeline_state(pipeline);
+    encoder.set_buffer(0, Some(gate_w), gate_w_off);
+    encoder.set_buffer(1, Some(gate_s), gate_s_off);
+    encoder.set_buffer(2, Some(gate_b), gate_b_off);
+    encoder.set_buffer(3, Some(up_w),   up_w_off);
+    encoder.set_buffer(4, Some(up_s),   up_s_off);
+    encoder.set_buffer(5, Some(up_b),   up_b_off);
+    encoder.set_buffer(6, Some(x),      x_off);
+    encoder.set_buffer(7, Some(out),    out_off);
+    unsafe {
+        set_u32(encoder, 8,  out_dim);
+        set_u32(encoder, 9,  in_dim);
+        set_u32(encoder, 10, group_size);
+    }
+    let num_tgs = (out_dim + ROWS_PER_TG - 1) / ROWS_PER_TG;
+    encoder.dispatch_thread_groups(
+        MTLSize::new(num_tgs as u64, 1, 1),
+        MTLSize::new(TG_SIZE as u64, 1, 1),
+    );
+    true
+}
+
 
 // ---------------------------------------------------------------------------
 // SwiGLU

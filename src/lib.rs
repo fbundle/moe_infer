@@ -16,6 +16,10 @@ mod timer;
 #[path = "quantize/qwen35_moe/bq4.rs"] pub mod bq4;
 #[path = "quantize/qwen35_moe/int4.rs"] pub mod int4;
 
+// Qwen3.5 dense variant (e.g. Qwen3.5-4B) — INT4 only, and selective BQ4.
+#[path = "quantize/qwen35_dense/int4.rs"] pub mod qwen35_dense_int4;
+#[path = "quantize/qwen35_dense/bq4.rs"]  pub mod qwen35_dense_bq4;
+
 // Gemma 4 quantize pipeline — BF16 passthrough (first-cut).
 #[path = "quantize/gemma4_moe/bq4.rs"] pub mod gemma4_bq4;
 
@@ -33,6 +37,7 @@ fn _moe_infer_rs(m: &pyo3::Bound<'_, pyo3::types::PyModule>) -> pyo3::PyResult<(
     m.add_class::<python_bindings::Cache>()?;
     m.add_function(wrap_pyfunction!(python_bindings::record_engine_telemetry, m)?)?;
     m.add_function(wrap_pyfunction!(python_bindings::qwen35_moe_quantize, m)?)?;
+    m.add_function(wrap_pyfunction!(python_bindings::qwen35_dense_quantize, m)?)?;
     m.add_function(wrap_pyfunction!(python_bindings::gemma4_moe_quantize, m)?)?;
     m.add_class::<python_bindings::PyHfRepo>()?;
     Ok(())

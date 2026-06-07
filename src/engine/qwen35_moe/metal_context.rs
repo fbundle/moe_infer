@@ -202,6 +202,23 @@ pub struct MetalContext {
     pub matvec_naive: ComputePipelineState,
     pub matvec_fast: ComputePipelineState,
     pub matvec_v3: ComputePipelineState,
+    /// Tiled variant of matvec_v3 — handles arbitrary `in_dim` by walking the
+    /// input vector in 4096-element chunks. Used when `in_dim > 4096`.
+    pub matvec_v3_tiled: Option<ComputePipelineState>,
+    /// 8192-element tile variant — half the tile count for in_dim ≤ 8192,
+    /// at the cost of occupancy (uses all 32 KB threadgroup memory).
+    pub matvec_v3_tiled_large: Option<ComputePipelineState>,
+    /// 4096-tile variant that ALSO caches scales/biases in threadgroup memory.
+    pub matvec_v3_tiled_sbcache: Option<ComputePipelineState>,
+    /// Split-K pass 1 — writes partial outputs to an intermediate buffer.
+    pub matvec_v3_splitk_pass1: Option<ComputePipelineState>,
+    /// Split-K pass 2 — reduces K_SPLIT partials per row.
+    pub matvec_v3_splitk_pass2: Option<ComputePipelineState>,
+    /// Scratch buffer for split-K partials. Sized for max INT4 out_dim × K_SPLIT.
+    pub buf_splitk_partials: Option<Buffer>,
+    /// Fused gate_proj + up_proj + SwiGLU (single kernel, x_shared cached).
+    /// Replaces 3 dispatches per expert with 1.
+    pub fused_gate_up_swiglu_v3: Option<ComputePipelineState>,
     pub matvec_bf16: ComputePipelineState,
     pub matvec_int8: ComputePipelineState,
     pub matvec_fp4_e2m1: Option<ComputePipelineState>,
@@ -474,8 +491,15 @@ impl MetalContext {
 const SHADER_SOURCE: &str = include_str!("shaders.metal");
 
 impl MetalContext {
-    /// Initialize Metal: create device, queue, compile shaders, build all pipelines.
+    /// Initialize Metal with the default qwen35_moe shaders.
     pub fn init() -> Result<Self, MoEError> {
+        Self::init_with_shaders(SHADER_SOURCE)
+    }
+
+    /// Initialize Metal with a caller-supplied shader source string. Lets
+    /// engine variants (e.g. dense Qwen3.5 with different GQA `#define`s)
+    /// reuse the entire pipeline-building flow without forking this file.
+    pub fn init_with_shaders(shader_src: &str) -> Result<Self, MoEError> {
         autoreleasepool(|| {
             let device = Device::system_default()
                 .ok_or_else(|| MoEError::Metal("No Metal device found".into()))?;
@@ -494,7 +518,7 @@ impl MetalContext {
             eprintln!("[metal] Compiling shaders from source...");
             let t_compile = crate::timer::now();
             let library = device
-                .new_library_with_source(SHADER_SOURCE, &compile_opts)
+                .new_library_with_source(shader_src, &compile_opts)
                 .map_err(|e| MoEError::Shader(format!("Shader compilation failed: {:?}", e)))?;
             eprintln!("[metal] Shader compilation: {:.0} ms", crate::timer::now().duration_since(t_compile).as_secs_f64() * 1000.0);
 
@@ -509,6 +533,12 @@ impl MetalContext {
 
             let matvec_naive = make_pipeline("dequant_matvec_4bit")?;
             let matvec_v3 = make_pipeline("dequant_matvec_4bit_v3")?;
+            let matvec_v3_tiled = make_pipeline("dequant_matvec_4bit_v3_tiled").ok();
+            let matvec_v3_tiled_large = make_pipeline("dequant_matvec_4bit_v3_tiled_large").ok();
+            let matvec_v3_tiled_sbcache = make_pipeline("dequant_matvec_4bit_v3_tiled_sbcache").ok();
+            let matvec_v3_splitk_pass1 = make_pipeline("dequant_matvec_4bit_v3_splitk_pass1").ok();
+            let matvec_v3_splitk_pass2 = make_pipeline("dequant_matvec_4bit_v3_splitk_pass2").ok();
+            let fused_gate_up_swiglu_v3 = make_pipeline("fused_gate_up_swiglu_v3").ok();
             let matvec_bf16 = make_pipeline("matvec_bf16")?;
             let matvec_int8 = make_pipeline("matvec_int8")?;
             let matvec_fp4_e2m1 = make_pipeline("dequant_matvec_fp4_e2m1").ok();
@@ -548,6 +578,9 @@ impl MetalContext {
 
             eprintln!("[metal] All pipelines created successfully");
 
+            // Allocate split-K partials scratch before moving `device` into the struct.
+            let buf_splitk_partials = Some(metal_buf_shared(&device, 4 * 16384 * 4));
+
             Ok(MetalContext {
                 device,
                 queue,
@@ -555,6 +588,13 @@ impl MetalContext {
                 matvec_naive,
                 matvec_fast,
                 matvec_v3: matvec_v3.clone(),
+                matvec_v3_tiled,
+                matvec_v3_tiled_large,
+                matvec_v3_tiled_sbcache,
+                matvec_v3_splitk_pass1,
+                matvec_v3_splitk_pass2,
+                buf_splitk_partials,
+                fused_gate_up_swiglu_v3,
                 matvec_bf16,
                 matvec_int8,
                 matvec_fp4_e2m1,

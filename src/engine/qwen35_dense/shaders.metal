@@ -38,9 +38,9 @@ using namespace metal;
 // Model dimension constants (Qwen3.5/3.6-35B-A3B)
 // ============================================================================
 #define HEAD_DIM        256
-#define NUM_KV_HEADS    2
+#define NUM_KV_HEADS    4
 #define KV_DIM          (NUM_KV_HEADS * HEAD_DIM)  // 512
-#define HEADS_PER_KV    8
+#define HEADS_PER_KV    4
 
 // ============================================================================
 // BFloat16 helpers
@@ -232,99 +232,6 @@ kernel void fused_gate_up_swiglu(
 }
 
 // ============================================================================
-// Kernel 1b2: FUSED gate_proj + up_proj + SwiGLU with shared-memory x cache.
-// ============================================================================
-// Replaces the 3-dispatch sequence (gate matvec, up matvec, swiglu) with a
-// single dispatch. Reads x once into x_shared, then each SIMD group computes
-// BOTH gate and up matvec for its row in lockstep, finally writes
-// `silu(gate[row]) * up[row]` to out[row].
-//
-// Dispatch shape mirrors matvec_v3: ceil(out_dim / ROWS_PER_TG) TGs, 256
-// threads each (8 SIMD groups × 32 lanes), TILE_IN ≤ 4096.
-//
-// Bandwidth saving vs (matvec_v3_gate + matvec_v3_up + swiglu):
-//   - x reads in shared cache: same (1 load per TG)
-//   - weight reads: same (read gate_W and up_W once each)
-//   - out writes: HALVED (one output per row instead of two intermediates)
-//   - dispatch count: 3 → 1
-//
-// Used by MoE expert path: each top-k expert dispatches one fused call here
-// + one matvec for down_proj, instead of 4 separate kernels.
-
-#define ROWS_PER_TG 8
-
-kernel void fused_gate_up_swiglu_v3(
-    device const uint32_t* gate_W    [[buffer(0)]],
-    device const uint16_t* gate_s    [[buffer(1)]],
-    device const uint16_t* gate_b    [[buffer(2)]],
-    device const uint32_t* up_W      [[buffer(3)]],
-    device const uint16_t* up_s      [[buffer(4)]],
-    device const uint16_t* up_b      [[buffer(5)]],
-    device const float*    x         [[buffer(6)]],
-    device float*          out       [[buffer(7)]],
-    constant uint&         out_dim   [[buffer(8)]],
-    constant uint&         in_dim    [[buffer(9)]],
-    constant uint&         group_size [[buffer(10)]],
-    uint tgid   [[threadgroup_position_in_grid]],
-    uint lid    [[thread_position_in_threadgroup]],
-    uint simd_lane  [[thread_index_in_simdgroup]],
-    uint simd_group [[simdgroup_index_in_threadgroup]]
-) {
-    uint row = tgid * ROWS_PER_TG + simd_group;
-    uint packed_cols = in_dim / 8;
-    uint num_groups  = in_dim / group_size;
-    uint group_packed = group_size / 8;
-
-    threadgroup float x_shared[4096];
-
-    for (uint i = lid; i < in_dim; i += 256) {
-        x_shared[i] = x[i];
-    }
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-
-    if (row >= out_dim) return;
-
-    device const uint32_t* gw_row = gate_W + row * packed_cols;
-    device const uint16_t* gs_row = gate_s + row * num_groups;
-    device const uint16_t* gb_row = gate_b + row * num_groups;
-    device const uint32_t* uw_row = up_W   + row * packed_cols;
-    device const uint16_t* us_row = up_s   + row * num_groups;
-    device const uint16_t* ub_row = up_b   + row * num_groups;
-
-    float gate_acc = 0.0f;
-    float up_acc   = 0.0f;
-
-    for (uint col = simd_lane; col < packed_cols; col += 32) {
-        uint g = col / group_packed;
-        float g_scale = bf16_to_f32(gs_row[g]);
-        float g_bias  = bf16_to_f32(gb_row[g]);
-        float u_scale = bf16_to_f32(us_row[g]);
-        float u_bias  = bf16_to_f32(ub_row[g]);
-
-        uint32_t gp = gw_row[col];
-        uint32_t up = uw_row[col];
-        uint x_base = col * 8;
-
-        // Process all 8 nibbles for both gate and up against the same x_shared slice.
-        for (uint i = 0; i < 8; i++) {
-            float xv = x_shared[x_base + i];
-            float gn = float((gp >> (i * 4)) & 0xF);
-            float un = float((up >> (i * 4)) & 0xF);
-            gate_acc = fma(gn * g_scale + g_bias, xv, gate_acc);
-            up_acc   = fma(un * u_scale + u_bias, xv, up_acc);
-        }
-    }
-
-    float g_sum = simd_sum(gate_acc);
-    float u_sum = simd_sum(up_acc);
-
-    if (simd_lane == 0) {
-        out[row] = (g_sum / (1.0f + exp(-g_sum))) * u_sum;
-    }
-}
-
-
-// ============================================================================
 // Kernel 1c: FULLY OPTIMIZED 4-bit dequant matvec
 // ============================================================================
 //
@@ -353,7 +260,7 @@ kernel void fused_gate_up_swiglu_v3(
 //     = 1 uint4 load per thread per row
 
 // Number of output rows per threadgroup = number of SIMD groups (256/32 = 8)
-// (ROWS_PER_TG already defined above for fused_gate_up_swiglu_v3.)
+#define ROWS_PER_TG 8
 
 kernel void dequant_matvec_4bit_v3(
     device const uint32_t* W_packed   [[buffer(0)]],  // [out_dim, in_dim/8]
@@ -445,6 +352,414 @@ kernel void dequant_matvec_4bit_v3(
         out[row] = sum;
     }
 }
+
+
+// ============================================================================
+// Kernel 1e2: TILED 4-bit dequant matvec for in_dim > 4096
+// ============================================================================
+// Same strategy as v3 (cache x in shared, 8 rows per threadgroup, lane-strided
+// over packed columns), but processes the input in 4096-element TILES so the
+// shared-memory cache stays at 16 KB regardless of in_dim.
+//
+// Throughput: each tile costs the same as one full v3 invocation. For in_dim
+// = 9216 (e.g. the dense Qwen3.5-4B MLP down_proj), that's 3 tiles per row
+// (4096 + 4096 + 1024), so ~2.25× the work of an in_dim=4096 matvec — vs
+// ~32× the work for matvec_fast which re-reads x from device memory per row.
+
+#define TILE_IN 4096
+
+kernel void dequant_matvec_4bit_v3_tiled(
+    device const uint32_t* W_packed   [[buffer(0)]],
+    device const uint16_t* scales     [[buffer(1)]],
+    device const uint16_t* biases     [[buffer(2)]],
+    device const float*    x          [[buffer(3)]],
+    device float*          out        [[buffer(4)]],
+    constant uint&         out_dim    [[buffer(5)]],
+    constant uint&         in_dim     [[buffer(6)]],
+    constant uint&         group_size [[buffer(7)]],
+    uint tgid   [[threadgroup_position_in_grid]],
+    uint lid    [[thread_position_in_threadgroup]],
+    uint simd_lane  [[thread_index_in_simdgroup]],
+    uint simd_group [[simdgroup_index_in_threadgroup]]
+) {
+    uint row = tgid * ROWS_PER_TG + simd_group;
+
+    uint packed_cols = in_dim / 8;
+    uint num_groups  = in_dim / group_size;
+    uint group_packed = group_size / 8;   // = 8 for group_size=64
+
+    threadgroup float x_shared[TILE_IN];
+
+    // Row pointers (safe to compute even for out-of-bounds rows — no load yet).
+    device const uint32_t* w_row = W_packed + row * packed_cols;
+    device const uint16_t* s_row = scales + row * num_groups;
+    device const uint16_t* b_row = biases + row * num_groups;
+
+    float acc = 0.0f;
+
+    // Walk the input vector one tile at a time.
+    for (uint tile_start = 0; tile_start < in_dim; tile_start += TILE_IN) {
+        uint tile_size = min((uint)TILE_IN, in_dim - tile_start);
+
+        // Cooperative load of this tile into shared.
+        for (uint i = lid; i < tile_size; i += 256) {
+            x_shared[i] = x[tile_start + i];
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        // SIMD groups with valid rows accumulate over this tile.
+        if (row < out_dim) {
+            uint tile_packed_start = tile_start / 8;
+            uint tile_packed_size  = tile_size / 8;
+
+            for (uint c_local = simd_lane; c_local < tile_packed_size; c_local += 32) {
+                uint col_global = tile_packed_start + c_local;
+                uint g = col_global / group_packed;
+                float scale = bf16_to_f32(s_row[g]);
+                float bias  = bf16_to_f32(b_row[g]);
+
+                uint32_t packed = w_row[col_global];
+                uint x_base = c_local * 8;
+
+                float sx0 = scale * x_shared[x_base + 0];  float bx0 = bias * x_shared[x_base + 0];
+                float sx1 = scale * x_shared[x_base + 1];  float bx1 = bias * x_shared[x_base + 1];
+                float sx2 = scale * x_shared[x_base + 2];  float bx2 = bias * x_shared[x_base + 2];
+                float sx3 = scale * x_shared[x_base + 3];  float bx3 = bias * x_shared[x_base + 3];
+                float sx4 = scale * x_shared[x_base + 4];  float bx4 = bias * x_shared[x_base + 4];
+                float sx5 = scale * x_shared[x_base + 5];  float bx5 = bias * x_shared[x_base + 5];
+                float sx6 = scale * x_shared[x_base + 6];  float bx6 = bias * x_shared[x_base + 6];
+                float sx7 = scale * x_shared[x_base + 7];  float bx7 = bias * x_shared[x_base + 7];
+
+                acc += fma(float((packed >>  0) & 0xF), sx0, bx0);
+                acc += fma(float((packed >>  4) & 0xF), sx1, bx1);
+                acc += fma(float((packed >>  8) & 0xF), sx2, bx2);
+                acc += fma(float((packed >> 12) & 0xF), sx3, bx3);
+                acc += fma(float((packed >> 16) & 0xF), sx4, bx4);
+                acc += fma(float((packed >> 20) & 0xF), sx5, bx5);
+                acc += fma(float((packed >> 24) & 0xF), sx6, bx6);
+                acc += fma(float((packed >> 28) & 0xF), sx7, bx7);
+            }
+        }
+
+        threadgroup_barrier(mem_flags::mem_threadgroup);   // before reloading
+    }
+
+    float sum = simd_sum(acc);
+    if (row < out_dim && simd_lane == 0) {
+        out[row] = sum;
+    }
+}
+
+#undef TILE_IN
+
+
+// ============================================================================
+// Variant A: 8192-element tile (uses the FULL 32 KB threadgroup memory).
+// ============================================================================
+// Halves the tile count for in_dim ≤ 8192 (one tile vs two), at the cost of
+// occupancy: only one threadgroup per SM can fit, since all of threadgroup
+// memory is consumed by x_shared.
+
+#define TILE_IN_LARGE 8192
+
+kernel void dequant_matvec_4bit_v3_tiled_large(
+    device const uint32_t* W_packed   [[buffer(0)]],
+    device const uint16_t* scales     [[buffer(1)]],
+    device const uint16_t* biases     [[buffer(2)]],
+    device const float*    x          [[buffer(3)]],
+    device float*          out        [[buffer(4)]],
+    constant uint&         out_dim    [[buffer(5)]],
+    constant uint&         in_dim     [[buffer(6)]],
+    constant uint&         group_size [[buffer(7)]],
+    uint tgid   [[threadgroup_position_in_grid]],
+    uint lid    [[thread_position_in_threadgroup]],
+    uint simd_lane  [[thread_index_in_simdgroup]],
+    uint simd_group [[simdgroup_index_in_threadgroup]]
+) {
+    uint row = tgid * ROWS_PER_TG + simd_group;
+    uint packed_cols = in_dim / 8;
+    uint num_groups  = in_dim / group_size;
+    uint group_packed = group_size / 8;
+
+    threadgroup float x_shared[TILE_IN_LARGE];
+
+    device const uint32_t* w_row = W_packed + row * packed_cols;
+    device const uint16_t* s_row = scales + row * num_groups;
+    device const uint16_t* b_row = biases + row * num_groups;
+
+    float acc = 0.0f;
+
+    for (uint tile_start = 0; tile_start < in_dim; tile_start += TILE_IN_LARGE) {
+        uint tile_size = min((uint)TILE_IN_LARGE, in_dim - tile_start);
+
+        for (uint i = lid; i < tile_size; i += 256) {
+            x_shared[i] = x[tile_start + i];
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        if (row < out_dim) {
+            uint tile_packed_start = tile_start / 8;
+            uint tile_packed_size  = tile_size / 8;
+
+            for (uint c_local = simd_lane; c_local < tile_packed_size; c_local += 32) {
+                uint col_global = tile_packed_start + c_local;
+                uint g = col_global / group_packed;
+                float scale = bf16_to_f32(s_row[g]);
+                float bias  = bf16_to_f32(b_row[g]);
+                uint32_t packed = w_row[col_global];
+                uint x_base = c_local * 8;
+
+                float sx0 = scale * x_shared[x_base + 0];  float bx0 = bias * x_shared[x_base + 0];
+                float sx1 = scale * x_shared[x_base + 1];  float bx1 = bias * x_shared[x_base + 1];
+                float sx2 = scale * x_shared[x_base + 2];  float bx2 = bias * x_shared[x_base + 2];
+                float sx3 = scale * x_shared[x_base + 3];  float bx3 = bias * x_shared[x_base + 3];
+                float sx4 = scale * x_shared[x_base + 4];  float bx4 = bias * x_shared[x_base + 4];
+                float sx5 = scale * x_shared[x_base + 5];  float bx5 = bias * x_shared[x_base + 5];
+                float sx6 = scale * x_shared[x_base + 6];  float bx6 = bias * x_shared[x_base + 6];
+                float sx7 = scale * x_shared[x_base + 7];  float bx7 = bias * x_shared[x_base + 7];
+
+                acc += fma(float((packed >>  0) & 0xF), sx0, bx0);
+                acc += fma(float((packed >>  4) & 0xF), sx1, bx1);
+                acc += fma(float((packed >>  8) & 0xF), sx2, bx2);
+                acc += fma(float((packed >> 12) & 0xF), sx3, bx3);
+                acc += fma(float((packed >> 16) & 0xF), sx4, bx4);
+                acc += fma(float((packed >> 20) & 0xF), sx5, bx5);
+                acc += fma(float((packed >> 24) & 0xF), sx6, bx6);
+                acc += fma(float((packed >> 28) & 0xF), sx7, bx7);
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    float sum = simd_sum(acc);
+    if (row < out_dim && simd_lane == 0) {
+        out[row] = sum;
+    }
+}
+
+#undef TILE_IN_LARGE
+
+
+// ============================================================================
+// Variant B: 4096 tile + cached scales/biases per tile.
+// ============================================================================
+// On each tile we cooperatively load:
+//   - x_shared[TILE]      (4096 floats = 16 KB)
+//   - sb_shared[ROWS_PER_TG][TILE/GROUP] (8 rows × 64 groups × 2 bf16 × 2 = 4 KB)
+// Inner loop reads scales/biases from shared instead of going to device memory
+// on every column. Group_size baked in as 64 (matches our INT4 quantizer).
+
+#define TILE_IN_B 4096
+#define GROUPS_PER_TILE 64    // = TILE_IN_B / group_size (group_size=64)
+
+kernel void dequant_matvec_4bit_v3_tiled_sbcache(
+    device const uint32_t* W_packed   [[buffer(0)]],
+    device const uint16_t* scales     [[buffer(1)]],
+    device const uint16_t* biases     [[buffer(2)]],
+    device const float*    x          [[buffer(3)]],
+    device float*          out        [[buffer(4)]],
+    constant uint&         out_dim    [[buffer(5)]],
+    constant uint&         in_dim     [[buffer(6)]],
+    constant uint&         group_size [[buffer(7)]],
+    uint tgid   [[threadgroup_position_in_grid]],
+    uint lid    [[thread_position_in_threadgroup]],
+    uint simd_lane  [[thread_index_in_simdgroup]],
+    uint simd_group [[simdgroup_index_in_threadgroup]]
+) {
+    uint row = tgid * ROWS_PER_TG + simd_group;
+    uint packed_cols = in_dim / 8;
+    uint num_groups  = in_dim / group_size;
+
+    threadgroup float    x_shared[TILE_IN_B];
+    // s_shared[r][g] = bf16 scale for row r, group g (within this tile)
+    threadgroup uint16_t s_shared[ROWS_PER_TG * GROUPS_PER_TILE];
+    threadgroup uint16_t b_shared[ROWS_PER_TG * GROUPS_PER_TILE];
+
+    uint row_base = tgid * ROWS_PER_TG;
+    device const uint32_t* w_row_base = W_packed + row * packed_cols;
+
+    float acc = 0.0f;
+
+    for (uint tile_start = 0; tile_start < in_dim; tile_start += TILE_IN_B) {
+        uint tile_size = min((uint)TILE_IN_B, in_dim - tile_start);
+        uint tile_groups = tile_size / group_size;
+        uint group_off = tile_start / group_size;
+
+        // Load x tile.
+        for (uint i = lid; i < tile_size; i += 256) {
+            x_shared[i] = x[tile_start + i];
+        }
+        // Load scales/biases for all 8 rows of this TG, for this tile's groups.
+        // Total per tile: 8 rows × 64 groups = 512 entries. 256 threads → 2 per thread.
+        for (uint i = lid; i < ROWS_PER_TG * tile_groups; i += 256) {
+            uint r = i / tile_groups;
+            uint g = i - r * tile_groups;
+            uint row_g = row_base + r;
+            if (row_g < out_dim) {
+                s_shared[i] = scales[row_g * num_groups + group_off + g];
+                b_shared[i] = biases[row_g * num_groups + group_off + g];
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        if (row < out_dim) {
+            uint tile_packed_start = tile_start / 8;
+            uint tile_packed_size  = tile_size / 8;
+            uint sb_row_off = simd_group * GROUPS_PER_TILE;
+
+            for (uint c_local = simd_lane; c_local < tile_packed_size; c_local += 32) {
+                uint col_global = tile_packed_start + c_local;
+                uint g_local = c_local / 8;       // 8 packed words per group
+                float scale = bf16_to_f32(s_shared[sb_row_off + g_local]);
+                float bias  = bf16_to_f32(b_shared[sb_row_off + g_local]);
+
+                uint32_t packed = w_row_base[col_global];
+                uint x_base = c_local * 8;
+
+                float sx0 = scale * x_shared[x_base + 0];  float bx0 = bias * x_shared[x_base + 0];
+                float sx1 = scale * x_shared[x_base + 1];  float bx1 = bias * x_shared[x_base + 1];
+                float sx2 = scale * x_shared[x_base + 2];  float bx2 = bias * x_shared[x_base + 2];
+                float sx3 = scale * x_shared[x_base + 3];  float bx3 = bias * x_shared[x_base + 3];
+                float sx4 = scale * x_shared[x_base + 4];  float bx4 = bias * x_shared[x_base + 4];
+                float sx5 = scale * x_shared[x_base + 5];  float bx5 = bias * x_shared[x_base + 5];
+                float sx6 = scale * x_shared[x_base + 6];  float bx6 = bias * x_shared[x_base + 6];
+                float sx7 = scale * x_shared[x_base + 7];  float bx7 = bias * x_shared[x_base + 7];
+
+                acc += fma(float((packed >>  0) & 0xF), sx0, bx0);
+                acc += fma(float((packed >>  4) & 0xF), sx1, bx1);
+                acc += fma(float((packed >>  8) & 0xF), sx2, bx2);
+                acc += fma(float((packed >> 12) & 0xF), sx3, bx3);
+                acc += fma(float((packed >> 16) & 0xF), sx4, bx4);
+                acc += fma(float((packed >> 20) & 0xF), sx5, bx5);
+                acc += fma(float((packed >> 24) & 0xF), sx6, bx6);
+                acc += fma(float((packed >> 28) & 0xF), sx7, bx7);
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    float sum = simd_sum(acc);
+    if (row < out_dim && simd_lane == 0) {
+        out[row] = sum;
+    }
+}
+
+#undef TILE_IN_B
+#undef GROUPS_PER_TILE
+
+
+// ============================================================================
+// Variant C: 2-pass split-K matvec (more parallelism for narrow output dims).
+// ============================================================================
+// Pass 1: each TG handles ROWS_PER_TG rows × (in_dim / K_SPLIT) input cols,
+//         writes partial sums to `partials[K_SPLIT, out_dim]`.
+// Pass 2: a reduce kernel sums the K_SPLIT partials per row.
+//
+// For in_dim=9216 and K_SPLIT=2, each pass-1 TG processes 9216/2=4608 in
+// cols × 8 rows → fits cleanly in two 2304-element shared chunks (which is
+// less than the v3 tile, so plenty of headroom). At K_SPLIT=4, each TG does
+// 2304 cols which fits in a single small tile.
+
+#define K_SPLIT 4
+
+kernel void dequant_matvec_4bit_v3_splitk_pass1(
+    device const uint32_t* W_packed   [[buffer(0)]],
+    device const uint16_t* scales     [[buffer(1)]],
+    device const uint16_t* biases     [[buffer(2)]],
+    device const float*    x          [[buffer(3)]],
+    device float*          partials   [[buffer(4)]],   // [K_SPLIT, out_dim]
+    constant uint&         out_dim    [[buffer(5)]],
+    constant uint&         in_dim     [[buffer(6)]],
+    constant uint&         group_size [[buffer(7)]],
+    constant uint&         num_row_tiles [[buffer(8)]],
+    uint  tgid_linear  [[threadgroup_position_in_grid]],   // row_tile + k * num_row_tiles
+    uint  lid          [[thread_position_in_threadgroup]],
+    uint  simd_lane    [[thread_index_in_simdgroup]],
+    uint  simd_group   [[simdgroup_index_in_threadgroup]]
+) {
+    uint row_tile = tgid_linear % num_row_tiles;
+    uint k        = tgid_linear / num_row_tiles;
+    uint row = row_tile * ROWS_PER_TG + simd_group;
+
+    uint packed_cols = in_dim / 8;
+    uint num_groups  = in_dim / group_size;
+    uint group_packed = group_size / 8;
+
+    // This k-slice processes input cols [in_start, in_end).
+    uint slice = (in_dim + K_SPLIT - 1) / K_SPLIT;
+    // Round slice down to a multiple of group_size so groups don't straddle.
+    slice = (slice / group_size) * group_size;
+    uint in_start = k * slice;
+    uint in_end   = (k == K_SPLIT - 1) ? in_dim : min(in_dim, in_start + slice);
+    if (in_start >= in_dim) return;
+    uint slice_size = in_end - in_start;
+
+    // x cache — sized for the full slice (≤ ~2400 for in_dim=9216, K=4).
+    threadgroup float x_shared[3072];   // enough for in_dim ≤ 12288, K_SPLIT ≥ 4
+
+    device const uint32_t* w_row = W_packed + row * packed_cols;
+    device const uint16_t* s_row = scales + row * num_groups;
+    device const uint16_t* b_row = biases + row * num_groups;
+
+    for (uint i = lid; i < slice_size; i += 256) {
+        x_shared[i] = x[in_start + i];
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    if (row >= out_dim) return;
+
+    float acc = 0.0f;
+    uint slice_packed_start = in_start / 8;
+    uint slice_packed_size  = slice_size / 8;
+
+    for (uint c_local = simd_lane; c_local < slice_packed_size; c_local += 32) {
+        uint col_global = slice_packed_start + c_local;
+        uint g = col_global / group_packed;
+        float scale = bf16_to_f32(s_row[g]);
+        float bias  = bf16_to_f32(b_row[g]);
+        uint32_t packed = w_row[col_global];
+        uint x_base = c_local * 8;
+
+        float sx0 = scale * x_shared[x_base + 0];  float bx0 = bias * x_shared[x_base + 0];
+        float sx1 = scale * x_shared[x_base + 1];  float bx1 = bias * x_shared[x_base + 1];
+        float sx2 = scale * x_shared[x_base + 2];  float bx2 = bias * x_shared[x_base + 2];
+        float sx3 = scale * x_shared[x_base + 3];  float bx3 = bias * x_shared[x_base + 3];
+        float sx4 = scale * x_shared[x_base + 4];  float bx4 = bias * x_shared[x_base + 4];
+        float sx5 = scale * x_shared[x_base + 5];  float bx5 = bias * x_shared[x_base + 5];
+        float sx6 = scale * x_shared[x_base + 6];  float bx6 = bias * x_shared[x_base + 6];
+        float sx7 = scale * x_shared[x_base + 7];  float bx7 = bias * x_shared[x_base + 7];
+
+        acc += fma(float((packed >>  0) & 0xF), sx0, bx0);
+        acc += fma(float((packed >>  4) & 0xF), sx1, bx1);
+        acc += fma(float((packed >>  8) & 0xF), sx2, bx2);
+        acc += fma(float((packed >> 12) & 0xF), sx3, bx3);
+        acc += fma(float((packed >> 16) & 0xF), sx4, bx4);
+        acc += fma(float((packed >> 20) & 0xF), sx5, bx5);
+        acc += fma(float((packed >> 24) & 0xF), sx6, bx6);
+        acc += fma(float((packed >> 28) & 0xF), sx7, bx7);
+    }
+
+    float sum = simd_sum(acc);
+    if (simd_lane == 0) {
+        partials[k * out_dim + row] = sum;
+    }
+}
+
+kernel void dequant_matvec_4bit_v3_splitk_pass2(
+    device const float* partials [[buffer(0)]],   // [K_SPLIT, out_dim]
+    device float*       out      [[buffer(1)]],   // [out_dim]
+    constant uint&      out_dim  [[buffer(2)]],
+    uint tid [[thread_position_in_grid]]
+) {
+    if (tid >= out_dim) return;
+    float s = 0.0f;
+    for (uint k = 0; k < K_SPLIT; ++k) {
+        s += partials[k * out_dim + tid];
+    }
+    out[tid] = s;
+}
+
+#undef K_SPLIT
 
 
 // ============================================================================

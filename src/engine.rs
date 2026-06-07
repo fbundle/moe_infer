@@ -121,14 +121,26 @@ pub mod fused_exp2;
 pub mod fused_exp3;
 #[path = "engine/qwen35_moe/fused_exp4.rs"]
 mod fused_exp4;
+#[path = "engine/qwen35_moe/fused_exp5.rs"]
+mod fused_exp5;
+#[path = "engine/qwen35_moe/expert_prefetch.rs"]
+pub mod expert_prefetch;
+#[path = "engine/qwen35_moe/fused_exp6.rs"]
+mod fused_exp6;
 #[path = "engine/qwen35_moe/metal_context.rs"]
 pub mod metal_context;
 #[path = "engine/qwen35_moe/metal_kernels.rs"]
-mod metal_kernels;
+pub mod metal_kernels;
 #[path = "engine/qwen35_moe/mtp.rs"]
 pub mod mtp;
 #[path = "engine/qwen35_moe/batched.rs"]
 pub mod batched;
+
+// Dense Qwen3.5 engine — single-CB forward (no expert pool, no streaming).
+#[path = "engine/qwen35_dense/constants.rs"]
+pub mod qwen35_dense_constants;
+#[path = "engine/qwen35_dense/fused_exp1.rs"]
+pub mod qwen35_dense_fused;
 
 // Gemma 4 MoE engine — scaffold; not yet registered in DynEngine.
 #[path = "engine/gemma4_moe/constants.rs"]
@@ -147,6 +159,10 @@ use crate::engine::fused_exp1::FusedExp1;
 use crate::engine::fused_exp2::FusedExp2;
 use crate::engine::fused_exp3::FusedExp3;
 use crate::engine::fused_exp4::FusedExp4;
+use crate::engine::fused_exp5::FusedExp5;
+use crate::engine::fused_exp6::FusedExp6;
+use crate::engine::qwen35_dense_constants::{Qwen35Dense4B, Qwen35DenseStripped};
+use crate::engine::qwen35_dense_fused::FusedDense;
 use crate::engine::gemma4_constants::{Gemma4_26B_A4B, Gemma4Stripped};
 use crate::engine::gemma4_fused_exp3::Gemma4Fused;
 
@@ -184,10 +200,22 @@ impl DynEngine {
                 Box::new(FusedExp4::<FullModel>::new(model, num_active_experts, expert_cache_count)?),
             ("Qwen35MoEFusedExp4", "Qwen3_5MoeForConditionalGeneration_Stripped") =>
                 Box::new(FusedExp4::<StrippedModel>::new(model, num_active_experts, expert_cache_count)?),
+            ("Qwen35MoEFusedExp5", "Qwen3_5MoeForConditionalGeneration") =>
+                Box::new(FusedExp5::<FullModel>::new(model, num_active_experts, expert_cache_count)?),
+            ("Qwen35MoEFusedExp5", "Qwen3_5MoeForConditionalGeneration_Stripped") =>
+                Box::new(FusedExp5::<StrippedModel>::new(model, num_active_experts, expert_cache_count)?),
+            ("Qwen35MoEFusedExp6", "Qwen3_5MoeForConditionalGeneration") =>
+                Box::new(FusedExp6::<FullModel>::new(model, num_active_experts, expert_cache_count)?),
+            ("Qwen35MoEFusedExp6", "Qwen3_5MoeForConditionalGeneration_Stripped") =>
+                Box::new(FusedExp6::<StrippedModel>::new(model, num_active_experts, expert_cache_count)?),
             ("Gemma4MoEFused", "Gemma4ForConditionalGeneration") =>
                 Box::new(Gemma4Fused::<Gemma4_26B_A4B>::new(model, num_active_experts, expert_cache_count)?),
             ("Gemma4MoEFused", "Gemma4ForConditionalGeneration_Stripped") =>
                 Box::new(Gemma4Fused::<Gemma4Stripped>::new(model, num_active_experts, expert_cache_count)?),
+            ("Qwen35DenseFused", "Qwen3_5ForConditionalGeneration") =>
+                Box::new(FusedDense::<Qwen35Dense4B>::new(model, num_active_experts, expert_cache_count)?),
+            ("Qwen35DenseFused", "Qwen3_5ForConditionalGeneration_Stripped") =>
+                Box::new(FusedDense::<Qwen35DenseStripped>::new(model, num_active_experts, expert_cache_count)?),
             _ => return Err(MoEError::Config(format!(
                 "Unknown engine: engine_type={:?}, arch={:?}", engine_type, arch
             ))),
