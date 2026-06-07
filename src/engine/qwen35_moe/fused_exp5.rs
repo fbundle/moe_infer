@@ -159,15 +159,22 @@ impl<'b, C: ModelConfig> ExecCtx<'b, C> {
             }
         };
 
+        let t_encode = Instant::now();
         let is_full = (layer + 1) % FULL_ATTN_INTERVAL == 0;
         if is_full {
             self.op1_full(layer, pos, &cmd);
         } else {
             self.op1_linear(layer, &cmd);
         }
+        let enc_ms = t_encode.elapsed().as_secs_f64() * 1000.0;
+        timing_add(&mut self.engine.timing, "phase.op1_encode_ms", enc_ms);
 
+        let t_wait = Instant::now();
         cmd.commit();
         cmd.wait_until_completed();
+        let wait_ms = t_wait.elapsed().as_secs_f64() * 1000.0;
+        timing_add(&mut self.engine.timing, "phase.op1_commit_wait_ms", wait_ms);
+
         drop(keep_alive);
         self.pending = None;
 
@@ -229,12 +236,15 @@ impl<'b, C: ModelConfig> ExecCtx<'b, C> {
     // ── Routing ───────────────────────────────────────────────────────────
 
     fn route_experts(&mut self, layer: usize, mut gate_scores: GateScores) -> Routing {
+        let t_route = Instant::now();
         let k = self.engine.num_active_experts;
         softmax(&mut gate_scores.scores);
         let mut expert_indices = vec![0usize; k];
         let mut expert_weights = vec![0.0f32; k];
         topk(&gate_scores.scores, k, &mut expert_indices, &mut expert_weights);
         normalize_weights(&mut expert_weights);
+        let route_cpu_ms = t_route.elapsed().as_secs_f64() * 1000.0;
+        timing_add(&mut self.engine.timing, "phase.route_cpu_ms", route_cpu_ms);
 
         let actual_k = k.min(MAX_K);
         let mut resolved_data: Vec<Option<Buffer>> = vec![None; actual_k];
@@ -316,7 +326,7 @@ impl<'b, C: ModelConfig> ExecCtx<'b, C> {
     // ── op2: post-expert (encodes into pending buffer, does NOT commit) ────
 
     fn op2(&mut self, layer: usize, routing: &Routing) {
-
+        let t_op2 = Instant::now();
         let hidden_dim = C::HIDDEN_DIM;
         let moe_inter = C::MOE_INTERMEDIATE;
         let shared_inter = C::SHARED_INTERMEDIATE;
@@ -362,11 +372,14 @@ impl<'b, C: ModelConfig> ExecCtx<'b, C> {
             cmd_buf: Some(cmd),
             _keep_alive: keep_alive,
         });
+        let op2_ms = t_op2.elapsed().as_secs_f64() * 1000.0;
+        timing_add(&mut self.engine.timing, "phase.op2_encode_ms", op2_ms);
     }
 
     // ── Commit final pending work & read hidden from GPU ──────────────────
 
     fn hidden_wait(&mut self) -> Vec<f32> {
+        let t_hw = Instant::now();
         let hidden_dim = C::HIDDEN_DIM;
         let pending = self.pending.take();
         if let Some(ref def) = pending {
@@ -382,14 +395,19 @@ impl<'b, C: ModelConfig> ExecCtx<'b, C> {
                 self.engine.ctx.buf_moe_hidden.as_ref().unwrap().contents() as *const f32,
                 hidden.as_mut_ptr(), hidden_dim);
         }
+        let hw_ms = t_hw.elapsed().as_secs_f64() * 1000.0;
+        timing_add(&mut self.engine.timing, "phase.hidden_wait_ms", hw_ms);
         hidden
     }
 
     // ── Final norm + LM head ───────────────────────────────────────────────
 
-    fn final_norm_and_lm_head(&self, hidden: &mut [f32], logits: &mut [f32]) {
+    fn final_norm_and_lm_head(&mut self, hidden: &mut [f32], logits: &mut [f32]) {
+        let t_lm = Instant::now();
         final_norm(&self.engine.model.weight_file, hidden, C::HIDDEN_DIM);
         gpu_lm_head(&self.engine.model.weight_file, hidden, logits, &self.engine.weight_buffer, &self.engine.ctx);
+        let lm_ms = t_lm.elapsed().as_secs_f64() * 1000.0;
+        timing_add(&mut self.engine.timing, "phase.lm_head_ms", lm_ms);
     }
 }
 
