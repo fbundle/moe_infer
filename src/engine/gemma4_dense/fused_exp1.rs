@@ -223,6 +223,60 @@ impl<C: ModelConfig> FusedGemma4Dense<C> {
         );
     }
 
+    /// Try to dispatch fused gate+up+GELU(tanh-approx). Returns false if
+    /// the kernel isn't available or either weight tensor isn't INT4 —
+    /// caller falls back to the 3-dispatch path.
+    fn encode_fused_gate_up_geglu_tanh(
+        &self,
+        enc: &ComputeCommandEncoderRef,
+        layer_prefix: &str,
+        src: &Buffer, dst: &Buffer,
+    ) -> bool {
+        if self.ctx.fused_gate_up_geglu_tanh_v3.is_none() {
+            return false;
+        }
+        let wf = &self.model.weight_file;
+        let base = self.weight_buffer.base;
+        let resolve = |name: &str| -> Option<u64> {
+            wf.get_tensor_ptr(name).map(|p| (p as usize - base as usize) as u64)
+        };
+        let gate_p = format!("{}.mlp.gate_proj", layer_prefix);
+        let up_p   = format!("{}.mlp.up_proj",   layer_prefix);
+        // Confirm both are INT4 (we don't fall back to a mixed-dtype fused path).
+        let int4_str = "u32"; // INT4 weight tensors store as u32 packs in our format.
+        let gate_dtype = wf.get_tensor_info(&format!("{}.weight", gate_p))
+            .map(|i| i.dtype.as_str().to_string()).unwrap_or_default();
+        let up_dtype = wf.get_tensor_info(&format!("{}.weight", up_p))
+            .map(|i| i.dtype.as_str().to_string()).unwrap_or_default();
+        if gate_dtype != int4_str || up_dtype != int4_str {
+            return false;
+        }
+        let (gw, gs, gb) = match (
+            resolve(&format!("{}.weight", gate_p)),
+            resolve(&format!("{}.scales", gate_p)),
+            resolve(&format!("{}.biases", gate_p)),
+        ) {
+            (Some(a), Some(b), Some(c)) => (a, b, c),
+            _ => return false,
+        };
+        let (uw, us, ub) = match (
+            resolve(&format!("{}.weight", up_p)),
+            resolve(&format!("{}.scales", up_p)),
+            resolve(&format!("{}.biases", up_p)),
+        ) {
+            (Some(a), Some(b), Some(c)) => (a, b, c),
+            _ => return false,
+        };
+        let buf = &self.weight_buffer.buf;
+        crate::engine::metal_kernels::encode_fused_gate_up_geglu_tanh(
+            &self.ctx, enc,
+            buf, gw, buf, gs, buf, gb,
+            buf, uw, buf, us, buf, ub,
+            src, 0, dst, 0,
+            C::INTERMEDIATE as u32, C::HIDDEN_DIM as u32, 64,
+        )
+    }
+
     fn encode_attention(
         &self,
         enc: &ComputeCommandEncoderRef,
@@ -540,23 +594,31 @@ impl<C: ModelConfig> FusedGemma4Dense<C> {
             &format!("{}.pre_feedforward_layernorm.weight", prefix),
             &self.buf_hidden, &self.buf_normed,
         );
-        self.encode_matvec(enc, &format!("{}.mlp.gate_proj", prefix),
-            &self.buf_normed, &self.buf_mlp_gate,
-            C::INTERMEDIATE, C::HIDDEN_DIM);
-        self.encode_matvec(enc, &format!("{}.mlp.up_proj", prefix),
-            &self.buf_normed, &self.buf_mlp_up,
-            C::INTERMEDIATE, C::HIDDEN_DIM);
-        // Gemma uses GELU(tanh-approx)(gate) * up — NOT SiLU.
-        let pipe = self.pipeline("gemma_geglu_tanh");
-        enc.set_compute_pipeline_state(&pipe);
-        enc.set_buffer(0, Some(&self.buf_mlp_gate), 0);
-        enc.set_buffer(1, Some(&self.buf_mlp_up), 0);
-        enc.set_buffer(2, Some(&self.buf_mlp_act), 0);
-        let count_u = C::INTERMEDIATE as u32;
-        enc.set_bytes(3, 4, &count_u as *const u32 as *const c_void);
-        enc.dispatch_thread_groups(
-            MTLSize::new(((C::INTERMEDIATE as u64 + 255) / 256), 1, 1),
-            MTLSize::new(256, 1, 1));
+        // Try fused gate+up+GELU first: one dispatch reading x once,
+        // computing both projections, and applying gelu_tanh inline. Falls
+        // back to the 3-dispatch path (gate matvec / up matvec / geglu) if
+        // the fused kernel isn't loaded (e.g. older shader bundle).
+        let fused_ok = self.encode_fused_gate_up_geglu_tanh(
+            enc, &prefix, &self.buf_normed, &self.buf_mlp_act,
+        );
+        if !fused_ok {
+            self.encode_matvec(enc, &format!("{}.mlp.gate_proj", prefix),
+                &self.buf_normed, &self.buf_mlp_gate,
+                C::INTERMEDIATE, C::HIDDEN_DIM);
+            self.encode_matvec(enc, &format!("{}.mlp.up_proj", prefix),
+                &self.buf_normed, &self.buf_mlp_up,
+                C::INTERMEDIATE, C::HIDDEN_DIM);
+            let pipe = self.pipeline("gemma_geglu_tanh");
+            enc.set_compute_pipeline_state(&pipe);
+            enc.set_buffer(0, Some(&self.buf_mlp_gate), 0);
+            enc.set_buffer(1, Some(&self.buf_mlp_up), 0);
+            enc.set_buffer(2, Some(&self.buf_mlp_act), 0);
+            let count_u = C::INTERMEDIATE as u32;
+            enc.set_bytes(3, 4, &count_u as *const u32 as *const c_void);
+            enc.dispatch_thread_groups(
+                MTLSize::new(((C::INTERMEDIATE as u64 + 255) / 256), 1, 1),
+                MTLSize::new(256, 1, 1));
+        }
         self.encode_matvec(enc, &format!("{}.mlp.down_proj", prefix),
             &self.buf_mlp_act, &self.buf_mlp_down,
             C::HIDDEN_DIM, C::INTERMEDIATE);

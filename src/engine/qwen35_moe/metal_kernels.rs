@@ -79,6 +79,30 @@ pub fn encode_matvec_offset(
         return;
     }
 
+    // v6: v4_nr4 + pre-multiplied lx + NSG=4. Dispatch: 4 rows × 4 SGs = 16
+    // rows per TG, 128 threads per TG.
+    if use_fast >= 3 && variant == "v6" && ctx.matvec_v6.is_some() {
+        let pipeline = ctx.matvec_v6.as_ref().unwrap();
+        encoder.set_compute_pipeline_state(pipeline);
+        encoder.set_buffer(0, Some(w_packed), w_offset);
+        encoder.set_buffer(1, Some(scales), s_offset);
+        encoder.set_buffer(2, Some(biases), b_offset);
+        encoder.set_buffer(3, Some(x), x_offset);
+        encoder.set_buffer(4, Some(out), o_offset);
+        unsafe {
+            set_u32(encoder, 5, out_dim);
+            set_u32(encoder, 6, in_dim);
+            set_u32(encoder, 7, group_size);
+        }
+        const ROWS_PER_TG_V6: u32 = 8;  // NR0=4 × NSG=2
+        let num_tgs = (out_dim + ROWS_PER_TG_V6 - 1) / ROWS_PER_TG_V6;
+        encoder.dispatch_thread_groups(
+            MTLSize::new(num_tgs as u64, 1, 1),
+            MTLSize::new(64, 1, 1),  // NSG=2 × 32 lanes
+        );
+        return;
+    }
+
     // Handle split-K specially — it's a 2-pass dispatch with a partials buffer.
     if need_large_int4 && variant == "splitk"
         && ctx.matvec_v3_splitk_pass1.is_some()
@@ -284,6 +308,51 @@ pub fn encode_fused_gate_up_swiglu(
     group_size: u32,
 ) -> bool {
     let pipeline = match ctx.fused_gate_up_swiglu_v3.as_ref() {
+        Some(p) => p,
+        None => return false,
+    };
+    encoder.set_compute_pipeline_state(pipeline);
+    encoder.set_buffer(0, Some(gate_w), gate_w_off);
+    encoder.set_buffer(1, Some(gate_s), gate_s_off);
+    encoder.set_buffer(2, Some(gate_b), gate_b_off);
+    encoder.set_buffer(3, Some(up_w),   up_w_off);
+    encoder.set_buffer(4, Some(up_s),   up_s_off);
+    encoder.set_buffer(5, Some(up_b),   up_b_off);
+    encoder.set_buffer(6, Some(x),      x_off);
+    encoder.set_buffer(7, Some(out),    out_off);
+    unsafe {
+        set_u32(encoder, 8,  out_dim);
+        set_u32(encoder, 9,  in_dim);
+        set_u32(encoder, 10, group_size);
+    }
+    let num_tgs = (out_dim + ROWS_PER_TG - 1) / ROWS_PER_TG;
+    encoder.dispatch_thread_groups(
+        MTLSize::new(num_tgs as u64, 1, 1),
+        MTLSize::new(TG_SIZE as u64, 1, 1),
+    );
+    true
+}
+
+/// Encode fused gate + up + GELU(tanh-approx) for Gemma's MLP. Same buffer
+/// layout as `encode_fused_gate_up_swiglu`; the only difference is the
+/// activation. Returns false when the pipeline isn't in the loaded bundle.
+#[allow(clippy::too_many_arguments)]
+pub fn encode_fused_gate_up_geglu_tanh(
+    ctx: &MetalContext,
+    encoder: &ComputeCommandEncoderRef,
+    gate_w: &BufferRef, gate_w_off: u64,
+    gate_s: &BufferRef, gate_s_off: u64,
+    gate_b: &BufferRef, gate_b_off: u64,
+    up_w:   &BufferRef, up_w_off:   u64,
+    up_s:   &BufferRef, up_s_off:   u64,
+    up_b:   &BufferRef, up_b_off:   u64,
+    x:      &BufferRef, x_off:      u64,
+    out:    &BufferRef, out_off:    u64,
+    out_dim: u32,
+    in_dim:  u32,
+    group_size: u32,
+) -> bool {
+    let pipeline = match ctx.fused_gate_up_geglu_tanh_v3.as_ref() {
         Some(p) => p,
         None => return false,
     };

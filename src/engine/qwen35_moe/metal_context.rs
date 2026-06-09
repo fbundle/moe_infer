@@ -224,6 +224,13 @@ pub struct MetalContext {
     /// Selected via `MATVEC_V3_VARIANT=v4_nr4`; falls back to `tiled` when
     /// the pipeline isn't present in the loaded shader bundle.
     pub matvec_v4_nr4: Option<ComputePipelineState>,
+    /// v4_nr4 + pre-multiplied lx + NSG=4. Inner loop is pure AND+FMA
+    /// (no per-nibble right-shift). Select via `MATVEC_V3_VARIANT=v6`.
+    pub matvec_v6: Option<ComputePipelineState>,
+    /// Fused gate_proj + up_proj + GELU(tanh-approx) — Gemma's MLP fast
+    /// path. Same structure as `fused_gate_up_swiglu_v3` but applies
+    /// gelu_tanh instead of silu.
+    pub fused_gate_up_geglu_tanh_v3: Option<ComputePipelineState>,
     pub matvec_bf16: ComputePipelineState,
     pub matvec_int8: ComputePipelineState,
     pub matvec_fp4_e2m1: Option<ComputePipelineState>,
@@ -643,6 +650,8 @@ impl MetalContext {
             let matvec_v3_splitk_pass2 = make_pipeline("dequant_matvec_4bit_v3_splitk_pass2").ok();
             let fused_gate_up_swiglu_v3 = make_pipeline("fused_gate_up_swiglu_v3").ok();
             let matvec_v4_nr4 = make_pipeline("dequant_matvec_4bit_v4_nr4").ok();
+            let matvec_v6 = make_pipeline("dequant_matvec_4bit_v6").ok();
+            let fused_gate_up_geglu_tanh_v3 = make_pipeline("fused_gate_up_geglu_tanh_v3").ok();
             let matvec_bf16 = make_pipeline("matvec_bf16")?;
             let matvec_int8 = make_pipeline("matvec_int8")?;
             let matvec_fp4_e2m1 = make_pipeline("dequant_matvec_fp4_e2m1").ok();
@@ -700,6 +709,8 @@ impl MetalContext {
                 buf_splitk_partials,
                 fused_gate_up_swiglu_v3,
                 matvec_v4_nr4,
+                matvec_v6,
+                fused_gate_up_geglu_tanh_v3,
                 matvec_bf16,
                 matvec_int8,
                 matvec_fp4_e2m1,
