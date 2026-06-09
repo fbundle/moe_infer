@@ -661,6 +661,9 @@ impl<C: ModelConfig> Engine for FusedGemma4Dense<C> {
             // Total floats written: (stop_at + 1) * HIDDEN_DIM.
             let capture_hidden = std::env::var("GEMMA4_DENSE_CAPTURE_HIDDEN").is_ok();
 
+            let profile = std::env::var("GEMMA4_DENSE_PROFILE").is_ok();
+            let t_cpu0 = if profile { Some(std::time::Instant::now()) } else { None };
+
             autoreleasepool(|| {
                 let cb = self.ctx.queue.new_command_buffer();
                 let enc = cb.new_compute_command_encoder();
@@ -681,8 +684,16 @@ impl<C: ModelConfig> Engine for FusedGemma4Dense<C> {
                 }
 
                 enc.end_encoding();
+                let t_enc = t_cpu0.map(|t| t.elapsed().as_secs_f64() * 1000.0);
                 cb.commit();
                 cb.wait_until_completed();
+                if let Some(enc_ms) = t_enc {
+                    let total_ms = t_cpu0.unwrap().elapsed().as_secs_f64() * 1000.0;
+                    let gpu_ms = total_ms - enc_ms;
+                    eprintln!(
+                        "[profile] tok={} cpu_enc={:.2}ms gpu+commit={:.2}ms total={:.2}ms",
+                        ti, enc_ms, gpu_ms, total_ms);
+                }
             });
 
             let logits_slice = &mut logits[ti * vocab_size..(ti + 1) * vocab_size];
