@@ -24,7 +24,7 @@ use metal::*;
 use objc::rc::autoreleasepool;
 
 use crate::cache::Cache;
-use crate::constants::{FULL_ATTN_INTERVAL, MAX_SEQ, RMS_NORM_EPS};
+use crate::constants::{FULL_ATTN_INTERVAL, RMS_NORM_EPS};
 use crate::engine::metal_context::{metal_buf_shared, MetalContext, WeightBuffer};
 use crate::engine::metal_kernels;
 use crate::engine::qwen35_dense_constants::{is_full_attn_layer, ModelConfig};
@@ -626,8 +626,12 @@ impl<C: ModelConfig> Engine for FusedDense<C> {
         if n_tokens == 0 { return Ok(logits); }
 
         let mut pos = self.ctx.pos.get();
+        // Grow KV cache up-front to cover this whole forward (pos + n_tokens).
+        // Doing it before the per-token loop means at most one grow per call,
+        // and no in-flight command buffer can reference the old buffers
+        // because we're between forward() invocations.
+        self.ctx.ensure_max_seq(pos + n_tokens);
         for ti in 0..n_tokens {
-            assert!(pos < MAX_SEQ, "sequence position {} exceeds MAX_SEQ ({})", pos, MAX_SEQ);
 
             // ── Copy this token's embedding → buf_moe_hidden ──
             {

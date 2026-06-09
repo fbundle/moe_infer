@@ -203,7 +203,9 @@ impl<'b, C: ModelConfig> ExecCtx<'b, C> {
             );
             enc.end_encoding();
         }
-        assert!(pos < MAX_SEQ, "sequence position {} exceeds MAX_SEQ ({})", pos, MAX_SEQ);
+        assert!(pos < self.engine.ctx.current_max_seq,
+            "internal: pos {} exceeded current_max_seq {} after ensure_max_seq grow — should not happen",
+            pos, self.engine.ctx.current_max_seq);
     }
 
     /// Linear-attn op1: encode pre-expert GPU work into the supplied command buffer.
@@ -966,6 +968,8 @@ impl<C: ModelConfig> Engine for FusedExp5<C> {
         }
 
         let mut pos = self.ctx.pos.get();
+        // Grow KV cache up-front to cover this whole forward (pos + n_tokens).
+        self.ctx.ensure_max_seq(pos + n_tokens);
         {
             let mut exec = ExecCtx { engine: self, pending: None };
 

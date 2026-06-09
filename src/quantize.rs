@@ -86,20 +86,51 @@ pub fn run(
 
     let _hd = scheme.hidden_dim();
 
-    // ── 1. Load weight map from index.json ─────────────────────────
+    // ── 1. Load weight map from index.json, or synthesize one for
+    //       single-shard models that don't have an index file
+    //       (e.g. google/gemma-4-12B ships a single `model.safetensors`
+    //       with no companion `.index.json`). ─────────────────────────
     repo.ensure("config.json")?;
-    let index_path = repo.ensure("model.safetensors.index.json")?;
-    let weight_map = {
-        let idx_str = fs::read_to_string(&index_path).map_err(|e| e.to_string())?;
-        let idx: serde_json::Value =
-            serde_json::from_str(&idx_str).map_err(|e| e.to_string())?;
-        let mut wm = HashMap::new();
-        if let Some(map) = idx["weight_map"].as_object() {
-            for (k, v) in map {
-                wm.insert(k.clone(), v.as_str().unwrap_or("").to_string());
+    let weight_map: HashMap<String, String> = match repo.ensure("model.safetensors.index.json") {
+        Ok(index_path) => {
+            let idx_str = fs::read_to_string(&index_path).map_err(|e| e.to_string())?;
+            let idx: serde_json::Value =
+                serde_json::from_str(&idx_str).map_err(|e| e.to_string())?;
+            let mut wm = HashMap::new();
+            if let Some(map) = idx["weight_map"].as_object() {
+                for (k, v) in map {
+                    wm.insert(k.clone(), v.as_str().unwrap_or("").to_string());
+                }
             }
+            wm
         }
-        wm
+        Err(_) => {
+            // Single-shard: enumerate tensor names by reading the safetensors
+            // header. The header is the first 8-byte length prefix followed
+            // by a JSON object whose keys (minus "__metadata__") are the
+            // tensor names. We map all of them to the single shard file.
+            let shard_name = "model.safetensors";
+            let shard_path = repo.ensure(shard_name)?;
+            let mut f = fs::File::open(&shard_path).map_err(|e| e.to_string())?;
+            use std::io::{Read, Seek, SeekFrom};
+            let mut len_bytes = [0u8; 8];
+            f.read_exact(&mut len_bytes).map_err(|e| e.to_string())?;
+            let header_len = u64::from_le_bytes(len_bytes) as usize;
+            let mut header_bytes = vec![0u8; header_len];
+            f.seek(SeekFrom::Start(8)).map_err(|e| e.to_string())?;
+            f.read_exact(&mut header_bytes).map_err(|e| e.to_string())?;
+            let header: serde_json::Value =
+                serde_json::from_slice(&header_bytes).map_err(|e| e.to_string())?;
+            let mut wm = HashMap::new();
+            if let Some(obj) = header.as_object() {
+                for k in obj.keys() {
+                    if k == "__metadata__" { continue; }
+                    wm.insert(k.clone(), shard_name.to_string());
+                }
+            }
+            eprintln!("  (single-shard model; synthesized weight_map from safetensors header)");
+            wm
+        }
     };
     eprintln!("  Total tensors: {}", weight_map.len());
 

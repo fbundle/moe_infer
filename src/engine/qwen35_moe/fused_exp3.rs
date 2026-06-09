@@ -171,8 +171,7 @@ impl<C: ModelConfig> Engine for FusedExp3<C> {
         }
 
         let past_pos = self.inner.ctx.pos.get();
-        assert!(past_pos + n <= MAX_SEQ, "past_pos + n ({} + {}) exceeds MAX_SEQ ({})",
-                past_pos, n, MAX_SEQ);
+        self.inner.ctx.ensure_max_seq(past_pos + n);
 
         // Per-call buffers + per-layer unique-expert pool.
         let bufs = BatchedFullBuffers::new::<C>(&self.inner.ctx.device, n);

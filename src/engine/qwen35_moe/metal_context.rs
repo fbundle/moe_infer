@@ -196,7 +196,7 @@ pub struct MetalContext {
     pub device: Device,
     pub queue: CommandQueue,
     #[allow(dead_code)]
-    library: Library,
+    pub library: Library,
 
     // Pipeline states for each kernel
     pub matvec_naive: ComputePipelineState,
@@ -318,9 +318,97 @@ pub struct MetalContext {
     pub pos: std::cell::Cell<usize>,
     kv_dim: usize,
     num_layers: usize,
+    // ── KV-cache capacity tracking (for runtime growth) ──
+    /// Current capacity of buf_kv_k / buf_kv_v / buf_attn_partials in
+    /// sequence positions. Starts at `crate::constants::MAX_SEQ` and is
+    /// doubled by `ensure_max_seq` when a forward pass would otherwise
+    /// exceed it. Only the dense engine triggers growth today; MoE engines
+    /// keep their `pos < MAX_SEQ` asserts.
+    pub current_max_seq: usize,
+    /// Dimensions needed to re-allocate `buf_attn_partials` when KV grows.
+    /// Set in `init_linear_attn_buffers`; 0 means partials isn't allocated
+    /// (e.g. dense engine doesn't use the 2-pass SDPA path).
+    pub partials_num_heads: usize,
+    pub partials_head_dim: usize,
 }
 
 impl MetalContext {
+    /// Grow the KV cache (and partials, if used) so that at least `needed`
+    /// sequence positions can be addressed.
+    ///
+    /// Strategy: doubling. If `needed <= current_max_seq` this is a no-op.
+    /// Otherwise we double `current_max_seq` until it's large enough, then
+    /// allocate fresh Metal buffers and `memcpy` the old contents in.
+    ///
+    /// Safety note: callers must ensure no command buffer referencing the
+    /// previous `buf_kv_k` / `buf_kv_v` / `buf_attn_partials` is in flight.
+    /// In single-token decode we naturally satisfy this because every token
+    /// commits + waits before the next one is encoded.
+    pub fn ensure_max_seq(&mut self, needed: usize) {
+        if needed <= self.current_max_seq {
+            return;
+        }
+        let old = self.current_max_seq;
+        let mut new_cap = old.max(1);
+        while new_cap < needed {
+            new_cap = new_cap.saturating_mul(2);
+        }
+        // Re-allocate KV buffers, copying the old (used) contents over.
+        let kv_dim = self.kv_dim;
+        if kv_dim == 0 || self.buf_kv_k.is_empty() {
+            // KV not yet initialised — just bump the cap; the next
+            // init_linear_attn_buffers will allocate at new_cap.
+            self.current_max_seq = new_cap;
+            return;
+        }
+        let new_kv_size = new_cap * kv_dim * 4;
+        let old_used_bytes = old * kv_dim * 4; // copy *all* of the old buffer
+        eprintln!(
+            "[metal] KV cache grow {} → {} ({} → {} MB per layer, {} full-attn layers)",
+            old, new_cap,
+            (old * kv_dim * 4) / (1024 * 1024),
+            new_kv_size / (1024 * 1024),
+            self.buf_kv_k.len(),
+        );
+        let new_k: Vec<Buffer> = self.buf_kv_k.iter().map(|old_buf| {
+            let new_buf = metal_buf_shared(&self.device, new_kv_size);
+            unsafe {
+                std::ptr::copy_nonoverlapping(
+                    old_buf.contents() as *const u8,
+                    new_buf.contents() as *mut u8,
+                    old_used_bytes,
+                );
+            }
+            new_buf
+        }).collect();
+        let new_v: Vec<Buffer> = self.buf_kv_v.iter().map(|old_buf| {
+            let new_buf = metal_buf_shared(&self.device, new_kv_size);
+            unsafe {
+                std::ptr::copy_nonoverlapping(
+                    old_buf.contents() as *const u8,
+                    new_buf.contents() as *mut u8,
+                    old_used_bytes,
+                );
+            }
+            new_buf
+        }).collect();
+        self.buf_kv_k = new_k;
+        self.buf_kv_v = new_v;
+
+        // Re-allocate partials too if it was allocated (used by the MoE 2-pass
+        // SDPA path; dense doesn't allocate this). Partials are workspace —
+        // no data to preserve, just resize.
+        if self.partials_num_heads > 0 && self.buf_attn_partials.is_some() {
+            let max_blocks = (new_cap + 31) / 32;
+            let stride = 2 + self.partials_head_dim;
+            let new_partials_size = self.partials_num_heads * max_blocks * stride * 4;
+            self.buf_attn_partials =
+                Some(metal_buf_shared(&self.device, new_partials_size));
+        }
+
+        self.current_max_seq = new_cap;
+    }
+
     /// Allocate persistent GPU buffers for fused linear attention.
     /// Must be called after model config is loaded.
     #[allow(clippy::too_many_arguments)]
@@ -378,13 +466,15 @@ impl MetalContext {
         self.buf_residual = Some(metal_buf_shared(&self.device, hidden_dim * 4));
         // Persistent KV cache buffers for full attention — avoids per-call
         // allocation and full-history copy.  Matches C's buf_kv_k / buf_kv_v.
+        // Sized to `current_max_seq` (initially MAX_SEQ const, can grow via
+        // `ensure_max_seq`).
         self.buf_kv_k.clear();
         self.buf_kv_v.clear();
-        let kv_buf_size = crate::constants::MAX_SEQ * kv_dim * 4;
+        let kv_buf_size = self.current_max_seq * kv_dim * 4;
         self.kv_dim = kv_dim;
         self.num_layers = num_full_attn_layers + num_linear_layers;
-        eprintln!("[metal] Allocating {} full-attn KV buffers ({} MB each)",
-            num_full_attn_layers, kv_buf_size / (1024 * 1024));
+        eprintln!("[metal] Allocating {} full-attn KV buffers ({} MB each, max_seq={})",
+            num_full_attn_layers, kv_buf_size / (1024 * 1024), self.current_max_seq);
         for _ in 0..num_full_attn_layers {
             self.buf_kv_k.push(metal_buf_shared(&self.device, kv_buf_size));
             self.buf_kv_v.push(metal_buf_shared(&self.device, kv_buf_size));
@@ -395,12 +485,14 @@ impl MetalContext {
         self.buf_attn_q = Some(metal_buf_shared(&self.device, q_dim * 4));
         self.buf_attn_q_gate = Some(metal_buf_shared(&self.device, q_dim * 4));
         self.buf_attn_out = Some(metal_buf_shared(&self.device, q_dim * 4));
-        // 2-pass SDPA partials — sized for the worst case (MAX_SEQ tokens) so
-        // we don't allocate a fresh Metal buffer per full-attn layer per token.
-        let max_blocks = (crate::constants::MAX_SEQ + 31) / 32;
+        // 2-pass SDPA partials — sized for the worst case (current_max_seq
+        // tokens). Re-sized by `ensure_max_seq` when KV grows.
+        let max_blocks = (self.current_max_seq + 31) / 32;
         let partials_stride = 2 + head_dim;
         let partials_size = num_attn_heads * max_blocks * partials_stride * 4;
         self.buf_attn_partials = Some(metal_buf_shared(&self.device, partials_size));
+        self.partials_num_heads = num_attn_heads;
+        self.partials_head_dim = head_dim;
         // Pre-allocated QKV projection buffers — reused across all full-attention layers.
         self.buf_qkv_x = Some(metal_buf_shared(&self.device, hidden_dim * 4));
         self.buf_qkv_q = Some(metal_buf_shared(&self.device, q_proj_dim * 4));
@@ -658,6 +750,9 @@ impl MetalContext {
                 pos: std::cell::Cell::new(0),
                 kv_dim: 0,
                 num_layers: 0,
+                current_max_seq: crate::constants::MAX_SEQ,
+                partials_num_heads: 0,
+                partials_head_dim: 0,
             })
         })
     }

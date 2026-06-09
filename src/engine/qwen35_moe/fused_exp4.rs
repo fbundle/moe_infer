@@ -209,7 +209,7 @@ impl<C: ModelConfig> Engine for FusedExp4<C> {
         }
 
         let past_pos = self.inner.ctx.pos.get();
-        assert!(past_pos + n <= MAX_SEQ);
+        self.inner.ctx.ensure_max_seq(past_pos + n);
 
         // ── NEW: persistent buffer cache ──────────────────────────────
         // Force allocation FIRST (mutable borrow) so the lifetime issues
