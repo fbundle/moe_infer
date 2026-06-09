@@ -3732,3 +3732,128 @@ kernel void attn_sdpa_full_h512_simple(
     }
     output[head * HD + tid] = out_val;
 }
+
+// ============================================================================
+// Kernel 35. dequant_matvec_4bit_v4_nr4 — llama.cpp-inspired row sharing
+// ============================================================================
+// Port of llama.cpp's `mul_vec_q_n_f32_impl<block_q4_0, N_R0_Q4_0=4>` adapted
+// to our asymmetric INT4 format (scale + bias per group of 64 weights).
+//
+// Differences vs v3_tiled:
+//   - NR0 = 4 output rows per SIMD group (vs 1) → ~4× reuse of each x load
+//   - x lives in thread-private registers per half-group (vs 16 KB threadgroup
+//     memory cache) → frees TG memory for higher occupancy
+//   - 2 lanes per weight group (lane 0 = packs 0-3, lane 1 = packs 4-7):
+//     gives perfectly coalesced x reads across adjacent lanes
+//   - bias correction via group sum_x (1 mul/group) instead of per-element
+//     bias*x (8 muls/pack/row in v3)
+//
+// Dispatch:
+//   threadgroups: ((out_dim + NR0*NSG - 1) / (NR0*NSG), 1, 1)
+//   threads/TG:   NSG * 32  (64 with NSG=2)
+//
+// Args identical to dequant_matvec_4bit_v3 — buffer 7 (group_size) is
+// expected to be 64.
+
+kernel void dequant_matvec_4bit_v4_nr4(
+    device const uint32_t* W_packed   [[buffer(0)]],   // [out_dim, in_dim/8]
+    device const uint16_t* scales     [[buffer(1)]],   // [out_dim, num_groups] bf16
+    device const uint16_t* biases     [[buffer(2)]],   // [out_dim, num_groups] bf16
+    device const float*    x          [[buffer(3)]],   // [in_dim]
+    device float*          out        [[buffer(4)]],   // [out_dim]
+    constant uint&         out_dim    [[buffer(5)]],
+    constant uint&         in_dim     [[buffer(6)]],
+    constant uint&         group_size [[buffer(7)]],   // expected: 64
+    uint  tgid   [[threadgroup_position_in_grid]],
+    uint  tiisg  [[thread_index_in_simdgroup]],
+    uint  sgitg  [[simdgroup_index_in_threadgroup]]
+) {
+    constexpr uint NR0   = 4;     // rows per simd group
+    constexpr uint NSG   = 2;     // simd groups per TG
+    constexpr uint NW    = 32;    // simd width
+    constexpr uint GROUP = 64;    // weight group size (assumed)
+    constexpr uint LANES_PER_GROUP = 2;
+    constexpr uint GROUPS_PER_ITER = NW / LANES_PER_GROUP;  // 16
+    constexpr uint PACKS_PER_HALF  = 4;       // uint32 per half-group
+    constexpr uint X_PER_HALF      = 32;      // floats of x per half-group
+
+    const uint first_row = (tgid * NSG + sgitg) * NR0;
+    if (first_row >= out_dim) return;
+
+    const uint num_groups = in_dim / GROUP;
+    const uint packed_cols = in_dim / 8;
+
+    // Per-row pointers. Out-of-range rows: clamp to first_row (writes are
+    // masked, but we need a valid pointer for the loop body).
+    device const uint32_t* w_rows[NR0];
+    device const uint16_t* s_rows[NR0];
+    device const uint16_t* b_rows[NR0];
+    for (short r = 0; r < NR0; r++) {
+        uint row = (first_row + r < out_dim) ? (first_row + r) : first_row;
+        w_rows[r] = W_packed + row * packed_cols;
+        s_rows[r] = scales    + row * num_groups;
+        b_rows[r] = biases    + row * num_groups;
+    }
+
+    float sumf[NR0] = { 0.0f, 0.0f, 0.0f, 0.0f };
+
+    const uint lane_half      = tiisg % LANES_PER_GROUP;   // 0 = packs 0-3, 1 = packs 4-7
+    const uint group_in_iter  = tiisg / LANES_PER_GROUP;   // 0..15
+
+    for (uint g_base = 0; g_base < num_groups; g_base += GROUPS_PER_ITER) {
+        const uint g = g_base + group_in_iter;
+        if (g >= num_groups) continue;
+
+        // Load 32 floats of x for this half-group into registers.
+        const uint x_off = g * GROUP + lane_half * X_PER_HALF;
+        float lx[X_PER_HALF];
+        float sx = 0.0f;
+        {
+            device const float4* xp = (device const float4*)(x + x_off);
+            #pragma unroll
+            for (short i = 0; i < X_PER_HALF / 4; i++) {
+                float4 v = xp[i];
+                lx[i*4+0] = v.x; lx[i*4+1] = v.y;
+                lx[i*4+2] = v.z; lx[i*4+3] = v.w;
+                sx += (v.x + v.y) + (v.z + v.w);
+            }
+        }
+
+        const uint pack_start = g * (GROUP / 8) + lane_half * PACKS_PER_HALF;
+
+        // For each of NR0 rows: read 4 packs and accumulate.
+        #pragma unroll
+        for (short r = 0; r < NR0; r++) {
+            const float scale = bf16_to_f32(s_rows[r][g]);
+            const float bias  = bf16_to_f32(b_rows[r][g]);
+            device const uint32_t* wp = w_rows[r] + pack_start;
+
+            float wx = 0.0f;
+            #pragma unroll
+            for (short p = 0; p < PACKS_PER_HALF; p++) {
+                uint32_t packed = wp[p];
+                short xi = p * 8;
+                wx += float((packed >>  0) & 0xF) * lx[xi+0];
+                wx += float((packed >>  4) & 0xF) * lx[xi+1];
+                wx += float((packed >>  8) & 0xF) * lx[xi+2];
+                wx += float((packed >> 12) & 0xF) * lx[xi+3];
+                wx += float((packed >> 16) & 0xF) * lx[xi+4];
+                wx += float((packed >> 20) & 0xF) * lx[xi+5];
+                wx += float((packed >> 24) & 0xF) * lx[xi+6];
+                wx += float((packed >> 28) & 0xF) * lx[xi+7];
+            }
+            // Each lane contributes its half-group's portion of the dot
+            // product. simd_sum below merges all halves of all groups.
+            sumf[r] += scale * wx + bias * sx;
+        }
+    }
+
+    // Reduce across all 32 SIMD lanes (covers all groups × halves).
+    #pragma unroll
+    for (short r = 0; r < NR0; r++) {
+        float tot = simd_sum(sumf[r]);
+        if (tiisg == 0 && first_row + r < out_dim) {
+            out[first_row + r] = tot;
+        }
+    }
+}

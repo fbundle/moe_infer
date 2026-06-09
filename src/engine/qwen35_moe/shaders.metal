@@ -2613,3 +2613,95 @@ kernel void buffer_copy_f32(
     if (tid >= count) return;
     dst[tid] = src[tid];
 }
+
+// ============================================================================
+// dequant_matvec_4bit_v4_nr4 — llama.cpp-inspired NR0=4 row sharing
+// ============================================================================
+// See src/engine/gemma4_dense/shaders.metal for the full annotated version.
+kernel void dequant_matvec_4bit_v4_nr4(
+    device const uint32_t* W_packed   [[buffer(0)]],
+    device const uint16_t* scales     [[buffer(1)]],
+    device const uint16_t* biases     [[buffer(2)]],
+    device const float*    x          [[buffer(3)]],
+    device float*          out        [[buffer(4)]],
+    constant uint&         out_dim    [[buffer(5)]],
+    constant uint&         in_dim     [[buffer(6)]],
+    constant uint&         group_size [[buffer(7)]],
+    uint  tgid   [[threadgroup_position_in_grid]],
+    uint  tiisg  [[thread_index_in_simdgroup]],
+    uint  sgitg  [[simdgroup_index_in_threadgroup]]
+) {
+    constexpr uint NR0 = 4, NSG = 2, NW = 32, GROUP = 64;
+    constexpr uint LANES_PER_GROUP = 2, GROUPS_PER_ITER = NW / LANES_PER_GROUP;
+    constexpr uint PACKS_PER_HALF = 4, X_PER_HALF = 32;
+
+    const uint first_row = (tgid * NSG + sgitg) * NR0;
+    if (first_row >= out_dim) return;
+
+    const uint num_groups = in_dim / GROUP;
+    const uint packed_cols = in_dim / 8;
+
+    device const uint32_t* w_rows[NR0];
+    device const uint16_t* s_rows[NR0];
+    device const uint16_t* b_rows[NR0];
+    for (short r = 0; r < NR0; r++) {
+        uint row = (first_row + r < out_dim) ? (first_row + r) : first_row;
+        w_rows[r] = W_packed + row * packed_cols;
+        s_rows[r] = scales    + row * num_groups;
+        b_rows[r] = biases    + row * num_groups;
+    }
+
+    float sumf[NR0] = { 0.0f, 0.0f, 0.0f, 0.0f };
+    const uint lane_half     = tiisg % LANES_PER_GROUP;
+    const uint group_in_iter = tiisg / LANES_PER_GROUP;
+
+    for (uint g_base = 0; g_base < num_groups; g_base += GROUPS_PER_ITER) {
+        const uint g = g_base + group_in_iter;
+        if (g >= num_groups) continue;
+
+        const uint x_off = g * GROUP + lane_half * X_PER_HALF;
+        float lx[X_PER_HALF];
+        float sx = 0.0f;
+        {
+            device const float4* xp = (device const float4*)(x + x_off);
+            #pragma unroll
+            for (short i = 0; i < X_PER_HALF / 4; i++) {
+                float4 v = xp[i];
+                lx[i*4+0] = v.x; lx[i*4+1] = v.y;
+                lx[i*4+2] = v.z; lx[i*4+3] = v.w;
+                sx += (v.x + v.y) + (v.z + v.w);
+            }
+        }
+
+        const uint pack_start = g * (GROUP / 8) + lane_half * PACKS_PER_HALF;
+        #pragma unroll
+        for (short r = 0; r < NR0; r++) {
+            const float scale = bf16_to_f32(s_rows[r][g]);
+            const float bias  = bf16_to_f32(b_rows[r][g]);
+            device const uint32_t* wp = w_rows[r] + pack_start;
+            float wx = 0.0f;
+            #pragma unroll
+            for (short p = 0; p < PACKS_PER_HALF; p++) {
+                uint32_t packed = wp[p];
+                short xi = p * 8;
+                wx += float((packed >>  0) & 0xF) * lx[xi+0];
+                wx += float((packed >>  4) & 0xF) * lx[xi+1];
+                wx += float((packed >>  8) & 0xF) * lx[xi+2];
+                wx += float((packed >> 12) & 0xF) * lx[xi+3];
+                wx += float((packed >> 16) & 0xF) * lx[xi+4];
+                wx += float((packed >> 20) & 0xF) * lx[xi+5];
+                wx += float((packed >> 24) & 0xF) * lx[xi+6];
+                wx += float((packed >> 28) & 0xF) * lx[xi+7];
+            }
+            sumf[r] += scale * wx + bias * sx;
+        }
+    }
+
+    #pragma unroll
+    for (short r = 0; r < NR0; r++) {
+        float tot = simd_sum(sumf[r]);
+        if (tiisg == 0 && first_row + r < out_dim) {
+            out[first_row + r] = tot;
+        }
+    }
+}

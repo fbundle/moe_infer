@@ -37,15 +37,47 @@ pub fn encode_matvec_offset(
     group_size: u32,
     use_fast: i32,
 ) {
-    // Variant picker for in_dim > 4096 INT4 matvecs. Env var `MATVEC_V3_VARIANT`
-    // selects one of: tiled (default), large, sbcache, splitk, fast.
-    // The default `tiled` is the safe v3-style 4096-element tile loop.
+    // Variant picker for INT4 matvecs. Env var `MATVEC_V3_VARIANT`:
+    //   v4_nr4      — llama.cpp-inspired NR0=4 row sharing (any in_dim)
+    //   tiled       — v3 with 4096-elem threadgroup x-cache (in_dim > 4096)
+    //   large       — v3 with 8192-elem x-cache
+    //   sbcache     — v3 with x + scale/bias in threadgroup memory
+    //   splitk      — 2-pass split-K reduction
+    //   fast        — v1 fallback (small TG, no tiling)
+    let env_variant = std::env::var("MATVEC_V3_VARIANT").ok();
     let need_large_int4 = use_fast >= 3 && in_dim > 4096;
-    let variant = if need_large_int4 {
-        std::env::var("MATVEC_V3_VARIANT").unwrap_or_else(|_| "tiled".to_string())
+    let variant = if let Some(v) = env_variant.clone() {
+        v
+    } else if need_large_int4 {
+        "tiled".to_string()
     } else {
         String::new()
     };
+
+    // v4_nr4: usable at ANY in_dim (no threadgroup cache, so not bound by
+    // 4096-tile limit). Dispatch: 4 rows/SIMD-group × 2 SIMD-groups/TG = 8
+    // rows per TG, 64 threads per TG.
+    if use_fast >= 3 && variant == "v4_nr4" && ctx.matvec_v4_nr4.is_some() {
+        let pipeline = ctx.matvec_v4_nr4.as_ref().unwrap();
+        encoder.set_compute_pipeline_state(pipeline);
+        encoder.set_buffer(0, Some(w_packed), w_offset);
+        encoder.set_buffer(1, Some(scales), s_offset);
+        encoder.set_buffer(2, Some(biases), b_offset);
+        encoder.set_buffer(3, Some(x), x_offset);
+        encoder.set_buffer(4, Some(out), o_offset);
+        unsafe {
+            set_u32(encoder, 5, out_dim);
+            set_u32(encoder, 6, in_dim);
+            set_u32(encoder, 7, group_size);
+        }
+        const ROWS_PER_TG_V4: u32 = 8; // NR0=4 × NSG=2
+        let num_tgs = (out_dim + ROWS_PER_TG_V4 - 1) / ROWS_PER_TG_V4;
+        encoder.dispatch_thread_groups(
+            MTLSize::new(num_tgs as u64, 1, 1),
+            MTLSize::new(64, 1, 1), // NSG=2 × 32 lanes
+        );
+        return;
+    }
 
     // Handle split-K specially — it's a 2-pass dispatch with a partials buffer.
     if need_large_int4 && variant == "splitk"
