@@ -154,6 +154,14 @@ mod gemma4_fused_exp3;
 #[path = "engine/gemma4_moe/fused_exp4.rs"]
 mod gemma4_fused_exp4;
 
+// Gemma 4 12B dense engine — Phase 2 skeleton (forward_hidden is a stub
+// that returns an error; the structure compiles and registers cleanly so
+// Phase 3 just fills in the kernel encoders).
+#[path = "engine/gemma4_dense/constants.rs"]
+pub mod gemma4_dense_constants;
+#[path = "engine/gemma4_dense/fused_exp1.rs"]
+pub mod gemma4_dense_fused;
+
 use crate::engine::qwen35_constants::{FullModel, StrippedModel};
 use crate::engine::fused_exp1::FusedExp1;
 use crate::engine::fused_exp2::FusedExp2;
@@ -165,6 +173,8 @@ use crate::engine::qwen35_dense_constants::{Qwen35Dense4B, Qwen35DenseStripped};
 use crate::engine::qwen35_dense_fused::FusedDense;
 use crate::engine::gemma4_constants::{Gemma4_26B_A4B, Gemma4Stripped};
 use crate::engine::gemma4_fused_exp3::Gemma4Fused;
+use crate::engine::gemma4_dense_constants::{Gemma4Dense12B, Gemma4Dense12BStripped};
+use crate::engine::gemma4_dense_fused::FusedGemma4Dense;
 
 /// Type-erased engine holding one of the engine variants via trait object.
 pub struct DynEngine {
@@ -216,6 +226,10 @@ impl DynEngine {
                 Box::new(FusedDense::<Qwen35Dense4B>::new(model, num_active_experts, expert_cache_count)?),
             ("Qwen35DenseFused", "Qwen3_5ForConditionalGeneration_Stripped") =>
                 Box::new(FusedDense::<Qwen35DenseStripped>::new(model, num_active_experts, expert_cache_count)?),
+            ("Gemma4DenseFused", "Gemma4UnifiedForConditionalGeneration") =>
+                Box::new(FusedGemma4Dense::<Gemma4Dense12B>::new(model, num_active_experts, expert_cache_count)?),
+            ("Gemma4DenseFused", "Gemma4UnifiedForConditionalGeneration_Stripped") =>
+                Box::new(FusedGemma4Dense::<Gemma4Dense12BStripped>::new(model, num_active_experts, expert_cache_count)?),
             _ => return Err(MoEError::Config(format!(
                 "Unknown engine: engine_type={:?}, arch={:?}", engine_type, arch
             ))),

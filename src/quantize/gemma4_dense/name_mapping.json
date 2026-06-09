@@ -1,0 +1,38 @@
+{
+  "_comment": "Gemma 4 12B dense HF→engine tensor name map. The pattern is the same as gemma4_moe/name_mapping.json — swap 'model.language_model' → 'language_model.model' (MLX-LM convention). Vision/audio tensors are KEPT (not skipped) because in Gemma 4 the multimodal projections are JUST matrices (single matmul for audio, patch_dense + pos_embedding + 2 LNs for vision) — no separate transformer encoder. Drop the 'model.' prefix for those: 'model.vision_embedder.X' → 'vision_embedder.X', etc.",
+
+  "_comment_v_proj": "v_proj.weight is only present on the 40 sliding-attention layers. The 8 full-attention layers (every 6th: 5, 11, 17, 23, 29, 35, 41, 47) reuse K as V — attention_k_eq_v=true. The {L} expansion creates entries for all 48 layers but lookups for non-existent ones are harmless (load_name_mapping just builds the lookup table; classify only ever sees tensors that actually exist in the safetensors).",
+
+  "model.language_model.embed_tokens.weight": "language_model.model.embed_tokens.weight",
+  "model.language_model.norm.weight":         "language_model.model.norm.weight",
+
+  "model.language_model.layers.{L}.input_layernorm.weight":           "language_model.model.layers.{L}.input_layernorm.weight",
+  "model.language_model.layers.{L}.post_attention_layernorm.weight":  "language_model.model.layers.{L}.post_attention_layernorm.weight",
+  "model.language_model.layers.{L}.pre_feedforward_layernorm.weight": "language_model.model.layers.{L}.pre_feedforward_layernorm.weight",
+  "model.language_model.layers.{L}.post_feedforward_layernorm.weight":"language_model.model.layers.{L}.post_feedforward_layernorm.weight",
+  "model.language_model.layers.{L}.layer_scalar":                     "language_model.model.layers.{L}.layer_scalar",
+
+  "model.language_model.layers.{L}.self_attn.q_proj.weight": "language_model.model.layers.{L}.self_attn.q_proj.weight",
+  "model.language_model.layers.{L}.self_attn.k_proj.weight": "language_model.model.layers.{L}.self_attn.k_proj.weight",
+  "model.language_model.layers.{L}.self_attn.v_proj.weight": "language_model.model.layers.{L}.self_attn.v_proj.weight",
+  "model.language_model.layers.{L}.self_attn.o_proj.weight": "language_model.model.layers.{L}.self_attn.o_proj.weight",
+  "model.language_model.layers.{L}.self_attn.q_norm.weight": "language_model.model.layers.{L}.self_attn.q_norm.weight",
+  "model.language_model.layers.{L}.self_attn.k_norm.weight": "language_model.model.layers.{L}.self_attn.k_norm.weight",
+
+  "model.language_model.layers.{L}.mlp.gate_proj.weight": "language_model.model.layers.{L}.mlp.gate_proj.weight",
+  "model.language_model.layers.{L}.mlp.up_proj.weight":   "language_model.model.layers.{L}.mlp.up_proj.weight",
+  "model.language_model.layers.{L}.mlp.down_proj.weight": "language_model.model.layers.{L}.mlp.down_proj.weight",
+
+  "model.embed_audio.embedding_projection.weight":  "embed_audio.embedding_projection.weight",
+  "model.embed_vision.embedding_projection.weight": "embed_vision.embedding_projection.weight",
+
+  "model.vision_embedder.patch_dense.weight": "vision_embedder.patch_dense.weight",
+  "model.vision_embedder.patch_dense.bias":   "vision_embedder.patch_dense.bias",
+  "model.vision_embedder.patch_ln1.weight":   "vision_embedder.patch_ln1.weight",
+  "model.vision_embedder.patch_ln1.bias":     "vision_embedder.patch_ln1.bias",
+  "model.vision_embedder.patch_ln2.weight":   "vision_embedder.patch_ln2.weight",
+  "model.vision_embedder.patch_ln2.bias":     "vision_embedder.patch_ln2.bias",
+  "model.vision_embedder.pos_embedding":      "vision_embedder.pos_embedding",
+  "model.vision_embedder.pos_norm.weight":    "vision_embedder.pos_norm.weight",
+  "model.vision_embedder.pos_norm.bias":      "vision_embedder.pos_norm.bias"
+}

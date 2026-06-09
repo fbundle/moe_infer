@@ -471,6 +471,34 @@ pub fn gemma4_moe_quantize(
         .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(format!("{:?}", e)))
 }
 
+/// Gemma 4 12B dense INT4 quantize.
+///
+/// All 2D weights → INT4 group=64 (including the audio/vision projection
+/// matrices, since for Gemma 4 those are plain matmuls). Norms / scalars /
+/// `pos_embedding` stay BF16. The dense architecture has no experts and no
+/// router, so there's no per-layer expert blob — everything ends up in
+/// `model_weights.bin` next to the manifest.
+#[pyfunction]
+#[pyo3(signature = (model_path, output_dir))]
+pub fn gemma4_dense_quantize(
+    model_path: &str,
+    output_dir: &str,
+) -> PyResult<()> {
+    let config_dir = if std::path::Path::new(model_path).is_dir() {
+        std::path::PathBuf::from(model_path)
+    } else {
+        let repo = crate::hf_util::HfRepo::from_hf(model_path)
+            .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e))?;
+        repo.ensure("config.json")
+            .map_err(|e| pyo3::exceptions::PyIOError::new_err(e))?;
+        repo.path().to_path_buf()
+    };
+    let s = crate::gemma4_dense_int4::Gemma4DenseInt4Scheme::new(&config_dir)
+        .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e))?;
+    crate::quantize::run(model_path, output_dir, &s)
+        .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e))
+}
+
 // ─── HfRepo (HF downloader exposed to Python) ────────────────────────────
 
 #[pyclass(unsendable)]

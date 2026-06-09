@@ -23,6 +23,10 @@ mod timer;
 // Gemma 4 quantize pipeline — BF16 passthrough (first-cut).
 #[path = "quantize/gemma4_moe/bq4.rs"] pub mod gemma4_bq4;
 
+// Gemma 4 12B dense INT4 — multimodal projections kept inline (audio = single
+// matmul; vision = patch_dense + pos_embedding + 2 LayerNorms).
+#[path = "quantize/gemma4_dense/int4.rs"] pub mod gemma4_dense_int4;
+
 #[cfg(feature = "python-bindings")]
 mod python_bindings;
 
@@ -39,6 +43,7 @@ fn _moe_infer_rs(m: &pyo3::Bound<'_, pyo3::types::PyModule>) -> pyo3::PyResult<(
     m.add_function(wrap_pyfunction!(python_bindings::qwen35_moe_quantize, m)?)?;
     m.add_function(wrap_pyfunction!(python_bindings::qwen35_dense_quantize, m)?)?;
     m.add_function(wrap_pyfunction!(python_bindings::gemma4_moe_quantize, m)?)?;
+    m.add_function(wrap_pyfunction!(python_bindings::gemma4_dense_quantize, m)?)?;
     m.add_class::<python_bindings::PyHfRepo>()?;
     Ok(())
 }
