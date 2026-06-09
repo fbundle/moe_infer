@@ -35,12 +35,24 @@
 using namespace metal;
 
 // ============================================================================
-// Model dimension constants (Qwen3.5/3.6-35B-A3B)
+// Model dimension constants — overridable via engine prelude.
+// Each engine prepends its own #defines; this block only sets defaults
+// for kernels that need named dims at compile time. Engines can override
+// any of these by defining them in their prelude before this file is
+// concatenated.
 // ============================================================================
+#ifndef HEAD_DIM
 #define HEAD_DIM        256
-#define NUM_KV_HEADS    8
-#define KV_DIM          (NUM_KV_HEADS * HEAD_DIM)  // 2048 for Gemma 4 12B (8*256)
-#define HEADS_PER_KV    2
+#endif
+#ifndef NUM_KV_HEADS
+#define NUM_KV_HEADS    4
+#endif
+#ifndef KV_DIM
+#define KV_DIM          (NUM_KV_HEADS * HEAD_DIM)
+#endif
+#ifndef HEADS_PER_KV
+#define HEADS_PER_KV    4
+#endif
 
 // ============================================================================
 // BFloat16 helpers
@@ -1282,10 +1294,7 @@ kernel void rms_norm_fused_bf16(
     // Compute rms
     float inv_rms = metal::precise::rsqrt(sum_sq / float(dim) + eps);
 
-    // Pass 2: normalize and write output.
-    // NOTE: Gemma 2/3/4 use zero-centered RMSNorm:  out = x_normed * (1 + w).
-    // The stored norm weights are zero-centered (can be negative). We apply
-    // the `+1` shift HERE so the engine and the transformers reference agree.
+    // Pass 2: normalize and write output
     for (uint i = lid; i < dim; i += tg_size) {
         float w = bf16_to_f32(weight[i]);
         out[i] = x[i] * inv_rms * w;
@@ -2271,12 +2280,12 @@ kernel void q_head_norm_rope(
         float theta;
         float pair_val;
         if (tid < rot_half) {
-            theta = float(pos) * pow(rope_theta, -2.0f * float(tid) / float(head_dim));
+            theta = float(pos) * pow(rope_theta, -2.0f * float(tid) / float(rotary_dim));
             pair_val = q_proj[src_base + tid + rot_half]
                        * inv_rms * bf16_to_f32(q_norm_w[tid + rot_half]);
         } else {
             uint pair = tid - rot_half;
-            theta = float(pos) * pow(rope_theta, -2.0f * float(pair) / float(head_dim));
+            theta = float(pos) * pow(rope_theta, -2.0f * float(pair) / float(rotary_dim));
             pair_val = q_proj[src_base + pair]
                        * inv_rms * bf16_to_f32(q_norm_w[pair]);
         }
@@ -2332,12 +2341,12 @@ kernel void k_head_norm_rope(
         float theta;
         float pair_val;
         if (tid < rot_half) {
-            theta = float(pos) * pow(rope_theta, -2.0f * float(tid) / float(head_dim));
+            theta = float(pos) * pow(rope_theta, -2.0f * float(tid) / float(rotary_dim));
             pair_val = k_buf[base + tid + rot_half]
                        * inv_rms * bf16_to_f32(k_norm_w[tid + rot_half]);
         } else {
             uint pair = tid - rot_half;
-            theta = float(pos) * pow(rope_theta, -2.0f * float(pair) / float(head_dim));
+            theta = float(pos) * pow(rope_theta, -2.0f * float(pair) / float(rotary_dim));
             pair_val = k_buf[base + pair]
                        * inv_rms * bf16_to_f32(k_norm_w[pair]);
         }
@@ -2932,25 +2941,177 @@ kernel void buffer_copy_f32(
     dst[tid] = src[tid];
 }
 
+// ============================================================================
+// dequant_matvec_4bit_v4_nr4 — llama.cpp-inspired NR0=4 row sharing
+// ============================================================================
+// See src/engine/gemma4_dense/shaders.metal for the full annotated version.
+// Identical kernel; duplicated here so qwen35_dense's shader bundle exposes it.
+kernel void dequant_matvec_4bit_v4_nr4(
+    device const uint32_t* W_packed   [[buffer(0)]],
+    device const uint16_t* scales     [[buffer(1)]],
+    device const uint16_t* biases     [[buffer(2)]],
+    device const float*    x          [[buffer(3)]],
+    device float*          out        [[buffer(4)]],
+    constant uint&         out_dim    [[buffer(5)]],
+    constant uint&         in_dim     [[buffer(6)]],
+    constant uint&         group_size [[buffer(7)]],
+    uint  tgid   [[threadgroup_position_in_grid]],
+    uint  tiisg  [[thread_index_in_simdgroup]],
+    uint  sgitg  [[simdgroup_index_in_threadgroup]]
+) {
+    constexpr uint NR0 = 4, NSG = 2, NW = 32, GROUP = 64;
+    constexpr uint LANES_PER_GROUP = 2, GROUPS_PER_ITER = NW / LANES_PER_GROUP;
+    constexpr uint PACKS_PER_HALF = 4, X_PER_HALF = 32;
+
+    const uint first_row = (tgid * NSG + sgitg) * NR0;
+    if (first_row >= out_dim) return;
+
+    const uint num_groups = in_dim / GROUP;
+    const uint packed_cols = in_dim / 8;
+
+    device const uint32_t* w_rows[NR0];
+    device const uint16_t* s_rows[NR0];
+    device const uint16_t* b_rows[NR0];
+    for (short r = 0; r < NR0; r++) {
+        uint row = (first_row + r < out_dim) ? (first_row + r) : first_row;
+        w_rows[r] = W_packed + row * packed_cols;
+        s_rows[r] = scales    + row * num_groups;
+        b_rows[r] = biases    + row * num_groups;
+    }
+
+    float sumf[NR0] = { 0.0f, 0.0f, 0.0f, 0.0f };
+    const uint lane_half     = tiisg % LANES_PER_GROUP;
+    const uint group_in_iter = tiisg / LANES_PER_GROUP;
+
+    for (uint g_base = 0; g_base < num_groups; g_base += GROUPS_PER_ITER) {
+        const uint g = g_base + group_in_iter;
+        if (g >= num_groups) continue;
+
+        const uint x_off = g * GROUP + lane_half * X_PER_HALF;
+        float lx[X_PER_HALF];
+        float sx = 0.0f;
+        {
+            device const float4* xp = (device const float4*)(x + x_off);
+            #pragma unroll
+            for (short i = 0; i < X_PER_HALF / 4; i++) {
+                float4 v = xp[i];
+                lx[i*4+0] = v.x; lx[i*4+1] = v.y;
+                lx[i*4+2] = v.z; lx[i*4+3] = v.w;
+                sx += (v.x + v.y) + (v.z + v.w);
+            }
+        }
+
+        const uint pack_start = g * (GROUP / 8) + lane_half * PACKS_PER_HALF;
+        #pragma unroll
+        for (short r = 0; r < NR0; r++) {
+            const float scale = bf16_to_f32(s_rows[r][g]);
+            const float bias  = bf16_to_f32(b_rows[r][g]);
+            device const uint32_t* wp = w_rows[r] + pack_start;
+            float wx = 0.0f;
+            #pragma unroll
+            for (short p = 0; p < PACKS_PER_HALF; p++) {
+                uint32_t packed = wp[p];
+                short xi = p * 8;
+                wx += float((packed >>  0) & 0xF) * lx[xi+0];
+                wx += float((packed >>  4) & 0xF) * lx[xi+1];
+                wx += float((packed >>  8) & 0xF) * lx[xi+2];
+                wx += float((packed >> 12) & 0xF) * lx[xi+3];
+                wx += float((packed >> 16) & 0xF) * lx[xi+4];
+                wx += float((packed >> 20) & 0xF) * lx[xi+5];
+                wx += float((packed >> 24) & 0xF) * lx[xi+6];
+                wx += float((packed >> 28) & 0xF) * lx[xi+7];
+            }
+            sumf[r] += scale * wx + bias * sx;
+        }
+    }
+
+    #pragma unroll
+    for (short r = 0; r < NR0; r++) {
+        float tot = simd_sum(sumf[r]);
+        if (tiisg == 0 && first_row + r < out_dim) {
+            out[first_row + r] = tot;
+        }
+    }
+}
 
 // ============================================================================
-// ── Gemma 4 12B dense — kernels appended for Phase 3 ─────────────────────────
+// Kernel 1b2 (MoE expert path): FUSED gate_proj + up_proj + SwiGLU
 // ============================================================================
+// Replaces the 3-dispatch sequence (gate matvec, up matvec, swiglu) with a
+// single dispatch. Reads x once into x_shared, then each SIMD group computes
+// BOTH gate and up matvec for its row in lockstep, finally writes
+// `silu(gate[row]) * up[row]` to out[row].
 //
-// What's new beyond the qwen35_dense base:
-//   * `gemma_q_norm_rope`    — Q norm + RoPE without the qwen output-gate
-//                              split (Gemma's q_proj is single-width).
-//   * `attn_sdpa_sliding`    — single-token SDPA whose KV loop starts at
-//                              `seq_start` instead of 0 (sliding window).
-//   * `logit_softcap_inplace`— `out[i] = tanh(x[i] / cap) * cap` over vocab.
-//   * `gemma_scaled_residual_add` — `dst[i] += scale[0] * src[i]` for
-//                                    the per-layer learnable `layer_scalar`.
-//
-// All other kernels (matvec_*, rms_norm_*, swiglu_*, residual_add, KV append,
-// k_head_norm_rope, attn_sdpa_fused) are inherited unchanged from the qwen
-// dense base above — they're already runtime-parameterized for HEAD_DIM and
-// take rotary_dim/kv_dim as constants.
+// (Originally from qwen35_moe; lives in the shared bundle so any engine that
+// uses SwiGLU can reach it.)
+kernel void fused_gate_up_swiglu_v3(
+    device const uint32_t* gate_W    [[buffer(0)]],
+    device const uint16_t* gate_s    [[buffer(1)]],
+    device const uint16_t* gate_b    [[buffer(2)]],
+    device const uint32_t* up_W      [[buffer(3)]],
+    device const uint16_t* up_s      [[buffer(4)]],
+    device const uint16_t* up_b      [[buffer(5)]],
+    device const float*    x         [[buffer(6)]],
+    device float*          out       [[buffer(7)]],
+    constant uint&         out_dim   [[buffer(8)]],
+    constant uint&         in_dim    [[buffer(9)]],
+    constant uint&         group_size [[buffer(10)]],
+    uint tgid   [[threadgroup_position_in_grid]],
+    uint lid    [[thread_position_in_threadgroup]],
+    uint simd_lane  [[thread_index_in_simdgroup]],
+    uint simd_group [[simdgroup_index_in_threadgroup]]
+) {
+    uint row = tgid * ROWS_PER_TG + simd_group;
+    uint packed_cols = in_dim / 8;
+    uint num_groups  = in_dim / group_size;
+    uint group_packed = group_size / 8;
 
+    threadgroup float x_shared[4096];
+
+    for (uint i = lid; i < in_dim; i += 256) {
+        x_shared[i] = x[i];
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    if (row >= out_dim) return;
+
+    device const uint32_t* gw_row = gate_W + row * packed_cols;
+    device const uint16_t* gs_row = gate_s + row * num_groups;
+    device const uint16_t* gb_row = gate_b + row * num_groups;
+    device const uint32_t* uw_row = up_W   + row * packed_cols;
+    device const uint16_t* us_row = up_s   + row * num_groups;
+    device const uint16_t* ub_row = up_b   + row * num_groups;
+
+    float gate_acc = 0.0f;
+    float up_acc   = 0.0f;
+
+    for (uint col = simd_lane; col < packed_cols; col += 32) {
+        uint g = col / group_packed;
+        float g_scale = bf16_to_f32(gs_row[g]);
+        float g_bias  = bf16_to_f32(gb_row[g]);
+        float u_scale = bf16_to_f32(us_row[g]);
+        float u_bias  = bf16_to_f32(ub_row[g]);
+
+        uint32_t gp = gw_row[col];
+        uint32_t up = uw_row[col];
+        uint x_base = col * 8;
+
+        for (uint i = 0; i < 8; i++) {
+            float xv = x_shared[x_base + i];
+            float gn = float((gp >> (i * 4)) & 0xF);
+            float un = float((up >> (i * 4)) & 0xF);
+            gate_acc = fma(gn * g_scale + g_bias, xv, gate_acc);
+            up_acc   = fma(un * u_scale + u_bias, xv, up_acc);
+        }
+    }
+
+    float g_sum = simd_sum(gate_acc);
+    float u_sum = simd_sum(up_acc);
+
+    if (simd_lane == 0) {
+        out[row] = (g_sum / (1.0f + exp(-g_sum))) * u_sum;
+    }
+}
 // ── 19. Gemma Q norm + RoPE (no gate split) ─────────────────────────────────
 // Dispatch: num_q threadgroups, head_dim threads each. q_proj is single-width
 // (Gemma has no attn_output_gate; q_proj.weight is [num_q*head_dim, hidden]).
@@ -3733,127 +3894,3 @@ kernel void attn_sdpa_full_h512_simple(
     output[head * HD + tid] = out_val;
 }
 
-// ============================================================================
-// Kernel 35. dequant_matvec_4bit_v4_nr4 — llama.cpp-inspired row sharing
-// ============================================================================
-// Port of llama.cpp's `mul_vec_q_n_f32_impl<block_q4_0, N_R0_Q4_0=4>` adapted
-// to our asymmetric INT4 format (scale + bias per group of 64 weights).
-//
-// Differences vs v3_tiled:
-//   - NR0 = 4 output rows per SIMD group (vs 1) → ~4× reuse of each x load
-//   - x lives in thread-private registers per half-group (vs 16 KB threadgroup
-//     memory cache) → frees TG memory for higher occupancy
-//   - 2 lanes per weight group (lane 0 = packs 0-3, lane 1 = packs 4-7):
-//     gives perfectly coalesced x reads across adjacent lanes
-//   - bias correction via group sum_x (1 mul/group) instead of per-element
-//     bias*x (8 muls/pack/row in v3)
-//
-// Dispatch:
-//   threadgroups: ((out_dim + NR0*NSG - 1) / (NR0*NSG), 1, 1)
-//   threads/TG:   NSG * 32  (64 with NSG=2)
-//
-// Args identical to dequant_matvec_4bit_v3 — buffer 7 (group_size) is
-// expected to be 64.
-
-kernel void dequant_matvec_4bit_v4_nr4(
-    device const uint32_t* W_packed   [[buffer(0)]],   // [out_dim, in_dim/8]
-    device const uint16_t* scales     [[buffer(1)]],   // [out_dim, num_groups] bf16
-    device const uint16_t* biases     [[buffer(2)]],   // [out_dim, num_groups] bf16
-    device const float*    x          [[buffer(3)]],   // [in_dim]
-    device float*          out        [[buffer(4)]],   // [out_dim]
-    constant uint&         out_dim    [[buffer(5)]],
-    constant uint&         in_dim     [[buffer(6)]],
-    constant uint&         group_size [[buffer(7)]],   // expected: 64
-    uint  tgid   [[threadgroup_position_in_grid]],
-    uint  tiisg  [[thread_index_in_simdgroup]],
-    uint  sgitg  [[simdgroup_index_in_threadgroup]]
-) {
-    constexpr uint NR0   = 4;     // rows per simd group
-    constexpr uint NSG   = 2;     // simd groups per TG
-    constexpr uint NW    = 32;    // simd width
-    constexpr uint GROUP = 64;    // weight group size (assumed)
-    constexpr uint LANES_PER_GROUP = 2;
-    constexpr uint GROUPS_PER_ITER = NW / LANES_PER_GROUP;  // 16
-    constexpr uint PACKS_PER_HALF  = 4;       // uint32 per half-group
-    constexpr uint X_PER_HALF      = 32;      // floats of x per half-group
-
-    const uint first_row = (tgid * NSG + sgitg) * NR0;
-    if (first_row >= out_dim) return;
-
-    const uint num_groups = in_dim / GROUP;
-    const uint packed_cols = in_dim / 8;
-
-    // Per-row pointers. Out-of-range rows: clamp to first_row (writes are
-    // masked, but we need a valid pointer for the loop body).
-    device const uint32_t* w_rows[NR0];
-    device const uint16_t* s_rows[NR0];
-    device const uint16_t* b_rows[NR0];
-    for (short r = 0; r < NR0; r++) {
-        uint row = (first_row + r < out_dim) ? (first_row + r) : first_row;
-        w_rows[r] = W_packed + row * packed_cols;
-        s_rows[r] = scales    + row * num_groups;
-        b_rows[r] = biases    + row * num_groups;
-    }
-
-    float sumf[NR0] = { 0.0f, 0.0f, 0.0f, 0.0f };
-
-    const uint lane_half      = tiisg % LANES_PER_GROUP;   // 0 = packs 0-3, 1 = packs 4-7
-    const uint group_in_iter  = tiisg / LANES_PER_GROUP;   // 0..15
-
-    for (uint g_base = 0; g_base < num_groups; g_base += GROUPS_PER_ITER) {
-        const uint g = g_base + group_in_iter;
-        if (g >= num_groups) continue;
-
-        // Load 32 floats of x for this half-group into registers.
-        const uint x_off = g * GROUP + lane_half * X_PER_HALF;
-        float lx[X_PER_HALF];
-        float sx = 0.0f;
-        {
-            device const float4* xp = (device const float4*)(x + x_off);
-            #pragma unroll
-            for (short i = 0; i < X_PER_HALF / 4; i++) {
-                float4 v = xp[i];
-                lx[i*4+0] = v.x; lx[i*4+1] = v.y;
-                lx[i*4+2] = v.z; lx[i*4+3] = v.w;
-                sx += (v.x + v.y) + (v.z + v.w);
-            }
-        }
-
-        const uint pack_start = g * (GROUP / 8) + lane_half * PACKS_PER_HALF;
-
-        // For each of NR0 rows: read 4 packs and accumulate.
-        #pragma unroll
-        for (short r = 0; r < NR0; r++) {
-            const float scale = bf16_to_f32(s_rows[r][g]);
-            const float bias  = bf16_to_f32(b_rows[r][g]);
-            device const uint32_t* wp = w_rows[r] + pack_start;
-
-            float wx = 0.0f;
-            #pragma unroll
-            for (short p = 0; p < PACKS_PER_HALF; p++) {
-                uint32_t packed = wp[p];
-                short xi = p * 8;
-                wx += float((packed >>  0) & 0xF) * lx[xi+0];
-                wx += float((packed >>  4) & 0xF) * lx[xi+1];
-                wx += float((packed >>  8) & 0xF) * lx[xi+2];
-                wx += float((packed >> 12) & 0xF) * lx[xi+3];
-                wx += float((packed >> 16) & 0xF) * lx[xi+4];
-                wx += float((packed >> 20) & 0xF) * lx[xi+5];
-                wx += float((packed >> 24) & 0xF) * lx[xi+6];
-                wx += float((packed >> 28) & 0xF) * lx[xi+7];
-            }
-            // Each lane contributes its half-group's portion of the dot
-            // product. simd_sum below merges all halves of all groups.
-            sumf[r] += scale * wx + bias * sx;
-        }
-    }
-
-    // Reduce across all 32 SIMD lanes (covers all groups × halves).
-    #pragma unroll
-    for (short r = 0; r < NR0; r++) {
-        float tot = simd_sum(sumf[r]);
-        if (tiisg == 0 && first_row + r < out_dim) {
-            out[first_row + r] = tot;
-        }
-    }
-}

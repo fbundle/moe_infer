@@ -67,7 +67,14 @@ impl<C: ModelConfig> FusedGemma4Dense<C> {
     ) -> Result<Self, MoEError> {
         C::validate_config(&model.config).map_err(MoEError::Config)?;
 
-        const GEMMA4_DENSE_SHADERS: &str = include_str!("shaders.metal");
+        // Gemma 4 12B sliding-attn layer has 8 KV heads × 2 q-per-kv (vs the
+        // shared bundle's default 4×4). Prepend overrides so the shared
+        // file's #ifndef guards see these definitions first.
+        const GEMMA4_DENSE_SHADERS: &str = concat!(
+            "#define NUM_KV_HEADS 8\n",
+            "#define HEADS_PER_KV 2\n",
+            include_str!("../shaders.metal"),
+        );
         let ctx = MetalContext::init_with_shaders(GEMMA4_DENSE_SHADERS)?;
 
         let weight_buffer = WeightBuffer::new(&ctx.device, &model.weight_file);

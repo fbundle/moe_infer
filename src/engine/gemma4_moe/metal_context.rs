@@ -10,8 +10,10 @@ pub use crate::engine::metal_context::{metal_buf_shared, WeightBuffer, MAX_K, Ex
 use crate::model::weights::WeightFile;
 use crate::engine::gemma4_constants::Gemma4ModelConfig;
 
+// gemma4_moe inherits the unified shader bundle's qwen35-style dim defaults
+// (NUM_KV_HEADS=4, HEADS_PER_KV=4) plus its own gemma4_moe extras.
 const SHADER_SOURCE: &str = concat!(
-    include_str!("../qwen35_moe/shaders.metal"),
+    include_str!("../shaders.metal"),
     include_str!("shaders.metal"),
 );
 

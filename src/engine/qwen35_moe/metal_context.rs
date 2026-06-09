@@ -584,8 +584,14 @@ impl MetalContext {
     }
 }
 
-/// Embed the shaders.metal source at compile time.
-const SHADER_SOURCE: &str = include_str!("shaders.metal");
+/// Unified shader bundle, prepended with qwen35_moe's model-specific
+/// dimension overrides. The shared shaders.metal file uses #ifndef guards,
+/// so these defines win for this engine.
+const SHADER_SOURCE: &str = concat!(
+    "#define NUM_KV_HEADS 2\n",
+    "#define HEADS_PER_KV 8\n",
+    include_str!("../shaders.metal"),
+);
 
 impl MetalContext {
     /// Initialize Metal with the default qwen35_moe shaders.

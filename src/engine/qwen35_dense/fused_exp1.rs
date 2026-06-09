@@ -62,9 +62,10 @@ impl<C: ModelConfig> FusedDense<C> {
     ) -> Result<Self, MoEError> {
         C::validate_config(&model.config).map_err(MoEError::Config)?;
 
-        // Dense Qwen3.5 has different GQA constants (4 kv-heads, 4 q-per-kv) than
-        // the qwen35_moe shaders' compile-time #defines. Use the dense fork.
-        const DENSE_SHADERS: &str = include_str!("shaders.metal");
+        // qwen35_dense uses the unified shader bundle. Its dimension
+        // defaults (HEAD_DIM=256, NUM_KV_HEADS=4, HEADS_PER_KV=4) match the
+        // shared shaders.metal defaults, so no prelude is needed.
+        const DENSE_SHADERS: &str = include_str!("../shaders.metal");
         let mut ctx = MetalContext::init_with_shaders(DENSE_SHADERS)?;
         ctx.init_linear_attn_buffers(
             C::NUM_LINEAR_LAYERS,
