@@ -3157,6 +3157,121 @@ kernel void dequant_matvec_4bit_v6(
 }
 
 // ============================================================================
+// Kernel 35c. dequant_matvec_4bit_v7 — port of MLX `qmv_fast` for asym-INT4
+// ============================================================================
+// MLX's quantized matvec (mlx/backend/metal/kernels/quantized.h:749 qmv_fast_impl)
+// adapted to our asymmetric (scale + bias per group of 64) INT4 format.
+//
+// Key parameters (matching MLX qmv_fast for bits=4):
+//   NR0  (results_per_simdgroup)   = 4   — 4 output rows per SIMD group
+//   NSG  (num_simdgroups)          = 2   — 2 SIMD groups per TG (64 threads)
+//   VPT  (values_per_thread)       = 16  — half of v4's 32; lower register state
+//   PPT  (packs_per_thread)        = 2   — 2 uint32 = 16 nibbles per thread
+//   BLOCK_SIZE                     = 512 — 32 lanes × 16 values
+//   SCALE_STEP                     = 4   — 4 lanes share a scale (cover 1 group)
+//
+// In-loop x cache uses MLX's pre-divide trick: x_thread[i+1] /= 16,
+//   x_thread[i+2] /= 256, x_thread[i+3] /= 4096. The qdot inner loop is then
+//   pure AND + FMA against masked uint16 weight words.
+//
+// REQUIRES: in_dim % BLOCK_SIZE == 0 (caller falls back to v4_nr4 otherwise).
+//   For our models this holds for: Qwen3.5-4B (all matvecs), and Gemma-4-12B's
+//   intermediate=15360 and q_dim_full=8192. Gemma's hidden=3840 is NOT
+//   divisible by 512 → caller routes those matvecs to v4_nr4.
+
+kernel void dequant_matvec_4bit_v7(
+    device const uint32_t* W_packed   [[buffer(0)]],
+    device const uint16_t* scales     [[buffer(1)]],
+    device const uint16_t* biases     [[buffer(2)]],
+    device const float*    x          [[buffer(3)]],
+    device float*          out        [[buffer(4)]],
+    constant uint&         out_dim    [[buffer(5)]],
+    constant uint&         in_dim     [[buffer(6)]],
+    constant uint&         group_size [[buffer(7)]],  // expected: 64
+    uint  tgid   [[threadgroup_position_in_grid]],
+    uint  tiisg  [[thread_index_in_simdgroup]],
+    uint  sgitg  [[simdgroup_index_in_threadgroup]]
+) {
+    constexpr int NR0 = 4, NSG = 2, GROUP = 64;
+    constexpr int VPT = 16;                      // values_per_thread
+    constexpr int PPT = 2;                       // packs_per_thread (uint32)
+    constexpr int SCALE_STEP = GROUP / VPT;      // 4
+    constexpr int BLOCK_SIZE = VPT * 32;         // 512
+
+    const uint out_row = tgid * (NSG * NR0) + sgitg * NR0;
+    if (out_row >= out_dim) return;
+
+    const uint in_vec_size_g = in_dim / GROUP;
+    const uint packed_cols   = in_dim / 8;       // uint32 cols per row
+
+    // Per-row byte pointers into the weight tensor + scales/biases.
+    device const uint8_t*  w_ptr = ((device const uint8_t*)W_packed)
+        + out_row * packed_cols * 4 + tiisg * PPT * 4;
+    device const uint16_t* s_ptr = scales
+        + out_row * in_vec_size_g + tiisg / SCALE_STEP;
+    device const uint16_t* b_ptr = biases
+        + out_row * in_vec_size_g + tiisg / SCALE_STEP;
+    device const float*    xp    = x + tiisg * VPT;
+
+    float sumf[NR0] = { 0.0f, 0.0f, 0.0f, 0.0f };
+
+    for (uint k = 0; k < in_dim; k += BLOCK_SIZE) {
+        // Load x and pre-divide by bit-position weights so the qdot inner
+        // loop sees the masked uint16 nibble values directly without shifts.
+        float x_thread[VPT];
+        float sx = 0.0f;
+        #pragma unroll
+        for (short i = 0; i < VPT; i += 4) {
+            sx += xp[i+0] + xp[i+1] + xp[i+2] + xp[i+3];
+            x_thread[i+0] = xp[i+0];
+            x_thread[i+1] = xp[i+1] * (1.0f /   16.0f);
+            x_thread[i+2] = xp[i+2] * (1.0f /  256.0f);
+            x_thread[i+3] = xp[i+3] * (1.0f / 4096.0f);
+        }
+
+        #pragma unroll
+        for (short row = 0; row < NR0; row++) {
+            if (out_row + row >= out_dim) continue;
+
+            const device uint8_t*  wl = w_ptr + row * packed_cols * 4;
+            const device uint16_t* sl = s_ptr + row * in_vec_size_g;
+            const device uint16_t* bl = b_ptr + row * in_vec_size_g;
+
+            float s = bf16_to_f32(sl[0]);
+            float b = bf16_to_f32(bl[0]);
+
+            // VPT=16 nibbles per thread = 4 uint16 words.
+            const device uint16_t* ws16 = (const device uint16_t*)wl;
+            float accum = 0.0f;
+            #pragma unroll
+            for (short i = 0; i < VPT / 4; i++) {
+                uint16_t w = ws16[i];
+                accum += x_thread[4*i+0] * float(w & 0x000f);
+                accum += x_thread[4*i+1] * float(w & 0x00f0);
+                accum += x_thread[4*i+2] * float(w & 0x0f00);
+                accum += x_thread[4*i+3] * float(w & 0xf000);
+            }
+            sumf[row] += s * accum + b * sx;
+        }
+
+        // Advance pointers by one block (512 weights = 256 bytes of packed
+        // weights = 8 groups of scales/biases = 512 floats of x).
+        w_ptr += BLOCK_SIZE / 2;          // 4 bits/weight = 0.5 bytes
+        s_ptr += BLOCK_SIZE / GROUP;      // 8
+        b_ptr += BLOCK_SIZE / GROUP;      // 8
+        xp    += BLOCK_SIZE;              // 512
+    }
+
+    #pragma unroll
+    for (short row = 0; row < NR0; row++) {
+        float tot = simd_sum(sumf[row]);
+        if (tiisg == 0 && out_row + row < out_dim) {
+            out[out_row + row] = tot;
+        }
+    }
+}
+
+// ============================================================================
 // Kernel 1b2 (MoE expert path): FUSED gate_proj + up_proj + SwiGLU
 // ============================================================================
 // Replaces the 3-dispatch sequence (gate matvec, up matvec, swiglu) with a

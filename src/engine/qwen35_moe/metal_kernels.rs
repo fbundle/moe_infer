@@ -51,7 +51,7 @@ pub fn encode_matvec_offset(
     //   fast        — v1 fallback (small TG, no tiling)
     let env_variant = std::env::var("MATVEC_V3_VARIANT").ok();
     let need_large_int4 = use_fast >= 3 && in_dim > 4096;
-    let variant = if let Some(v) = env_variant.clone() {
+    let mut variant = if let Some(v) = env_variant.clone() {
         v
     } else if use_fast >= 3 && ctx.matvec_v4_nr4.is_some() {
         // Default for any INT4 matvec when the v4_nr4 pipeline is loaded.
@@ -61,6 +61,10 @@ pub fn encode_matvec_offset(
     } else {
         String::new()
     };
+    // v7 requires in_dim % 512 == 0; transparently fall back when not.
+    if variant == "v7" && (in_dim % 512 != 0 || ctx.matvec_v7.is_none()) {
+        variant = "v4_nr4".to_string();
+    }
 
     // v4_nr4: usable at ANY in_dim (no threadgroup cache, so not bound by
     // 4096-tile limit). Dispatch: 4 rows/SIMD-group × 2 SIMD-groups/TG = 8
@@ -87,6 +91,34 @@ pub fn encode_matvec_offset(
         return;
     }
 
+    // v7: MLX-style qmv_fast (values_per_thread=16, pre-mult x cache).
+    // REQUIRES in_dim % 512 == 0. Same dispatch shape as v4_nr4: 8 rows/TG,
+    // 64 threads/TG. When alignment fails, transparently fall back to
+    // v4_nr4 below.
+    if use_fast >= 3 && variant == "v7"
+        && ctx.matvec_v7.is_some()
+        && in_dim % 512 == 0
+    {
+        let pipeline = ctx.matvec_v7.as_ref().unwrap();
+        encoder.set_compute_pipeline_state(pipeline);
+        encoder.set_buffer(0, Some(w_packed), w_offset);
+        encoder.set_buffer(1, Some(scales), s_offset);
+        encoder.set_buffer(2, Some(biases), b_offset);
+        encoder.set_buffer(3, Some(x), x_offset);
+        encoder.set_buffer(4, Some(out), o_offset);
+        unsafe {
+            set_u32(encoder, 5, out_dim);
+            set_u32(encoder, 6, in_dim);
+            set_u32(encoder, 7, group_size);
+        }
+        const ROWS_PER_TG_V7: u32 = 8; // NR0=4 × NSG=2
+        let num_tgs = (out_dim + ROWS_PER_TG_V7 - 1) / ROWS_PER_TG_V7;
+        encoder.dispatch_thread_groups(
+            MTLSize::new(num_tgs as u64, 1, 1),
+            MTLSize::new(64, 1, 1),
+        );
+        return;
+    }
     // v6: v4_nr4 + pre-multiplied lx + NSG=4. Dispatch: 4 rows × 4 SGs = 16
     // rows per TG, 128 threads per TG.
     if use_fast >= 3 && variant == "v6" && ctx.matvec_v6.is_some() {

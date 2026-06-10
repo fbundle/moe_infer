@@ -227,6 +227,10 @@ pub struct MetalContext {
     /// v4_nr4 + pre-multiplied lx + NSG=4. Inner loop is pure AND+FMA
     /// (no per-nibble right-shift). Select via `MATVEC_V3_VARIANT=v6`.
     pub matvec_v6: Option<ComputePipelineState>,
+    /// MLX qmv_fast port — NR0=4, NSG=2, values_per_thread=16, pre-
+    /// multiplied x cache. REQUIRES `in_dim % 512 == 0`; caller routes
+    /// non-aligned shapes to v4_nr4. Select via `MATVEC_V3_VARIANT=v7`.
+    pub matvec_v7: Option<ComputePipelineState>,
     /// Fused gate_proj + up_proj + GELU(tanh-approx) — Gemma's MLP fast
     /// path. Same structure as `fused_gate_up_swiglu_v3` but applies
     /// gelu_tanh instead of silu.
@@ -651,6 +655,7 @@ impl MetalContext {
             let fused_gate_up_swiglu_v3 = make_pipeline("fused_gate_up_swiglu_v3").ok();
             let matvec_v4_nr4 = make_pipeline("dequant_matvec_4bit_v4_nr4").ok();
             let matvec_v6 = make_pipeline("dequant_matvec_4bit_v6").ok();
+            let matvec_v7 = make_pipeline("dequant_matvec_4bit_v7").ok();
             let fused_gate_up_geglu_tanh_v3 = make_pipeline("fused_gate_up_geglu_tanh_v3").ok();
             let matvec_bf16 = make_pipeline("matvec_bf16")?;
             let matvec_int8 = make_pipeline("matvec_int8")?;
@@ -710,6 +715,7 @@ impl MetalContext {
                 fused_gate_up_swiglu_v3,
                 matvec_v4_nr4,
                 matvec_v6,
+                matvec_v7,
                 fused_gate_up_geglu_tanh_v3,
                 matvec_bf16,
                 matvec_int8,
