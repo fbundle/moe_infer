@@ -37,8 +37,13 @@ pub fn encode_matvec_offset(
     group_size: u32,
     use_fast: i32,
 ) {
-    // Variant picker for INT4 matvecs. Env var `MATVEC_V3_VARIANT`:
-    //   v4_nr4      — llama.cpp-inspired NR0=4 row sharing (any in_dim)
+    // Variant picker for INT4 matvecs. Default: `v4_nr4` (llama.cpp-inspired
+    // NR0=4 row sharing) — best decode throughput on Apple Silicon across
+    // all model sizes we've measured (Qwen3.5-4B and Gemma-4-12B). Override
+    // via env var `MATVEC_V3_VARIANT`:
+    //   v4_nr4      — DEFAULT. 4 rows per SIMD group, no threadgroup cache.
+    //   v6          — v4_nr4 + pre-multiplied lx; ALU-saving variant for
+    //                 hardware where shifts are expensive.
     //   tiled       — v3 with 4096-elem threadgroup x-cache (in_dim > 4096)
     //   large       — v3 with 8192-elem x-cache
     //   sbcache     — v3 with x + scale/bias in threadgroup memory
@@ -48,6 +53,9 @@ pub fn encode_matvec_offset(
     let need_large_int4 = use_fast >= 3 && in_dim > 4096;
     let variant = if let Some(v) = env_variant.clone() {
         v
+    } else if use_fast >= 3 && ctx.matvec_v4_nr4.is_some() {
+        // Default for any INT4 matvec when the v4_nr4 pipeline is loaded.
+        "v4_nr4".to_string()
     } else if need_large_int4 {
         "tiled".to_string()
     } else {
