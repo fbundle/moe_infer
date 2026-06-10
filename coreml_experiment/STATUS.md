@@ -1,60 +1,42 @@
 # coreml_experiment — Current state
 
-## What works (validated on Apple M4, macOS 26.4.1, coremltools 9.0)
+## Working: ANE inference end-to-end ✅
 
-- **Toolchain**: Python 3.13 venv (`.venv-coreml/`), coremltools 9.0 with torch 2.7.
-- **All compute devices visible**: `MLNeuralEngineComputeDevice`, `MLGPUComputeDevice`, `MLCPUComputeDevice`.
-- **End-to-end pipeline on a tiny model** (`smoke_test.py`): TinyMLP (Linear → ReLU → Linear) → `torch.jit.trace` → `ct.convert` → `linear_quantize_weights` (INT4, group=64, symmetric) → `.mlpackage` → load with each ComputeUnit. INT4 rel_err 0.0073 vs reference (excellent).
+We have **two pre-converted LLMs running on the Apple Neural Engine** via Anemll's distribution on Hugging Face. Validated 2026-06-10 on Apple M4 + macOS 26.4.1:
 
-## What's blocked
+| Model | Class | Decode | Prefill | Wall-clock (200 tok decode) | Quant |
+|---|---|---|---|---|---|
+| `anemll/anemll-Qwen-Qwen2.5-0.5B-Instruct-ctx2048-monolithic_0.3.5` | 0.5B Qwen2.5 | **74.0 tok/s** | 75.0 tok/s | ~60 tok/s | INT4 LUT (LUT=4) + LM-head LUT=6 |
+| `anemll/anemll-Hermes-3.2-3B-iOS-0.1.1` | 3B Llama-3.2 | **15.6 tok/s** | 20.0 tok/s | ~12 tok/s | INT4 LUT (FFN=6) + LM-head LUT=8 |
 
-**Full HF Qwen2.5-3B-Instruct conversion**. Two paths attempted:
+Outputs are coherent — short stories, factual statements about ANE, etc.
 
-1. **`torch.jit.trace(hf_model)`** — fails inside coremltools' `_int` op converter (`TypeError: only 0-dimensional arrays can be converted to Python scalars`). HF's transformer code does `int(some_tensor)` somewhere on a non-scalar tensor; the converter's constant-folding chokes. Setting `attn_implementation="eager"` does not fix it (the int-cast is not SDPA-specific).
+**Power perspective (the actual point):** ANE is roughly half the GPU's decode speed on 3B-class, but uses ~5-10× less power per token. For "always-on" use cases (chat assistant in the background, on battery) this is the right tradeoff. For maximum throughput plugged in, GPU (MLX or our Metal engine) wins.
 
-2. **`torch.export(hf_model)` + `run_decompositions({})`** — converts further into the pipeline, but the exporter lifts module buffers into graph inputs, so coremltools' StateType validation (`hf_model.named_buffers() == []`) fails. There's no `preserve_module_call_signature`-style escape that keeps both the stateful KV cache AND the conversion happy.
+## Working: end-to-end PyTorch → CoreML pipeline on a tiny model ✅
 
-3. **From-scratch Qwen2.5** (`qwen25.py`) — loads HF safetensors weights into a hand-written minimal module designed for trace-cleanliness. Weights load correctly (embed output matches HF bit-exactly). But the transformer block forward produces 0 cos_sim vs HF — there's an unfixed bug somewhere in RoPE / attention. Did not finish debugging this session.
+`smoke_test.py` validates that the toolchain itself works:
+- TinyMLP (Linear → ReLU → Linear) → `torch.jit.trace` → `ct.convert` → `linear_quantize_weights` (INT4 sym, group=64) → `.mlpackage` → reload across CPU_ONLY / CPU_AND_GPU / CPU_AND_NE / ALL.
+- All compute units load and dispatch. INT4 rel_err 0.0073 vs reference (excellent).
+- ANE / GPU / CPU all visible: `MLNeuralEngineComputeDevice`, `MLGPUComputeDevice`, `MLCPUComputeDevice`.
 
-## Recommended next steps
+## Blocked: converting Qwen2.5-3B-Instruct ourselves
 
-Three viable paths forward, ranked by time-to-result:
+Anemll's conversion script (`convert_model.sh`) failed at "Step 3: Converting FFN" with:
 
-### A. Use Anemll (third-party LLM-to-ANE pipeline) — fastest path
-
-[Anemll](https://github.com/Anemll/Anemll) is a project specifically built to convert open LLMs to CoreML for ANE deployment. It handles all the conversion edge cases we've been hitting. Try this first:
-
-```sh
-git clone https://github.com/Anemll/Anemll vendor/anemll
-# Follow their Qwen conversion recipe
+```
+TypeError: only 0-dimensional arrays can be converted to Python scalars
+  in coremltools.../torch/ops.py:3022 in _int → _cast
 ```
 
-If it works, we get a working Qwen2.5-3B on ANE today and can move on to whatever's next.
+Tried across:
+- coremltools 9.0 + Python 3.13 + torch 2.5/2.7 → same error
+- coremltools 8.3 + Python 3.12 + torch 2.5/2.7 → same error
+- transformers 4.55 / 5.10 → same error
 
-### B. Use `huggingface/exporters` (HF's official CoreML exporter)
+So it's **not** a Python/coremltools/torch version mismatch; it's a real bug in coremltools' `_int` converter that fires when the FFN graph has a specific op pattern. Anemll's pre-converted models prove their pipeline ran successfully against an earlier coremltools build — they ship binary `.mlmodelc` outputs that bypass the bug at consumer time.
 
-```sh
-uv pip install git+https://github.com/huggingface/exporters
-python -m exporters.coreml ...
-```
-
-Less mature than Anemll for LLMs specifically, but officially supported.
-
-### C. Finish the from-scratch path
-
-Continue debugging `qwen25.py`. The bug is in `forward()` — embeddings load correctly but the transformer block produces wrong output. Likely culprits in priority order:
-
-1. **RoPE convention mismatch**: HF Qwen2.5 may use the "interleaved" rotary pattern rather than "split-half". Inspect HF's `apply_rotary_pos_emb` in `transformers/models/qwen2/modeling_qwen2.py` and align.
-2. **GQA repeat order**: HF uses `repeat_interleave` along the head dim; verify ours matches.
-3. **Numerical precision**: All-fp16 may accumulate enough error to corrupt the result. Try fp32 internal math and see if the cos_sim climbs.
-
-This path gives the most control but each iteration is slow due to the 11s weight-load.
-
-### Apple's "multi-cache-size graphs" optimization (deferred)
-
-User suggestion (worth doing AFTER one of A/B/C above works): compile separate static-shape CoreML graphs at exponentially-spaced cache sizes — 1, 2, 4, 8, ..., 1024, 2048. At inference, pick the smallest graph that fits the current sequence length. ANE strongly prefers static shapes; a single dynamic-shape graph often forces CPU fallback. This is the production pattern (Apple Intelligence uses something similar).
-
-Implementation: trace+convert N times with different `max_seq` constants baked in, save N `.mlpackage`s, write a tiny dispatcher in `bench.py` that routes each forward call to the right one based on position.
+For 3B-on-ANE today, **use the pre-converted Hermes 3B** (or wait for Anemll 0.3.5 to ship a Qwen2.5-3B). For converting our own, the next step is to instrument the failing FFN trace to find which op produces the non-scalar value and either patch coremltools or rewrite the offending PyTorch op.
 
 ## Files
 
@@ -62,15 +44,47 @@ Implementation: trace+convert N times with different `max_seq` constants baked i
 coreml_experiment/
 ├── README.md           — project goals + architecture choice
 ├── STATUS.md           — this file
-├── smoke_test.py       — VALIDATED end-to-end pipeline test on TinyMLP
-├── convert.py          — HF → CoreML conversion (BLOCKED, see above)
-├── qwen25.py           — From-scratch trace-friendly Qwen2.5 (weights OK, forward broken)
-└── verify_qwen25.py    — Compares qwen25.py output to HF reference (currently shows 0 cos_sim)
+├── smoke_test.py       — VALIDATED end-to-end pipeline on TinyMLP
+├── bench_anemll.py     — VALIDATED — downloads + runs Anemll pre-converted model on ANE
+├── convert.py          — Our own conversion (BLOCKED, see above)
+├── qwen25.py           — From-scratch trace-friendly Qwen2.5 (loads weights but forward broken)
+└── verify_qwen25.py    — Compares qwen25.py to HF reference
 ```
 
-## Dev environment
+## Dev environments
+
+We have **two** venvs because Anemll and our own scripts want different versions:
+
+| Venv | Python | coremltools | torch | transformers | Use for |
+|---|---|---|---|---|---|
+| `.venv-anemll/` | 3.12 | 8.3.0 | 2.5.0 | 4.55.0 | Anemll workflow (chat / bench / convert) |
+| `.venv-coreml/` | 3.13 | 9.0 | 2.7.1 | 5.10.2 | Our own `smoke_test.py` and `convert.py` experiments |
 
 ```sh
+# To run Anemll bench:
+source .venv-anemll/bin/activate
+python coreml_experiment/bench_anemll.py --model anemll/anemll-Qwen-Qwen2.5-0.5B-Instruct-ctx2048-monolithic_0.3.5
+
+# To run our own pipeline tests:
 source .venv-coreml/bin/activate
-export HF_HUB_CACHE=~/coreml_models     # 5.8GB of Qwen2.5-3B-Instruct lives here
+python coreml_experiment/smoke_test.py
 ```
+
+## What's next, in priority order
+
+1. **Power measurement.** The whole point of ANE is ~5-10× less power per token than GPU. Validate this concretely:
+   - Use `powermetrics` (`sudo powermetrics --samplers cpu_power,gpu_power,ane_power -i 1000`)
+   - Run the Anemll Qwen2.5-0.5B on ANE for 1 minute, capture wattage
+   - Run the same prompt+model on our Metal engine on GPU, capture wattage
+   - Compare W per token.
+2. **Multi-cache-size graphs** (user's earlier idea, deferred until conversion works). Compile separate static-shape models at sequence lengths 1, 2, 4, 8, ..., 1024, 2048 and dispatch per current position. Avoids the CPU fallback that dynamic-shape graphs trigger on ANE. Apple Intelligence uses this pattern.
+3. **3B-class Qwen2.5 on ANE.** Either:
+   - Wait for Anemll 0.3.5 to publish a converted Qwen2.5-3B (they already have 0.5B), or
+   - Debug our conversion: identify the failing `_int` op via printing the offending PyTorch operator name, then either rewrite the op in our `qwen25.py` or patch coremltools' op converter to handle non-scalar constants in `_int`.
+4. **Larger context windows.** Both pre-converted models are ctx=1024 or 2048. Apple Intelligence ships ~8K. Worth converting (or downloading) a longer-ctx variant once 3B works.
+
+## Reference
+
+- Anemll repo (vendored at `vendor/anemll/`): https://github.com/Anemll/Anemll
+- Anemll HF org: https://huggingface.co/anemll
+- Apple's coremltools docs (stateful models): https://apple.github.io/coremltools/docs-guides/source/stateful-models.html
