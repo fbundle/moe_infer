@@ -806,6 +806,55 @@ pub fn encode_buffer_copy_f32(
     );
 }
 
+/// Encode v7_n batched matvec: N x vectors share weight reads. Caller
+/// must ensure in_dim % 512 == 0; returns false otherwise (caller falls
+/// back to per-token v7 dispatches).
+///
+/// Picks `v7_n8` if n >= 5 (better weight reuse) else `v7_n4`. For n > 8,
+/// the caller dispatches multiple times with x/out advanced by 8.
+#[allow(clippy::too_many_arguments)]
+pub fn encode_dequant_matvec_4bit_v7_n(
+    ctx: &MetalContext,
+    encoder: &ComputeCommandEncoderRef,
+    w_packed: &BufferRef, w_offset: u64,
+    scales: &BufferRef, s_offset: u64,
+    biases: &BufferRef, b_offset: u64,
+    x: &BufferRef, x_offset: u64,
+    out: &BufferRef, o_offset: u64,
+    out_dim: u32,
+    in_dim: u32,
+    group_size: u32,
+    n_tokens: u32,
+) -> bool {
+    if in_dim % 512 != 0 || n_tokens == 0 {
+        return false;
+    }
+    let pipeline = if n_tokens >= 5 {
+        match ctx.matvec_v7_n8.as_ref() { Some(p) => p, None => return false }
+    } else {
+        match ctx.matvec_v7_n4.as_ref() { Some(p) => p, None => return false }
+    };
+    encoder.set_compute_pipeline_state(pipeline);
+    encoder.set_buffer(0, Some(w_packed), w_offset);
+    encoder.set_buffer(1, Some(scales), s_offset);
+    encoder.set_buffer(2, Some(biases), b_offset);
+    encoder.set_buffer(3, Some(x), x_offset);
+    encoder.set_buffer(4, Some(out), o_offset);
+    unsafe {
+        set_u32(encoder, 5, out_dim);
+        set_u32(encoder, 6, in_dim);
+        set_u32(encoder, 7, group_size);
+        set_u32(encoder, 8, n_tokens);
+    }
+    const ROWS_PER_TG_V7N: u32 = 8;
+    let num_tgs = (out_dim + ROWS_PER_TG_V7N - 1) / ROWS_PER_TG_V7N;
+    encoder.dispatch_thread_groups(
+        MTLSize::new(num_tgs as u64, 1, 1),
+        MTLSize::new(64, 1, 1),
+    );
+    true
+}
+
 pub fn encode_dequant_matvec_4bit_n(
     ctx: &MetalContext,
     encoder: &ComputeCommandEncoderRef,

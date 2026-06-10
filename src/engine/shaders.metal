@@ -3272,6 +3272,181 @@ kernel void dequant_matvec_4bit_v7(
 }
 
 // ============================================================================
+// Kernel 35d. dequant_matvec_4bit_v7_n — N-batched v7 for prefill
+// ============================================================================
+// Same v7 inner kernel but processes N x vectors at once, sharing weight
+// reads across all N tokens. This is the prefill foundation: for N=8 prompt
+// tokens, each weight byte is read 1× instead of 8× → near-linear prefill
+// speedup until ALU/register pressure dominates.
+//
+// Dispatch: same shape as v7 (8 rows/TG, 64 threads/TG). Grid stride 1
+// per N batch (the kernel handles ALL N tokens per dispatch).
+//
+// REQUIRES in_dim % 512 == 0 (same as v7).
+//
+// Layout:
+//   x  in [N, in_dim]   row-major
+//   out in [N, out_dim] row-major
+//
+// Register pressure: x_thread[N_MAX][VPT] = 8*16 = 128 floats per lane in
+// the worst case. NR0=4 × N_MAX=8 = 32 accumulators per lane. Comfortable
+// for Apple M-series at this NSG=2 dispatch.
+
+template <int N_MAX>
+inline void dequant_matvec_4bit_v7_n_impl(
+    device const uint32_t* W_packed,
+    device const uint16_t* scales,
+    device const uint16_t* biases,
+    device const float*    x,
+    device float*          out,
+    uint out_dim, uint in_dim, uint n_tokens,
+    uint tgid, uint tiisg, uint sgitg
+) {
+    constexpr int NR0 = 4, NSG = 2, GROUP = 64;
+    constexpr int VPT = 16, PPT = 2;
+    constexpr int SCALE_STEP = GROUP / VPT;
+    constexpr int BLOCK_SIZE = VPT * 32;
+
+    const uint out_row = tgid * (NSG * NR0) + sgitg * NR0;
+    if (out_row >= out_dim) return;
+
+    const uint in_vec_size_g = in_dim / GROUP;
+    const uint packed_cols   = in_dim / 8;
+
+    device const uint8_t*  w_ptr = ((device const uint8_t*)W_packed)
+        + out_row * packed_cols * 4 + tiisg * PPT * 4;
+    device const uint16_t* s_ptr = scales
+        + out_row * in_vec_size_g + tiisg / SCALE_STEP;
+    device const uint16_t* b_ptr = biases
+        + out_row * in_vec_size_g + tiisg / SCALE_STEP;
+    device const float*    xp_base = x + tiisg * VPT;
+
+    // sumf[row][n_idx] = per-row per-token accumulator
+    float sumf[NR0][N_MAX] = { 0.0f };
+    // Cap N to N_MAX (caller dispatches multiple times if n_tokens > N_MAX).
+    const uint N = min(n_tokens, (uint)N_MAX);
+
+    for (uint k = 0; k < in_dim; k += BLOCK_SIZE) {
+        // Load + pre-mult x for each of the N tokens.
+        float x_thread[N_MAX][VPT];
+        float sx[N_MAX];
+        #pragma unroll
+        for (uint n = 0; n < N_MAX; n++) {
+            if (n >= N) {
+                sx[n] = 0;
+                #pragma unroll
+                for (short i = 0; i < VPT; i++) x_thread[n][i] = 0;
+                continue;
+            }
+            device const float* xp_n = xp_base + n * in_dim;
+            float sxn = 0.0f;
+            #pragma unroll
+            for (short i = 0; i < VPT; i += 4) {
+                sxn += xp_n[i+0] + xp_n[i+1] + xp_n[i+2] + xp_n[i+3];
+                x_thread[n][i+0] = xp_n[i+0];
+                x_thread[n][i+1] = xp_n[i+1] * (1.0f /   16.0f);
+                x_thread[n][i+2] = xp_n[i+2] * (1.0f /  256.0f);
+                x_thread[n][i+3] = xp_n[i+3] * (1.0f / 4096.0f);
+            }
+            sx[n] = sxn;
+        }
+
+        #pragma unroll
+        for (short row = 0; row < NR0; row++) {
+            if (out_row + row >= out_dim) continue;
+
+            const device uint8_t*  wl = w_ptr + row * packed_cols * 4;
+            const device uint16_t* sl = s_ptr + row * in_vec_size_g;
+            const device uint16_t* bl = b_ptr + row * in_vec_size_g;
+            float s = bf16_to_f32(sl[0]);
+            float b = bf16_to_f32(bl[0]);
+
+            const device uint16_t* ws16 = (const device uint16_t*)wl;
+            uint16_t w16[VPT/4];
+            #pragma unroll
+            for (short i = 0; i < VPT/4; i++) w16[i] = ws16[i];
+
+            // For each token, dot product against the same weights.
+            #pragma unroll
+            for (uint n = 0; n < N_MAX; n++) {
+                if (n >= N) continue;
+                float accum = 0.0f;
+                #pragma unroll
+                for (short i = 0; i < VPT/4; i++) {
+                    uint16_t w = w16[i];
+                    accum += x_thread[n][4*i+0] * float(w & 0x000f);
+                    accum += x_thread[n][4*i+1] * float(w & 0x00f0);
+                    accum += x_thread[n][4*i+2] * float(w & 0x0f00);
+                    accum += x_thread[n][4*i+3] * float(w & 0xf000);
+                }
+                sumf[row][n] += s * accum + b * sx[n];
+            }
+        }
+
+        w_ptr += BLOCK_SIZE / 2;
+        s_ptr += BLOCK_SIZE / GROUP;
+        b_ptr += BLOCK_SIZE / GROUP;
+        xp_base += BLOCK_SIZE;
+    }
+
+    #pragma unroll
+    for (short row = 0; row < NR0; row++) {
+        if (out_row + row >= out_dim) continue;
+        #pragma unroll
+        for (uint n = 0; n < N_MAX; n++) {
+            if (n >= N) continue;
+            float tot = simd_sum(sumf[row][n]);
+            if (tiisg == 0) {
+                out[n * out_dim + out_row + row] = tot;
+            }
+        }
+    }
+}
+
+// Instantiations for common batch sizes. Caller picks the best one given
+// the prompt length; oversized N_MAX wastes register state, undersized
+// requires multiple dispatches.
+kernel void dequant_matvec_4bit_v7_n4(
+    device const uint32_t* W_packed   [[buffer(0)]],
+    device const uint16_t* scales     [[buffer(1)]],
+    device const uint16_t* biases     [[buffer(2)]],
+    device const float*    x          [[buffer(3)]],
+    device float*          out        [[buffer(4)]],
+    constant uint&         out_dim    [[buffer(5)]],
+    constant uint&         in_dim     [[buffer(6)]],
+    constant uint&         group_size [[buffer(7)]],
+    constant uint&         n_tokens   [[buffer(8)]],
+    uint  tgid  [[threadgroup_position_in_grid]],
+    uint  tiisg [[thread_index_in_simdgroup]],
+    uint  sgitg [[simdgroup_index_in_threadgroup]]
+) {
+    dequant_matvec_4bit_v7_n_impl<4>(
+        W_packed, scales, biases, x, out,
+        out_dim, in_dim, n_tokens,
+        tgid, tiisg, sgitg);
+}
+
+kernel void dequant_matvec_4bit_v7_n8(
+    device const uint32_t* W_packed   [[buffer(0)]],
+    device const uint16_t* scales     [[buffer(1)]],
+    device const uint16_t* biases     [[buffer(2)]],
+    device const float*    x          [[buffer(3)]],
+    device float*          out        [[buffer(4)]],
+    constant uint&         out_dim    [[buffer(5)]],
+    constant uint&         in_dim     [[buffer(6)]],
+    constant uint&         group_size [[buffer(7)]],
+    constant uint&         n_tokens   [[buffer(8)]],
+    uint  tgid  [[threadgroup_position_in_grid]],
+    uint  tiisg [[thread_index_in_simdgroup]],
+    uint  sgitg [[simdgroup_index_in_threadgroup]]
+) {
+    dequant_matvec_4bit_v7_n_impl<8>(
+        W_packed, scales, biases, x, out,
+        out_dim, in_dim, n_tokens,
+        tgid, tiisg, sgitg);
+}
+
+// ============================================================================
 // Kernel 1b2 (MoE expert path): FUSED gate_proj + up_proj + SwiGLU
 // ============================================================================
 // Replaces the 3-dispatch sequence (gate matvec, up matvec, swiglu) with a

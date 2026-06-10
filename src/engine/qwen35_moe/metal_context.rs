@@ -231,6 +231,11 @@ pub struct MetalContext {
     /// multiplied x cache. REQUIRES `in_dim % 512 == 0`; caller routes
     /// non-aligned shapes to v4_nr4. Select via `MATVEC_V3_VARIANT=v7`.
     pub matvec_v7: Option<ComputePipelineState>,
+    /// v7 batched across N=4 tokens — weight reads shared across all N
+    /// tokens. Foundation for batched prefill.
+    pub matvec_v7_n4: Option<ComputePipelineState>,
+    /// v7 batched across N=8 tokens.
+    pub matvec_v7_n8: Option<ComputePipelineState>,
     /// Fused gate_proj + up_proj + GELU(tanh-approx) — Gemma's MLP fast
     /// path. Same structure as `fused_gate_up_swiglu_v3` but applies
     /// gelu_tanh instead of silu.
@@ -656,6 +661,8 @@ impl MetalContext {
             let matvec_v4_nr4 = make_pipeline("dequant_matvec_4bit_v4_nr4").ok();
             let matvec_v6 = make_pipeline("dequant_matvec_4bit_v6").ok();
             let matvec_v7 = make_pipeline("dequant_matvec_4bit_v7").ok();
+            let matvec_v7_n4 = make_pipeline("dequant_matvec_4bit_v7_n4").ok();
+            let matvec_v7_n8 = make_pipeline("dequant_matvec_4bit_v7_n8").ok();
             let fused_gate_up_geglu_tanh_v3 = make_pipeline("fused_gate_up_geglu_tanh_v3").ok();
             let matvec_bf16 = make_pipeline("matvec_bf16")?;
             let matvec_int8 = make_pipeline("matvec_int8")?;
@@ -716,6 +723,8 @@ impl MetalContext {
                 matvec_v4_nr4,
                 matvec_v6,
                 matvec_v7,
+                matvec_v7_n4,
+                matvec_v7_n8,
                 fused_gate_up_geglu_tanh_v3,
                 matvec_bf16,
                 matvec_int8,
