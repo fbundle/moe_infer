@@ -26,9 +26,9 @@ Harness: `experiment/bench.go` (sashabaranov + verify-loop with reasoning replay
 |---|---|---|---|---|
 | **deepseek-v4-flash** | API | 100% (80/80) | **0.176 ±0.020** | 83.3% (165/198) |
 | **claude-opus-4-7** (claude-cli backend, effort=medium) | API | 80% (64/80) | — | 79% (46/58) partial |
-| **VibeThinker-3B** | mixed_4_6 (4.77 bpw) | 66.2% (53/80) | pending | pending |
+| **VibeThinker-3B** | mixed_4_6 (4.77 bpw) | 66.2% (53/80) | in progress | pending |
 | **Gemma-4-E4B-QAT** (4B active / 26B total) | mlx q4 (~4.5 bpw) | pending | pending | pending |
-| **LFM2.5-8B-A1B** (~1B active) | mlx q8 (~8.5 bpw) | 33% (3/9) partial | pending | pending |
+| **LFM2.5-8B-A1B** (~1B active) | mlx q8 (~8.5 bpw) | 3.8% (3/80) | pending | pending |
 | **Qwen3.5-4B** | mlx q4 (~4.5 bpw) | on hold | on hold | on hold |
 | Claude Opus 4.5 | API | — | — | 87.0% |
 | Qwen3-VL-235B-A22B Thinking | open | 97.3% | — | — |
