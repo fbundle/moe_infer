@@ -1,0 +1,2 @@
+# compiled Go binary (rebuild with `go build -o bench bench.go`)
+bench
