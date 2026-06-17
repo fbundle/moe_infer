@@ -18,6 +18,32 @@ type History struct {
 	Responses []openai.ChatCompletionResponse
 }
 
+// LoopExitReason — Go has no enums; typed string constants are the idiom.
+// One of these is set in LoopError when ChatCompletionLoop returns without
+// a validated value.
+type LoopExitReason string
+
+const (
+	ExitInvalidInput    LoopExitReason = "invalid_input"
+	ExitMaxRetries      LoopExitReason = "max_retries_reached"
+	ExitBudgetExhausted LoopExitReason = "budget_exhausted"
+	ExitCallError       LoopExitReason = "call_error" // completion func returned err/nil
+)
+
+type LoopError struct {
+	Reason  LoopExitReason
+	LastErr error // last validate or completion error, if any
+}
+
+func (e *LoopError) Error() string {
+	if e.LastErr != nil {
+		return string(e.Reason) + ": " + e.LastErr.Error()
+	}
+	return string(e.Reason)
+}
+
+func (e *LoopError) Unwrap() error { return e.LastErr }
+
 func budgetMessage(remainingTokens int) openai.ChatCompletionMessage {
 	return openai.ChatCompletionMessage{
 		Role:    openai.ChatMessageRoleSystem,
@@ -41,11 +67,10 @@ func ChatCompletionLoop[T any](
 	maxCompletionTokens int,
 ) (o T, h History, err error) {
 	if maxRetries < 0 {
-		return o, h, errors.New("maxTries must be non-negative")
-
+		return o, h, &LoopError{Reason: ExitInvalidInput, LastErr: errors.New("maxTries must be non-negative")}
 	}
 	if maxCompletionTokens <= 0 {
-		return o, h, errors.New("maxCompletionTokens must positive")
+		return o, h, &LoopError{Reason: ExitInvalidInput, LastErr: errors.New("maxCompletionTokens must positive")}
 	}
 	remainingTokens := maxCompletionTokens
 	reaminingRetries := maxRetries
@@ -53,10 +78,14 @@ func ChatCompletionLoop[T any](
 		Messages:  slices.Clone(initial),
 		Responses: nil,
 	}
+	var lastValidateErr error // surfaced in the LoopError if we run out
 
 	for {
-		if remainingTokens == 0 || reaminingRetries == 0 {
-			return o, h, errors.New("loop break")
+		if remainingTokens == 0 {
+			return o, h, &LoopError{Reason: ExitBudgetExhausted, LastErr: lastValidateErr}
+		}
+		if reaminingRetries == 0 {
+			return o, h, &LoopError{Reason: ExitMaxRetries, LastErr: lastValidateErr}
 		}
 		// add budget hint
 		h.Messages = append(h.Messages, budgetMessage(remainingTokens))
@@ -64,7 +93,7 @@ func ChatCompletionLoop[T any](
 		r, err := completion(ctx, h.Messages, remainingTokens)
 		if err != nil || r == nil {
 			// not recoverable
-			return o, h, err
+			return o, h, &LoopError{Reason: ExitCallError, LastErr: err}
 		}
 		// make call success, update history
 		h.Responses = append(h.Responses, *r)
@@ -78,6 +107,7 @@ func ChatCompletionLoop[T any](
 			return o, h, nil
 		}
 		// retry loop
+		lastValidateErr = err
 		h.Messages = append(h.Messages, errorMessage(err.Error()))
 		reaminingRetries -= 1
 		remainingTokens -= r.Usage.CompletionTokens

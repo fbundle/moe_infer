@@ -9,6 +9,7 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
 	"io"
@@ -303,6 +304,10 @@ func runOne[T any](ctx context.Context, b *Backend, spec BenchSpec[T],
 		}
 	} else {
 		r.Error = err.Error()
+		var le *LoopError
+		if errors.As(err, &le) {
+			extras["exit_reason"] = string(le.Reason)
+		}
 	}
 	r.Extras = extras
 	return r
