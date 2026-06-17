@@ -1,7 +1,11 @@
 package main
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
+	"fmt"
+	"os/exec"
 	"strings"
 	"sync"
 
@@ -9,25 +13,32 @@ import (
 	"github.com/sashabaranov/go-openai/jsonschema"
 )
 
-// OpenAI-compatible backend (strict json_schema → json_object fallback).
+// Backend is the contract every contender (OpenAI-compatible HTTP, claude CLI, ...) implements.
+type Backend interface {
+	CallWithSchema(ctx context.Context,
+		messages []openai.ChatCompletionMessage,
+		schema *jsonschema.Definition, schemaName string,
+		maxTokens int, temperature, topP float32,
+	) (*openai.ChatCompletionResponse, error)
+	Mode() string
+}
 
-type Backend struct {
+// ── OpenAI-compatible backend (strict json_schema → json_object fallback) ──
+
+type OpenAIBackend struct {
 	client   *openai.Client
 	model    string
 	mu       sync.Mutex
 	strictOK *bool // nil = unknown
 }
 
-func NewBackend(baseURL, apiKey, model string) *Backend {
+func NewOpenAIBackend(baseURL, apiKey, model string) *OpenAIBackend {
 	cfg := openai.DefaultConfig(apiKey)
 	cfg.BaseURL = baseURL
-	return &Backend{client: openai.NewClientWithConfig(cfg), model: model}
+	return &OpenAIBackend{client: openai.NewClientWithConfig(cfg), model: model}
 }
 
-// CallWithSchema makes one chat-completion call enforcing a JSON schema.
-// Tries strict json_schema first; falls back permanently to json_object
-// when the endpoint refuses (e.g. DeepSeek, older mlx servers).
-func (b *Backend) CallWithSchema(
+func (b *OpenAIBackend) CallWithSchema(
 	ctx context.Context,
 	messages []openai.ChatCompletionMessage,
 	schema *jsonschema.Definition, schemaName string,
@@ -71,15 +82,13 @@ func (b *Backend) CallWithSchema(
 	return &resp, nil
 }
 
-func (b *Backend) setStrict(v bool) {
+func (b *OpenAIBackend) setStrict(v bool) {
 	b.mu.Lock()
 	b.strictOK = &v
 	b.mu.Unlock()
 }
 
-// Mode reports what the backend is doing now: "strict", "json_object",
-// or "unknown" before the first call decides.
-func (b *Backend) Mode() string {
+func (b *OpenAIBackend) Mode() string {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	if b.strictOK == nil {
@@ -90,3 +99,121 @@ func (b *Backend) Mode() string {
 	}
 	return "json_object"
 }
+
+// ── Claude Code headless CLI backend (`claude -p`) ────────────────────────
+//
+// One fresh CLI process per call. Multi-turn message history is flattened
+// into a single prompt with ROLE: labels — fine for the verify-loop case
+// where we replay <prev assistant>+<retry hint>. `--system-prompt` fully
+// replaces the default system prompt, suppressing CLAUDE.md auto-discovery
+// and auto-memory so the contender sees the same inputs as a blank API call.
+
+type ClaudeCLIBackend struct {
+	model  string
+	effort string
+}
+
+func NewClaudeCLIBackend(model, effort string) *ClaudeCLIBackend {
+	return &ClaudeCLIBackend{model: model, effort: effort}
+}
+
+type cliEnvelope struct {
+	Result           string          `json:"result"`
+	StructuredOutput json.RawMessage `json:"structured_output"`
+	SessionID        string          `json:"session_id"`
+	TotalCost        float64         `json:"total_cost_usd"`
+	IsError          bool            `json:"is_error"`
+	Usage            struct {
+		OutputTokens int `json:"output_tokens"`
+	} `json:"usage"`
+}
+
+func (b *ClaudeCLIBackend) CallWithSchema(
+	ctx context.Context,
+	messages []openai.ChatCompletionMessage,
+	schema *jsonschema.Definition, schemaName string,
+	_ int, _, _ float32,
+) (*openai.ChatCompletionResponse, error) {
+	var sys strings.Builder
+	var convo []string
+	for _, m := range messages {
+		switch m.Role {
+		case openai.ChatMessageRoleSystem:
+			if sys.Len() > 0 {
+				sys.WriteString("\n\n")
+			}
+			sys.WriteString(m.Content)
+		case openai.ChatMessageRoleUser:
+			convo = append(convo, "USER:\n"+m.Content)
+		case openai.ChatMessageRoleAssistant:
+			convo = append(convo, "ASSISTANT:\n"+m.Content)
+		}
+	}
+	prompt := strings.Join(convo, "\n\n")
+
+	schemaJSON, err := json.Marshal(schema)
+	if err != nil {
+		return nil, fmt.Errorf("marshal schema: %w", err)
+	}
+
+	args := []string{
+		"-p",
+		"--model", b.model,
+		"--effort", b.effort,
+		"--system-prompt", sys.String(),
+		"--json-schema", string(schemaJSON),
+		"--output-format", "json",
+		"--no-session-persistence",
+		"--dangerously-skip-permissions",
+		prompt,
+	}
+
+	cmd := exec.CommandContext(ctx, "claude", args...)
+	cmd.Stdin = bytes.NewReader(nil)
+	var stdout, stderr bytes.Buffer
+	cmd.Stdout = &stdout
+	cmd.Stderr = &stderr
+	if err := cmd.Run(); err != nil {
+		errOut := stderr.String()
+		if len(errOut) > 400 {
+			errOut = errOut[:400]
+		}
+		return nil, fmt.Errorf("claude -p failed: %v (stderr: %s)", err, strings.TrimSpace(errOut))
+	}
+
+	var env cliEnvelope
+	if err := json.Unmarshal(stdout.Bytes(), &env); err != nil {
+		raw := stdout.String()
+		if len(raw) > 400 {
+			raw = raw[:400]
+		}
+		return nil, fmt.Errorf("parse claude envelope: %w (raw: %q)", err, raw)
+	}
+	if env.IsError {
+		return nil, fmt.Errorf("claude -p returned is_error=true: %s", env.Result)
+	}
+
+	// With --json-schema set, the model's structured answer lands in
+	// `structured_output` and `result` is empty. Otherwise we fall back
+	// to `result` (free-form text).
+	content := env.Result
+	if len(env.StructuredOutput) > 0 && string(env.StructuredOutput) != "null" {
+		content = string(env.StructuredOutput)
+	}
+
+	return &openai.ChatCompletionResponse{
+		Choices: []openai.ChatCompletionChoice{{
+			Index: 0,
+			Message: openai.ChatCompletionMessage{
+				Role:    openai.ChatMessageRoleAssistant,
+				Content: content,
+			},
+			FinishReason: openai.FinishReasonStop,
+		}},
+		Usage: openai.Usage{
+			CompletionTokens: env.Usage.OutputTokens,
+		},
+	}, nil
+}
+
+func (b *ClaudeCLIBackend) Mode() string { return "claude-cli" }

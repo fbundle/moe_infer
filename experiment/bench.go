@@ -1,19 +1,17 @@
-// Three-axis reasoning bench. Bench definitions + orchestration only —
-// the chat-completion loop and OpenAI backend live in harness.go.
-//
-//   go run . --model vibethinker-3b-q4 --concurrency 2 --n 10 \
-//            --max-retries 5 --top-p 0.95 --max-tokens 40960 \
-//            --dump-dir ../data/bench_runs/test
+// Reasoning + decision-under-uncertainty + knowledge bench. Bench
+// definitions + orchestration only — the chat-completion loop and OpenAI
+// backend live in harness.go and backend.go.
 package main
 
 import (
 	"context"
 	"encoding/json"
-	"errors"
 	"flag"
 	"fmt"
+	"hash/fnv"
 	"io"
 	"log"
+	"math/rand"
 	"os"
 	"path/filepath"
 	"strings"
@@ -33,42 +31,62 @@ type Example[T any] struct {
 	Meta   map[string]any `json:"meta"`
 }
 
+// BenchSpec defines a bench. NewStep is called per example and returns
+// (a) the user-role prompt to start the conversation and (b) a stateful
+// step closure: given the assistant's latest content, either return a
+// final T (isFinal=true) or an intermediate hint string to feed back as
+// a system message (isFinal=false). Same shape handles single-shot
+// validation (parse fail → intermediate hint, parse OK → final) and
+// rollouts (env step → intermediate observation, env done → final).
 type BenchSpec[T any] struct {
 	Name         string
 	SystemPrompt string
 	Schema       *jsonschema.Definition
-	Validate     func(content string) (parsed T, hint string, err error)
+	NewStep      func(ex Example[T]) (userPrompt string, step func(content string) (final T, hint string, isFinal bool))
 	Score        func(parsed, gold T) (correct bool, extras map[string]any)
 }
 
 type Result[T any] struct {
-	ID       string                           `json:"id"`
-	Prompt   string                           `json:"prompt"`
-	Gold     T                                `json:"gold"`
-	Parsed   *T                               `json:"parsed"`
-	Correct  bool                             `json:"correct"`
-	Elapsed  float64                          `json:"elapsed"`
-	Error    string                           `json:"error"`
-	Meta     map[string]any                   `json:"meta"`
-	Extras   map[string]any                   `json:"extras"`
-	History  []openai.ChatCompletionResponse  `json:"history"`
-	Messages []openai.ChatCompletionMessage   `json:"messages"`
+	ID       string                          `json:"id"`
+	Prompt   string                          `json:"prompt"`
+	Gold     T                               `json:"gold"`
+	Parsed   *T                              `json:"parsed"`
+	Correct  bool                            `json:"correct"`
+	Elapsed  float64                         `json:"elapsed"`
+	Error    string                          `json:"error"`
+	Meta     map[string]any                  `json:"meta"`
+	Extras   map[string]any                  `json:"extras"`
+	History  []openai.ChatCompletionResponse `json:"history"`
+	Messages []openai.ChatCompletionMessage  `json:"messages"`
 }
 
-// ── Bench specs ───────────────────────────────────────────────────────────
+// ── Helpers ───────────────────────────────────────────────────────────────
 
-// Validator error sentinels. Validators return one of these as err (for
-// caller-side analytics) plus a free-form hint string (for the LLM).
-var (
-	ErrJSONParse = errors.New("json_parse")
-	ErrShape     = errors.New("shape_mismatch")
-	ErrEnum      = errors.New("enum_violation")
-)
+// extractLastJSON returns the last balanced {...} substring in s, or s
+// unchanged if none is found. Used in tolerant mode for non-thinking
+// models that wrap output in prose/markdown fences.
+func extractLastJSON(s string) string {
+	end := -1
+	depth := 0
+	for i := len(s) - 1; i >= 0; i-- {
+		switch s[i] {
+		case '}':
+			if depth == 0 {
+				end = i
+			}
+			depth++
+		case '{':
+			depth--
+			if depth == 0 && end >= 0 {
+				return s[i : end+1]
+			}
+		}
+	}
+	return s
+}
 
 // qwen3Assistant folds reasoning_content back into the assistant message
-// using <think>...</think> tags, so retries can see prior chain-of-thought.
-// Qwen3-family chat templates parse these tags natively; other model
-// families would need a different toAssistantMessage.
+// using <think>...</think> tags so subsequent turns see the prior CoT.
 func qwen3Assistant(r openai.ChatCompletionResponse) openai.ChatCompletionMessage {
 	msg := r.Choices[0].Message
 	content := msg.Content
@@ -80,6 +98,8 @@ func qwen3Assistant(r openai.ChatCompletionResponse) openai.ChatCompletionMessag
 		Content: content,
 	}
 }
+
+// ── ZebraLogic ────────────────────────────────────────────────────────────
 
 type ZebraOutput struct {
 	Header []string   `json:"header"`
@@ -102,23 +122,26 @@ func zebraBench() BenchSpec[ZebraOutput] {
 				"rows":   {Type: jsonschema.Array, Items: &jsonschema.Definition{Type: jsonschema.Array, Items: &jsonschema.Definition{Type: jsonschema.String}}},
 			},
 		},
-		Validate: func(c string) (ZebraOutput, string, error) {
-			var z ZebraOutput
-			if e := json.Unmarshal([]byte(c), &z); e != nil {
-				hint := fmt.Sprintf("invalid JSON: %v.\n"+
-					`Expected exactly: {"header": ["House","Name","Color",...], "rows": [["1","Alice","red",...], ["2","Bob","blue",...]]}.`+"\n"+
-					"Each row MUST be its own inner [...] array nested inside the outer rows array — do NOT write rows values as siblings of the rows array.", e)
-				return z, hint, ErrJSONParse
-			}
-			if len(z.Header) == 0 || len(z.Rows) == 0 {
-				return z, "header and rows must both be non-empty arrays", ErrShape
-			}
-			for i, r := range z.Rows {
-				if len(r) != len(z.Header) {
-					return z, fmt.Sprintf("row %d has %d cells but header has %d — every row must match the header length", i, len(r), len(z.Header)), ErrShape
+		NewStep: func(ex Example[ZebraOutput]) (string, func(string) (ZebraOutput, string, bool)) {
+			step := func(c string) (ZebraOutput, string, bool) {
+				var z ZebraOutput
+				if e := json.Unmarshal([]byte(c), &z); e != nil {
+					hint := fmt.Sprintf("invalid JSON: %v.\n"+
+						`Expected exactly: {"header": ["House","Name","Color",...], "rows": [["1","Alice","red",...], ["2","Bob","blue",...]]}.`+"\n"+
+						"Each row MUST be its own inner [...] array nested inside the outer rows array.", e)
+					return z, hint, false
 				}
+				if len(z.Header) == 0 || len(z.Rows) == 0 {
+					return z, "header and rows must both be non-empty arrays", false
+				}
+				for i, r := range z.Rows {
+					if len(r) != len(z.Header) {
+						return z, fmt.Sprintf("row %d has %d cells but header has %d", i, len(r), len(z.Header)), false
+					}
+				}
+				return z, "", true
 			}
-			return z, "", nil
+			return ex.Prompt, step
 		},
 		Score: func(p, g ZebraOutput) (bool, map[string]any) {
 			total, correct := 0, 0
@@ -139,56 +162,7 @@ func zebraBench() BenchSpec[ZebraOutput] {
 	}
 }
 
-// CladderOutput / GpqaOutput accept either a bare string (frozen-subset
-// gold format) or {"answer": ...} (validation format).
-
-type CladderOutput struct {
-	Answer string `json:"answer"`
-}
-
-func (c *CladderOutput) UnmarshalJSON(data []byte) error {
-	var s string
-	if err := json.Unmarshal(data, &s); err == nil {
-		c.Answer = s
-		return nil
-	}
-	type alias CladderOutput
-	var a alias
-	if err := json.Unmarshal(data, &a); err != nil {
-		return err
-	}
-	*c = CladderOutput(a)
-	return nil
-}
-
-func cladderBench() BenchSpec[CladderOutput] {
-	return BenchSpec[CladderOutput]{
-		Name: "cladder",
-		SystemPrompt: "Answer the causal-reasoning question. Respond with a single " +
-			`JSON object: {"answer": "yes"} or {"answer": "no"}.`,
-		Schema: &jsonschema.Definition{
-			Type:                 jsonschema.Object,
-			Required:             []string{"answer"},
-			AdditionalProperties: false,
-			Properties: map[string]jsonschema.Definition{
-				"answer": {Type: jsonschema.String, Enum: []string{"yes", "no"}},
-			},
-		},
-		Validate: func(c string) (CladderOutput, string, error) {
-			var o CladderOutput
-			if e := json.Unmarshal([]byte(c), &o); e != nil {
-				return o, fmt.Sprintf(`invalid JSON: %v. Expected exactly: {"answer": "yes"} or {"answer": "no"}`, e), ErrJSONParse
-			}
-			if o.Answer != "yes" && o.Answer != "no" {
-				return o, fmt.Sprintf(`answer must be lowercase "yes" or "no" (got %q). Re-emit: {"answer": "yes"} or {"answer": "no"}`, o.Answer), ErrEnum
-			}
-			return o, "", nil
-		},
-		Score: func(p, g CladderOutput) (bool, map[string]any) {
-			return strings.EqualFold(strings.TrimSpace(p.Answer), strings.TrimSpace(g.Answer)), nil
-		},
-	}
-}
+// ── GPQA-Diamond ──────────────────────────────────────────────────────────
 
 type GpqaOutput struct {
 	Answer string `json:"answer"`
@@ -222,15 +196,18 @@ func gpqaBench() BenchSpec[GpqaOutput] {
 				"answer": {Type: jsonschema.String, Enum: []string{"A", "B", "C", "D"}},
 			},
 		},
-		Validate: func(c string) (GpqaOutput, string, error) {
-			var o GpqaOutput
-			if e := json.Unmarshal([]byte(c), &o); e != nil {
-				return o, fmt.Sprintf(`invalid JSON: %v. Expected exactly: {"answer": "A"} (or B, C, D)`, e), ErrJSONParse
+		NewStep: func(ex Example[GpqaOutput]) (string, func(string) (GpqaOutput, string, bool)) {
+			step := func(c string) (GpqaOutput, string, bool) {
+				var o GpqaOutput
+				if e := json.Unmarshal([]byte(c), &o); e != nil {
+					return o, fmt.Sprintf(`invalid JSON: %v. Expected exactly: {"answer": "A"} (or B, C, D)`, e), false
+				}
+				if len(o.Answer) != 1 || !strings.ContainsRune("ABCD", rune(o.Answer[0])) {
+					return o, fmt.Sprintf(`answer must be a single letter A, B, C, or D (got %q)`, o.Answer), false
+				}
+				return o, "", true
 			}
-			if len(o.Answer) != 1 || !strings.ContainsRune("ABCD", rune(o.Answer[0])) {
-				return o, fmt.Sprintf(`answer must be a single letter A, B, C, or D (got %q). Re-emit: {"answer": "A"}`, o.Answer), ErrEnum
-			}
-			return o, "", nil
+			return ex.Prompt, step
 		},
 		Score: func(p, g GpqaOutput) (bool, map[string]any) {
 			return strings.EqualFold(p.Answer, g.Answer), nil
@@ -238,50 +215,125 @@ func gpqaBench() BenchSpec[GpqaOutput] {
 	}
 }
 
-// KalshiOutput — single float probability ∈ [0, 1]. Gold uses the same
-// shape: P=1.0 for "yes", P=0.0 for "no" (set during subset freezing).
+// ── K-armed Bernoulli bandit (decision under uncertainty) ─────────────────
 
-type KalshiOutput struct {
-	Probability float64 `json:"probability"`
+// BanditRow's Gold = {K, Probs}; the rollout trace is {Actions, Rewards}.
+// T (rounds per game) is a spec-level constant. Rewards are sampled at
+// step time from a per-example seeded RNG so runs are reproducible
+// across models without storing a reward table in the data.
+type BanditRow struct {
+	K       int       `json:"K"`
+	Probs   []float64 `json:"probs"`
+	Actions []int     `json:"actions,omitempty"`
+	Rewards []int     `json:"rewards,omitempty"`
 }
 
-func kalshiBench() BenchSpec[KalshiOutput] {
-	return BenchSpec[KalshiOutput]{
-		Name: "kalshi",
-		SystemPrompt: "You are a calibrated forecaster. Estimate the probability of the " +
-			"event resolving YES using all available reasoning. Respond with a single " +
-			`JSON object: {"probability": <number between 0 and 1 inclusive>}.`,
+const banditT = 30 // rounds per game
+
+func banditBench() BenchSpec[BanditRow] {
+	return BenchSpec[BanditRow]{
+		Name: "bandit",
+		SystemPrompt: "You play a multi-armed bandit game. Each arm has a fixed but " +
+			"unknown success probability. On every round you pick one arm and observe " +
+			"a Bernoulli reward (0 or 1). Maximize total reward over the full game.",
 		Schema: &jsonschema.Definition{
 			Type:                 jsonschema.Object,
-			Required:             []string{"probability"},
+			Required:             []string{"action"},
 			AdditionalProperties: false,
 			Properties: map[string]jsonschema.Definition{
-				"probability": {Type: jsonschema.Number},
+				"action": {Type: jsonschema.Integer},
 			},
 		},
-		Validate: func(c string) (KalshiOutput, string, error) {
-			var o KalshiOutput
-			if e := json.Unmarshal([]byte(c), &o); e != nil {
-				return o, fmt.Sprintf(`invalid JSON: %v. Expected exactly: {"probability": <float in [0,1]>}`, e), ErrJSONParse
+		NewStep: func(ex Example[BanditRow]) (string, func(string) (BanditRow, string, bool)) {
+			env := ex.Gold
+			state := BanditRow{K: env.K, Probs: env.Probs}
+			// Per-example deterministic RNG seeded by ID hash → identical
+			// reward streams across model runs without storing a table.
+			h := fnv.New64a()
+			h.Write([]byte(ex.ID))
+			envRng := rand.New(rand.NewSource(int64(h.Sum64())))
+
+			userPrompt := fmt.Sprintf(
+				"Game: %d arms (numbered 1..%d), %d rounds total. Each arm's success "+
+					"probability is fixed for the whole game but unknown to you. "+
+					"Reward each round is 0 or 1.\n\n"+
+					"Respond each round with a single JSON object: {\"action\": <int 1..%d>}.\n\n"+
+					"Round 1 / %d. Which arm?", env.K, env.K, banditT, env.K, banditT)
+
+			step := func(c string) (BanditRow, string, bool) {
+				var act struct {
+					Action int `json:"action"`
+				}
+				if e := json.Unmarshal([]byte(c), &act); e != nil {
+					return state, fmt.Sprintf(`invalid JSON: %v. Expected: {"action": <int 1..%d>}`, e, env.K), false
+				}
+				if act.Action < 1 || act.Action > env.K {
+					return state, fmt.Sprintf("action must be in 1..%d (got %d)", env.K, act.Action), false
+				}
+				round := len(state.Actions) // 0-indexed round we're resolving
+				reward := 0
+				if envRng.Float64() < env.Probs[act.Action-1] {
+					reward = 1
+				}
+				state.Actions = append(state.Actions, act.Action)
+				state.Rewards = append(state.Rewards, reward)
+				if len(state.Actions) >= banditT {
+					return state, "", true
+				}
+				next := len(state.Actions) + 1
+				return state, fmt.Sprintf(
+					"Round %d result: arm %d → reward %d.\n"+
+						"Round %d / %d. Which arm?",
+					round+1, act.Action, reward, next, banditT), false
 			}
-			if o.Probability < 0.0 || o.Probability > 1.0 {
-				return o, fmt.Sprintf(`probability must be in [0, 1] (got %v). Re-emit: {"probability": 0.7}`, o.Probability), ErrEnum
-			}
-			return o, "", nil
+			return userPrompt, step
 		},
-		// Score: Brier per row, "correct" = threshold-0.5 prediction matches gold.
-		Score: func(p, g KalshiOutput) (bool, map[string]any) {
-			diff := p.Probability - g.Probability
-			brier := diff * diff
-			thresholdMatch := (p.Probability > 0.5) == (g.Probability > 0.5)
-			return thresholdMatch, map[string]any{"brier": brier, "probability": p.Probability}
+		Score: func(p, g BanditRow) (bool, map[string]any) {
+			optimal := 0.0
+			meanArm := 0.0
+			for _, pr := range g.Probs {
+				if pr > optimal {
+					optimal = pr
+				}
+				meanArm += pr
+			}
+			meanArm /= float64(len(g.Probs))
+			uniformInstantRegret := optimal - meanArm
+
+			// Sum instantaneous regret over all banditT rounds. Rounds
+			// played count their actual regret; rounds skipped (budget /
+			// step cap exhausted) are filled with the uniform-random
+			// regret, so truncation is penalized.
+			totalRegret := 0.0
+			for _, a := range p.Actions {
+				totalRegret += optimal - g.Probs[a-1]
+			}
+			unplayed := banditT - len(p.Actions)
+			if unplayed < 0 {
+				unplayed = 0
+			}
+			totalRegret += float64(unplayed) * uniformInstantRegret
+			meanRegret := totalRegret / float64(banditT)
+
+			totalReward := 0
+			for _, r := range p.Rewards {
+				totalReward += r
+			}
+			return meanRegret < uniformInstantRegret, map[string]any{
+				"mean_regret":    meanRegret,
+				"uniform_regret": uniformInstantRegret,
+				"optimal_p":      optimal,
+				"total_reward":   totalReward,
+				"rounds_played":  len(p.Actions),
+				"rounds_skipped": unplayed,
+			}
 		},
 	}
 }
 
 // ── runBench + runOne ─────────────────────────────────────────────────────
 
-func runBench[T any](ctx context.Context, b *Backend, spec BenchSpec[T],
+func runBench[T any](ctx context.Context, b Backend, spec BenchSpec[T],
 	examples []Example[T], dumpPath string, opts Opts) {
 
 	done := loadDoneIDs(dumpPath)
@@ -337,9 +389,9 @@ func runBench[T any](ctx context.Context, b *Backend, spec BenchSpec[T],
 		line, _ := json.Marshal(r)
 		dumpF.Write(line)
 		dumpF.Write([]byte("\n"))
-		fmt.Printf("  %s %3d/%d  id=%-14s  %5.1fs  attempts=%d  tokens=%d\n",
+		fmt.Printf("  %s %3d/%d  id=%-14s  %5.1fs  steps=%d  tokens=%d\n",
 			mark, doneCount, len(examples), r.ID, r.Elapsed,
-			intOr(r.Extras["attempts"], 1), intOr(r.Extras["tokens_used"], 0))
+			intOr(r.Extras["steps"], 1), intOr(r.Extras["tokens_used"], 0))
 	}
 
 	if stats["total"] > 0 {
@@ -349,28 +401,33 @@ func runBench[T any](ctx context.Context, b *Backend, spec BenchSpec[T],
 	}
 }
 
-func runOne[T any](ctx context.Context, b *Backend, spec BenchSpec[T],
+func runOne[T any](ctx context.Context, b Backend, spec BenchSpec[T],
 	ex Example[T], opts Opts) Result[T] {
 
 	t0 := time.Now()
+	userPrompt, step := spec.NewStep(ex)
+	if opts.TolerantJSON {
+		inner := step
+		step = func(c string) (T, string, bool) { return inner(extractLastJSON(c)) }
+	}
 	initial := []openai.ChatCompletionMessage{
 		{Role: openai.ChatMessageRoleSystem, Content: spec.SystemPrompt},
-		{Role: openai.ChatMessageRoleUser, Content: ex.Prompt},
+		{Role: openai.ChatMessageRoleUser, Content: userPrompt},
 	}
 	completion := func(c context.Context, m []openai.ChatCompletionMessage, maxTok int) (*openai.ChatCompletionResponse, error) {
 		return b.CallWithSchema(c, m, spec.Schema, spec.Name+"_output",
 			maxTok, opts.Temperature, opts.TopP)
 	}
 	parsed, history, err := ChatCompletionLoop(ctx, initial, completion,
-		qwen3Assistant, spec.Validate, opts.MaxRetries, opts.MaxTokens)
+		qwen3Assistant, step, opts.MaxSteps, opts.MaxTokens)
 
 	r := Result[T]{
-		ID: ex.ID, Prompt: ex.Prompt, Gold: ex.Gold, Meta: ex.Meta,
+		ID: ex.ID, Prompt: userPrompt, Gold: ex.Gold, Meta: ex.Meta,
 		Elapsed:  time.Since(t0).Seconds(),
 		History:  history.Responses, Messages: history.Messages,
 	}
 	extras := map[string]any{
-		"attempts":    len(history.Responses),
+		"steps":       len(history.Responses),
 		"exit_reason": string(history.Reason),
 		"mode":        b.Mode(),
 	}
@@ -381,23 +438,15 @@ func runOne[T any](ctx context.Context, b *Backend, spec BenchSpec[T],
 			extras["finish"] = string(last.Choices[0].FinishReason)
 		}
 	}
-	if err == nil {
+	if err == nil && history.Reason == ExitOK {
 		r.Parsed = &parsed
 		ok, sx := spec.Score(parsed, ex.Gold)
 		r.Correct = ok
 		for k, v := range sx {
 			extras[k] = v
 		}
-	} else {
+	} else if err != nil {
 		r.Error = err.Error()
-		switch {
-		case errors.Is(err, ErrJSONParse):
-			extras["validate_code"] = "json_parse"
-		case errors.Is(err, ErrShape):
-			extras["validate_code"] = "shape_mismatch"
-		case errors.Is(err, ErrEnum):
-			extras["validate_code"] = "enum_violation"
-		}
 	}
 	r.Extras = extras
 	return r
@@ -459,14 +508,16 @@ func intOr(v any, def int) int {
 	return def
 }
 
+
 // ── main ──────────────────────────────────────────────────────────────────
 
 type Opts struct {
-	Concurrency, MaxTokens, MaxRetries int
-	Temperature, TopP                  float32
+	Concurrency, MaxTokens, MaxSteps int
+	Temperature, TopP                float32
+	TolerantJSON                     bool
 }
 
-func runNamed[T any](ctx context.Context, b *Backend, spec BenchSpec[T],
+func runNamed[T any](ctx context.Context, b Backend, spec BenchSpec[T],
 	subsetsDir, dumpPath string, n int, opts Opts) {
 	exs, err := loadSubset[T](subsetsDir, spec.Name, n)
 	if err != nil {
@@ -483,21 +534,31 @@ func main() {
 	maxTokens := flag.Int("max-tokens", 40960, "per-call token budget")
 	temperature := flag.Float64("temperature", 1.0, "sampling temperature")
 	topP := flag.Float64("top-p", 0.95, "nucleus sampling cutoff")
-	maxRetries := flag.Int("max-retries", 5, "verify-loop retries on parse fail")
+	maxSteps := flag.Int("max-steps", 30, "loop safety cap (env steps + retries)")
+	tolerantJSON := flag.Bool("tolerant-json", false, "extract last {...} block from content (for non-thinking models that wrap output)")
 	n := flag.Int("n", 0, "cap per axis (0 = all)")
-	benches := flag.String("benches", "zebralogic,kalshi,gpqa_diamond", "comma list")
+	benches := flag.String("benches", "zebralogic,bandit,gpqa_diamond", "comma list")
 	subsetsDir := flag.String("subsets-dir", "../data/bench_subsets", "frozen subset dir")
 	dumpDir := flag.String("dump-dir", "../data/bench_runs/go-bench", "output dir")
+	backendKind := flag.String("backend", "openai", "openai | claude-cli")
+	cliEffort := flag.String("cli-effort", "medium", "claude -p --effort (low|medium|high|xhigh|max)")
 	flag.Parse()
 
 	if err := os.MkdirAll(*dumpDir, 0o755); err != nil {
 		log.Fatalf("mkdir dump: %v", err)
 	}
 	opts := Opts{
-		Concurrency: *concurrency, MaxTokens: *maxTokens, MaxRetries: *maxRetries,
+		Concurrency: *concurrency, MaxTokens: *maxTokens, MaxSteps: *maxSteps,
 		Temperature: float32(*temperature), TopP: float32(*topP),
+		TolerantJSON: *tolerantJSON,
 	}
-	backend := NewBackend(*baseURL, *apiKey, *model)
+	var backend Backend
+	switch *backendKind {
+	case "claude-cli":
+		backend = NewClaudeCLIBackend(*model, *cliEffort)
+	default:
+		backend = NewOpenAIBackend(*baseURL, *apiKey, *model)
+	}
 	ctx := context.Background()
 
 	dumpFor := func(name string) string {
@@ -510,10 +571,8 @@ func main() {
 		switch name {
 		case "zebralogic":
 			runNamed(ctx, backend, zebraBench(), *subsetsDir, dumpFor(name), *n, opts)
-		case "cladder":
-			runNamed(ctx, backend, cladderBench(), *subsetsDir, dumpFor(name), *n, opts)
-		case "kalshi":
-			runNamed(ctx, backend, kalshiBench(), *subsetsDir, dumpFor(name), *n, opts)
+		case "bandit":
+			runNamed(ctx, backend, banditBench(), *subsetsDir, dumpFor(name), *n, opts)
 		case "gpqa_diamond":
 			runNamed(ctx, backend, gpqaBench(), *subsetsDir, dumpFor(name), *n, opts)
 		default:

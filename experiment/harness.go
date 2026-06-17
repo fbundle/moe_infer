@@ -16,7 +16,7 @@ type LoopExitReason string
 const (
 	ExitOK              LoopExitReason = "ok"
 	ExitInvalidInput    LoopExitReason = "invalid_input"
-	ExitMaxRetries      LoopExitReason = "max_retries_reached"
+	ExitMaxSteps        LoopExitReason = "max_steps_reached"
 	ExitBudgetExhausted LoopExitReason = "budget_exhausted"
 	ExitCallError       LoopExitReason = "call_error" // completion func returned err/nil
 )
@@ -36,73 +36,73 @@ func budgetMessage(remainingTokens int) openai.ChatCompletionMessage {
 	}
 }
 
-func errorMessage(content string) openai.ChatCompletionMessage {
+func envMessage(content string) openai.ChatCompletionMessage {
 	return openai.ChatCompletionMessage{
 		Role:    openai.ChatMessageRoleSystem,
 		Content: content,
 	}
 }
 
+// ChatCompletionLoop drives an agent loop. The caller supplies a `step`
+// function that the loop calls with the assistant's latest content. Step
+// either returns a final value (isFinal=true) or an intermediate
+// environment message (isFinal=false) which gets fed back as a system
+// message for the next turn.
+//
+// Same signature handles single-shot benches (step parses output; isFinal
+// on valid parse, retry-hint on parse failure) and rollouts (step
+// advances env state, returns intermediate "round t observation" or
+// final summary).
+//
+// maxSteps is a safety cap — loop aborts with ExitMaxSteps if step never
+// returns isFinal within that many calls.
 func ChatCompletionLoop[T any](
 	ctx context.Context,
 	initial []openai.ChatCompletionMessage,
 	completion func(ctx context.Context, messages []openai.ChatCompletionMessage, maxCompletionTokens int) (*openai.ChatCompletionResponse, error),
-	toAssistantMessage func(openai.ChatCompletionResponse) openai.ChatCompletionMessage, // model-specific (e.g. Qwen3 <think> wrapping)
-	validate func(string) (T, string, error), // (parsed, hint-for-LLM, err-for-caller)
-	maxRetries int,
+	toAssistantMessage func(openai.ChatCompletionResponse) openai.ChatCompletionMessage,
+	step func(content string) (final T, hint string, isFinal bool),
+	maxSteps int,
 	maxCompletionTokens int,
 ) (o T, h History, err error) {
-	if maxRetries < 0 {
+	if maxSteps <= 0 {
 		h.Reason = ExitInvalidInput
-		return o, h, errors.New("maxTries must be non-negative")
+		return o, h, errors.New("maxSteps must be positive")
 	}
 	if maxCompletionTokens <= 0 {
 		h.Reason = ExitInvalidInput
-		return o, h, errors.New("maxCompletionTokens must positive")
+		return o, h, errors.New("maxCompletionTokens must be positive")
 	}
 	remainingTokens := maxCompletionTokens
-	reaminingRetries := maxRetries
-	h = History{
-		Messages:  slices.Clone(initial),
-		Responses: nil,
-	}
-	var lastValidateErr error // surfaced as err when we run out
+	remainingSteps := maxSteps
+	h = History{Messages: slices.Clone(initial)}
 
 	for {
 		if remainingTokens == 0 {
 			h.Reason = ExitBudgetExhausted
-			return o, h, lastValidateErr
+			return o, h, nil
 		}
-		if reaminingRetries == 0 {
-			h.Reason = ExitMaxRetries
-			return o, h, lastValidateErr
+		if remainingSteps == 0 {
+			h.Reason = ExitMaxSteps
+			return o, h, nil
 		}
-		// add budget hint
 		h.Messages = append(h.Messages, budgetMessage(remainingTokens))
-		// make call
 		r, err := completion(ctx, h.Messages, remainingTokens)
 		if err != nil || r == nil {
-			// not recoverable
 			h.Reason = ExitCallError
 			return o, h, err
 		}
-		// make call success, update history.
-		// Caller's toAssistantMessage decides how to fold reasoning_content back
-		// into the next turn — Qwen3 uses <think>...</think>, others may
-		// pass it through reasoning_content, others drop it entirely.
 		h.Responses = append(h.Responses, *r)
 		h.Messages = append(h.Messages, toAssistantMessage(*r))
-		// validate
-		var hint string
-		o, hint, err = validate(r.Choices[0].Message.Content)
-		if err == nil { // validate success
+
+		final, hint, isFinal := step(r.Choices[0].Message.Content)
+		if isFinal {
 			h.Reason = ExitOK
-			return o, h, nil
+			return final, h, nil
 		}
-		// retry loop — hint is LLM-facing, err is caller-facing
-		lastValidateErr = err
-		h.Messages = append(h.Messages, errorMessage(hint))
-		reaminingRetries -= 1
+		// Intermediate: feed hint back as a system message and continue.
+		h.Messages = append(h.Messages, envMessage(hint))
+		remainingSteps--
 		remainingTokens -= r.Usage.CompletionTokens
 	}
 }
