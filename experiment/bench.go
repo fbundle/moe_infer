@@ -94,8 +94,9 @@ func zebraBench() BenchSpec[ZebraOutput] {
 			`  {"header": ["House", "<attr1>", ...], "rows": [["1", "...", ...], ...]}` + "\n" +
 			"Use the exact attribute values from the puzzle.",
 		Schema: &jsonschema.Definition{
-			Type:     jsonschema.Object,
-			Required: []string{"header", "rows"},
+			Type:                 jsonschema.Object,
+			Required:             []string{"header", "rows"},
+			AdditionalProperties: false,
 			Properties: map[string]jsonschema.Definition{
 				"header": {Type: jsonschema.Array, Items: &jsonschema.Definition{Type: jsonschema.String}},
 				"rows":   {Type: jsonschema.Array, Items: &jsonschema.Definition{Type: jsonschema.Array, Items: &jsonschema.Definition{Type: jsonschema.String}}},
@@ -166,8 +167,9 @@ func cladderBench() BenchSpec[CladderOutput] {
 		SystemPrompt: "Answer the causal-reasoning question. Respond with a single " +
 			`JSON object: {"answer": "yes"} or {"answer": "no"}.`,
 		Schema: &jsonschema.Definition{
-			Type:     jsonschema.Object,
-			Required: []string{"answer"},
+			Type:                 jsonschema.Object,
+			Required:             []string{"answer"},
+			AdditionalProperties: false,
 			Properties: map[string]jsonschema.Definition{
 				"answer": {Type: jsonschema.String, Enum: []string{"yes", "no"}},
 			},
@@ -213,8 +215,9 @@ func gpqaBench() BenchSpec[GpqaOutput] {
 		SystemPrompt: "Answer the multiple-choice question. Respond with a single " +
 			`JSON object: {"answer": "A"} or "B", "C", "D".`,
 		Schema: &jsonschema.Definition{
-			Type:     jsonschema.Object,
-			Required: []string{"answer"},
+			Type:                 jsonschema.Object,
+			Required:             []string{"answer"},
+			AdditionalProperties: false,
 			Properties: map[string]jsonschema.Definition{
 				"answer": {Type: jsonschema.String, Enum: []string{"A", "B", "C", "D"}},
 			},
@@ -328,6 +331,7 @@ func runOne[T any](ctx context.Context, b *Backend, spec BenchSpec[T],
 	extras := map[string]any{
 		"attempts":    len(history.Responses),
 		"exit_reason": string(history.Reason),
+		"mode":        b.Mode(),
 	}
 	if n := len(history.Responses); n > 0 {
 		last := history.Responses[n-1]

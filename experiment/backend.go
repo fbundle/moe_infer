@@ -76,3 +76,17 @@ func (b *Backend) setStrict(v bool) {
 	b.strictOK = &v
 	b.mu.Unlock()
 }
+
+// Mode reports what the backend is doing now: "strict", "json_object",
+// or "unknown" before the first call decides.
+func (b *Backend) Mode() string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if b.strictOK == nil {
+		return "unknown"
+	}
+	if *b.strictOK {
+		return "strict"
+	}
+	return "json_object"
+}
