@@ -28,8 +28,8 @@ Canonical baseline subset (id + prompt + gold per example) frozen at `data/bench
 
 | Model | Quant | ZebraLogic | CLadder (R2 / R3) | GPQA-D |
 |---|---|---|---|---|
-| **deepseek-v4-flash** | API (fp) | **98.8%** (79/80, 0 parse-fail) | **83.5%** (167/200; R2 90 / R3 77) | **83.8%** (166/198, 0 truncated) |
-| **VibeThinker-3B** | mixed_4_6 (4.77 bpw) | _in progress_ | _pending_ | _pending_ |
+| **deepseek-v4-flash** | API (fp) | 100% (64/64) | _pending_ | _pending_ |
+| **VibeThinker-3B** | mixed_4_6 (4.77 bpw) | 70.2% (33/47) | _pending_ | _pending_ |
 | **Qwen3.5-4B** | mlx q4 (~4.5 bpw) | _pending_ | _pending_ | _pending_ |
 | **LFM2.5-8B-A1B** (~1B active) | mlx q8 (~8.5 bpw) | _pending_ | _pending_ | _pending_ |
 | DeepSeek-R1 | API | 78.7% | 72.3% / 55.1% | 71-73% |
@@ -41,12 +41,21 @@ Canonical baseline subset (id + prompt + gold per example) frozen at `data/bench
 | GPT-4 (CLadder paper) | API | — | 62% / 70.4% w/ CausalCoT | ~36% |
 | Random / human PhD expert | — | ~0% / — | 50% / — | 25% / ~65% |
 
-**Our local run config (all rows above marked "ours"):** oMLX continuous-batching server, concurrency=2, `temperature=1.0`, `top_p=0.95`, `max_tokens=40960`, `max_retries=5` with reasoning-replay verify loop, `response_format=json_schema` strict (`additionalProperties:false`, all-required; oMLX accepts but does not constrain).
+**Common run config (all "ours" rows):** verify loop with reasoning-replay (`<think>...</think>`), `max_retries=5`, `response_format=json_schema` strict (`additionalProperties:false`, all-required; oMLX accepts but does not constrain).
+
+**Per-model recommended decode (from each model card):**
+
+| Model | temperature | top_p | top_k | max_tokens | notes |
+|---|---|---|---|---|---|
+| VibeThinker-3B | 1.0 | 0.95 | — | 40960 | oMLX, conc=2 |
+| Qwen3.5-4B | 0.6 | 0.95 | 20 | 40960 | thinking mode (Qwen3 family default); oMLX, conc=2 |
+| LFM2.5-8B-A1B | 0.2 | 1.0 | — | 40960 | model-card recommended (`temperature: 0.2`); oMLX, conc=2 |
+| deepseek-v4-flash | 1.0 | 0.95 | — | 32768 | DeepSeek `/v1` API, conc=16 |
 
 ## Notes
 
 - **oMLX does not enforce `response_format`.** Direct probe confirms `json_schema` strict mode is accepted but unconstrained server-side — output discipline is intrinsic to the model. Our Backend still sends strict + `additionalProperties: false`/required-all (for any future server that honors it).
-- **Retry loop is a free win on bracket/shape bugs.** Verify-loop replays reasoning into `<think>…</think>` so the model patches malformed JSON instead of re-deriving the answer (which can flip a correct row to wrong at temp=1.0). Recovery rate ~50% on json_parse/shape_mismatch failures.
+- **Retry loop is a free win on bracket/shape bugs.** Verify-loop replays reasoning into `<think>…</think>` so the model patches malformed JSON instead of re-deriving the answer (which can flip a correct row to wrong at temp=1.0). On VibeThinker-3B mixed_4_6, ZL first-attempt accuracy is 53.2% (25/47) vs 70.2% (33/47) final — retry lift +17pp, ~50% recovery on the 16 first-attempt failures, 7 hit max_retries.
 - **Rung 3 (counterfactual) collapse** is CLadder's diagnostic signal — strong models lose 10-30pp from rung 2 (DeepSeek 90 → 77).
 - **`max_tokens=32k+` recovered the literature GPQA number** (83.8% vs 88.1% reported), zero truncations; the prior 16k run truncated 24%.
 
