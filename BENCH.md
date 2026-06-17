@@ -26,7 +26,7 @@ Harness: `experiment/bench.go` (sashabaranov + verify-loop with reasoning replay
 |---|---|---|---|---|
 | **deepseek-v4-flash** | API | 100% (80/80) | 0.228 | 83.3% (165/198) |
 | **deepseek-v4-pro** | API | 100% (80/80) | 0.225 | 82.8% (164/198) |
-| **VibeThinker-3B** | mixed_4_6 (4.77 bpw) | 67.6% (50/74) | pending | pending |
+| **VibeThinker-3B** | mixed_4_6 (4.77 bpw) | 67.5% (52/77) | pending | pending |
 | **Qwen3.5-4B** | mlx q4 (~4.5 bpw) | pending | pending | pending |
 | **LFM2.5-8B-A1B** (~1B active) | mlx q8 (~8.5 bpw) | pending | pending | pending |
 | Claude Opus 4.5 | API | — | 0.227 | 87.0% |
@@ -49,7 +49,7 @@ ZL public numbers are the paper's *Overall* (all sizes 2×2 → 6×6). Our 80-ro
 ## Notes
 
 - **oMLX does not enforce `response_format`.** Direct probe confirms strict `json_schema` is accepted but unconstrained — output discipline is intrinsic to the model.
-- **Retry loop is a free win on shape bugs.** Verify-loop replays the prior turn wrapped as `<think>{reasoning_content}</think>{content}` so the model patches malformed JSON instead of re-deriving (re-derivation at temp=1.0 routinely flips correct → wrong). VibeThinker ZL: first-attempt 52.7% → final 67.6% (+15pp).
+- **Retry loop is a free win on shape bugs.** Verify-loop replays the prior turn wrapped as `<think>{reasoning_content}</think>{content}` so the model patches malformed JSON instead of re-deriving (re-derivation at temp=1.0 routinely flips correct → wrong). VibeThinker ZL: first-attempt 51.9% → final 67.5% (+16pp).
 - **No tool calls.** RL-on-text reasoning models (VibeThinker family) read the tool definitions, reason about them in `content`, never emit `<tool_call>`. Chat template still carries the slots but RL trained the emission away.
 - **Kalshi Brier = squared error, lower is better** (column header `↓`). 0 = perfect, 0.25 = uninformed (always 0.5), 1.0 = maximally wrong. Always-0.5 baseline = 0.250; superforecasters reach ~0.10; frontier LLMs cluster near 0.22–0.23 — slightly better than uninformed. **Anything > 0.25 is worse than guessing** (e.g. DeepSeek-V3.2 0.339, GPT-5.2-XHigh 0.433).
 - **`max_tokens=32k+` is needed for GPQA** — at 16k VibeThinker/DeepSeek truncated ~24%.
