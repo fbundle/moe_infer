@@ -6,9 +6,11 @@ Pure-reasoning prompts on three orthogonal axes:
 - **Probabilistic** — CLadder (causal queries, Pearl's hierarchy)
 - **Knowledge** — GPQA-Diamond (graduate-level science MC)
 
-JSON output via `response_format` (strict `json_schema`, fallback `json_object`). Pydantic-validated; empty `content` → `no_answer` (no `reasoning_content` scraping — random-chance credit). Per-example JSONL streams to `data/bench_runs/{model}__{bench}.jsonl` and rerunning resumes.
+JSON output via `response_format` (strict `json_schema`, fallback `json_object`). Schema-validated; `no_answer` is scored as wrong (no carve-out). Per-example JSONL streams to `data/bench_runs/{model}__{bench}.jsonl` and rerunning resumes.
 
-`moe_infer/helpers/bench_axes.py`.
+Two harnesses (interchangeable, same JSONL schema):
+- `moe_infer/helpers/bench_axes.py` — async-openai + pydantic
+- `experiment/bench.go` — sashabaranov/go-openai, sequential verify-loop with reasoning replay (`<think>` wrap), per-row `extras.{mode,exit_reason,validate_code,attempts}`
 
 ## Method
 
@@ -24,25 +26,29 @@ Canonical baseline subset (id + prompt + gold per example) frozen at `data/bench
 
 **Ours** in **bold**. Other rows are public reports (full-set, usually 5-shot CoT). CLadder rung-2 / rung-3 split shown where available.
 
-| Model | ZebraLogic | CLadder (R2 / R3) | GPQA-D |
-|---|---|---|---|
-| **deepseek-v4-flash** (32k) | **98.8%** (79/80, 0 parse-fail) | **83.5%** (167/200; R2 90 / R3 77) | **83.8%** (166/198, 0 truncated) |
-| **VibeThinker-3B q4** (4.77 bpw, redoing with retries, top_p=0.95, max_tokens=40960, max_retries=5) | _pending_ | _pending_ | _pending_ |
-| **VibeThinker-3B q8** (8.5 bpw, queued) | _pending_ | _pending_ | _pending_ |
-| DeepSeek-R1 | 78.7% | 72.3% / 55.1% | 71-73% |
-| Claude Sonnet 4 | — | 81.2% / 63.4% | — |
-| o4-mini-high | — | 73.2% / 58.8% | — |
-| o1 | 81.0% | — | ~78% |
-| Claude 3.5 Sonnet | 33.4% (all) / 12.4% (hard) | — | 59-65% |
-| GPT-4o | 31.7% | — | 50-53% |
-| GPT-4 (CLadder paper) | — | 62% overall, 70.4% w/ CausalCoT | ~36% |
-| Random / human PhD expert | ~0% / — | 50% / — | 25% / ~65% |
+| Model | Quant | ZebraLogic | CLadder (R2 / R3) | GPQA-D |
+|---|---|---|---|---|
+| **deepseek-v4-flash** | API (fp) | **98.8%** (79/80, 0 parse-fail) | **83.5%** (167/200; R2 90 / R3 77) | **83.8%** (166/198, 0 truncated) |
+| **VibeThinker-3B** | mixed_4_6 (4.77 bpw) | _in progress_ | _pending_ | _pending_ |
+| **Qwen3.5-4B** | mlx q4 (~4.5 bpw) | _pending_ | _pending_ | _pending_ |
+| **LFM2.5-8B-A1B** (~1B active) | mlx q8 (~8.5 bpw) | _pending_ | _pending_ | _pending_ |
+| DeepSeek-R1 | API | 78.7% | 72.3% / 55.1% | 71-73% |
+| Claude Sonnet 4 | API | — | 81.2% / 63.4% | — |
+| o4-mini-high | API | — | 73.2% / 58.8% | — |
+| o1 | API | 81.0% | — | ~78% |
+| Claude 3.5 Sonnet | API | 33.4% (all) / 12.4% (hard) | — | 59-65% |
+| GPT-4o | API | 31.7% | — | 50-53% |
+| GPT-4 (CLadder paper) | API | — | 62% / 70.4% w/ CausalCoT | ~36% |
+| Random / human PhD expert | — | ~0% / — | 50% / — | 25% / ~65% |
+
+**Our local run config (all rows above marked "ours"):** oMLX continuous-batching server, concurrency=2, `temperature=1.0`, `top_p=0.95`, `max_tokens=40960`, `max_retries=5` with reasoning-replay verify loop, `response_format=json_schema` strict (`additionalProperties:false`, all-required; oMLX accepts but does not constrain).
 
 ## Notes
 
-- **Grammar enforcement is the bottleneck on local eval.** Neither our engine nor oMLX/mlx-lm.server grammar-constrains; weak models drift from strict JSON at ~30% rate, all scored `no_answer`.
+- **oMLX does not enforce `response_format`.** Direct probe confirms `json_schema` strict mode is accepted but unconstrained server-side — output discipline is intrinsic to the model. Our Backend still sends strict + `additionalProperties: false`/required-all (for any future server that honors it).
+- **Retry loop is a free win on bracket/shape bugs.** Verify-loop replays reasoning into `<think>…</think>` so the model patches malformed JSON instead of re-deriving the answer (which can flip a correct row to wrong at temp=1.0). Recovery rate ~50% on json_parse/shape_mismatch failures.
 - **Rung 3 (counterfactual) collapse** is CLadder's diagnostic signal — strong models lose 10-30pp from rung 2 (DeepSeek 90 → 77).
-- **`max_tokens=32k` recovered the literature GPQA number** (83.8% vs 88.1% reported), zero truncations; the prior 16k run truncated 24%.
+- **`max_tokens=32k+` recovered the literature GPQA number** (83.8% vs 88.1% reported), zero truncations; the prior 16k run truncated 24%.
 
 ## Sources
 
@@ -52,8 +58,8 @@ Canonical baseline subset (id + prompt + gold per example) frozen at `data/bench
 
 ## How we elicit the structured answer
 
-Per-bench `system_prompt` instructs the model to "respond with a single JSON object" matching the schema; `response_format` is set to strict `json_schema` (pydantic model) where supported, else `json_object` + client-side pydantic validation. JSON-in-message-content, not tool calls.
+Per-bench `system_prompt` instructs the model to "respond with a single JSON object" matching the schema; `response_format = strict json_schema` (where the server honors it) or `json_object`. JSON-in-message-content, not tool calls.
 
-**Why not tool calls.** Tried `tools=[{submit_answer: pydantic_schema}]` with `tool_choice` forcing the call. Works for instruct models (Qwen3-4B emits a clean tool call in ~5s). **Does NOT work for RL-on-text reasoning models** — VibeThinker-3B reads the tool definitions, reasons about them in `content` ("the system says we have a function 'answer'..."), then never emits `<tool_call>` and stops at `finish_reason=length`. The base model (Qwen2.5-Coder-3B) was trained for tool use and the chat template still carries the slots, but the reasoning RL stage trained the emission behavior away. Expected to apply to other reasoning-RL'd models (R1-distill family, similar).
+**Verify-loop with reasoning replay.** Validate returns `(parsed, hint, err)` — `err` is a sentinel (`ErrJSONParse`/`ErrShape`/`ErrEnum`) for analytics; `hint` is the LLM-facing message appended on failure. The retry conversation includes the prior assistant turn wrapped as `<think>{reasoning_content}</think>{content}` so Qwen3-family models can continue from their own CoT rather than re-derive (re-derivation at temp=1.0 routinely flips correct answers to wrong).
 
-For reasoning models this means the JSON parse-fail floor (~30% for VibeThinker at temp=1.0) is intrinsic and can only be closed by grammar-constrained decoding on the local server side. Until then, structured-output-strong models (DeepSeek API: 0% parse-fail) and reasoning-only models (VibeThinker: ~30% parse-fail) aren't directly comparable on the raw number — the gap mixes reasoning and structured-output discipline.
+**Why not tool calls.** Tried `tools=[{submit_answer: schema}]` with `tool_choice` forcing the call. Works for instruct models (Qwen3-4B emits a clean tool call in ~5s). **Does NOT work for RL-on-text reasoning models** — VibeThinker-3B reads the tool definitions, reasons about them in `content`, then never emits `<tool_call>` and stops at `finish_reason=length`. The base (Qwen2.5-Coder-3B) supports tool use and the chat template still carries the slots, but the reasoning RL stage trained the emission away. Expected to apply to other reasoning-RL'd models.
