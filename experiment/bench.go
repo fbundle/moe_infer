@@ -37,7 +37,7 @@ type BenchSpec[T any] struct {
 	Name         string
 	SystemPrompt string
 	Schema       *jsonschema.Definition
-	Validate     func(content string) (T, error)
+	Validate     func(content string) (parsed T, hint string, err error)
 	Score        func(parsed, gold T) (correct bool, extras map[string]any)
 }
 
@@ -56,6 +56,14 @@ type Result[T any] struct {
 }
 
 // ── Bench specs ───────────────────────────────────────────────────────────
+
+// Validator error sentinels. Validators return one of these as err (for
+// caller-side analytics) plus a free-form hint string (for the LLM).
+var (
+	ErrJSONParse = errors.New("json_parse")
+	ErrShape     = errors.New("shape_mismatch")
+	ErrEnum      = errors.New("enum_violation")
+)
 
 type ZebraOutput struct {
 	Header []string   `json:"header"`
@@ -77,22 +85,23 @@ func zebraBench() BenchSpec[ZebraOutput] {
 				"rows":   {Type: jsonschema.Array, Items: &jsonschema.Definition{Type: jsonschema.Array, Items: &jsonschema.Definition{Type: jsonschema.String}}},
 			},
 		},
-		Validate: func(c string) (ZebraOutput, error) {
+		Validate: func(c string) (ZebraOutput, string, error) {
 			var z ZebraOutput
-			if err := json.Unmarshal([]byte(c), &z); err != nil {
-				return z, fmt.Errorf("invalid JSON: %v.\n"+
+			if e := json.Unmarshal([]byte(c), &z); e != nil {
+				hint := fmt.Sprintf("invalid JSON: %v.\n"+
 					`Expected exactly: {"header": ["House","Name","Color",...], "rows": [["1","Alice","red",...], ["2","Bob","blue",...]]}.`+"\n"+
-					"Each row MUST be its own inner [...] array nested inside the outer rows array — do NOT write rows values as siblings of the rows array.", err)
+					"Each row MUST be its own inner [...] array nested inside the outer rows array — do NOT write rows values as siblings of the rows array.", e)
+				return z, hint, ErrJSONParse
 			}
 			if len(z.Header) == 0 || len(z.Rows) == 0 {
-				return z, fmt.Errorf("header and rows must both be non-empty arrays")
+				return z, "header and rows must both be non-empty arrays", ErrShape
 			}
 			for i, r := range z.Rows {
 				if len(r) != len(z.Header) {
-					return z, fmt.Errorf("row %d has %d cells but header has %d — every row must match the header length", i, len(r), len(z.Header))
+					return z, fmt.Sprintf("row %d has %d cells but header has %d — every row must match the header length", i, len(r), len(z.Header)), ErrShape
 				}
 			}
-			return z, nil
+			return z, "", nil
 		},
 		Score: func(p, g ZebraOutput) (bool, map[string]any) {
 			total, correct := 0, 0
@@ -147,15 +156,15 @@ func cladderBench() BenchSpec[CladderOutput] {
 				"answer": {Type: jsonschema.String, Enum: []string{"yes", "no"}},
 			},
 		},
-		Validate: func(c string) (CladderOutput, error) {
+		Validate: func(c string) (CladderOutput, string, error) {
 			var o CladderOutput
-			if err := json.Unmarshal([]byte(c), &o); err != nil {
-				return o, fmt.Errorf(`invalid JSON: %v. Expected exactly: {"answer": "yes"} or {"answer": "no"}`, err)
+			if e := json.Unmarshal([]byte(c), &o); e != nil {
+				return o, fmt.Sprintf(`invalid JSON: %v. Expected exactly: {"answer": "yes"} or {"answer": "no"}`, e), ErrJSONParse
 			}
 			if o.Answer != "yes" && o.Answer != "no" {
-				return o, fmt.Errorf(`answer must be lowercase "yes" or "no" (got %q). Re-emit: {"answer": "yes"} or {"answer": "no"}`, o.Answer)
+				return o, fmt.Sprintf(`answer must be lowercase "yes" or "no" (got %q). Re-emit: {"answer": "yes"} or {"answer": "no"}`, o.Answer), ErrEnum
 			}
-			return o, nil
+			return o, "", nil
 		},
 		Score: func(p, g CladderOutput) (bool, map[string]any) {
 			return strings.EqualFold(strings.TrimSpace(p.Answer), strings.TrimSpace(g.Answer)), nil
@@ -194,15 +203,15 @@ func gpqaBench() BenchSpec[GpqaOutput] {
 				"answer": {Type: jsonschema.String, Enum: []string{"A", "B", "C", "D"}},
 			},
 		},
-		Validate: func(c string) (GpqaOutput, error) {
+		Validate: func(c string) (GpqaOutput, string, error) {
 			var o GpqaOutput
-			if err := json.Unmarshal([]byte(c), &o); err != nil {
-				return o, fmt.Errorf(`invalid JSON: %v. Expected exactly: {"answer": "A"} (or B, C, D)`, err)
+			if e := json.Unmarshal([]byte(c), &o); e != nil {
+				return o, fmt.Sprintf(`invalid JSON: %v. Expected exactly: {"answer": "A"} (or B, C, D)`, e), ErrJSONParse
 			}
 			if len(o.Answer) != 1 || !strings.ContainsRune("ABCD", rune(o.Answer[0])) {
-				return o, fmt.Errorf(`answer must be a single letter A, B, C, or D (got %q). Re-emit: {"answer": "A"}`, o.Answer)
+				return o, fmt.Sprintf(`answer must be a single letter A, B, C, or D (got %q). Re-emit: {"answer": "A"}`, o.Answer), ErrEnum
 			}
-			return o, nil
+			return o, "", nil
 		},
 		Score: func(p, g GpqaOutput) (bool, map[string]any) {
 			return strings.EqualFold(p.Answer, g.Answer), nil
@@ -300,7 +309,10 @@ func runOne[T any](ctx context.Context, b *Backend, spec BenchSpec[T],
 		Elapsed:  time.Since(t0).Seconds(),
 		History:  history.Responses, Messages: history.Messages,
 	}
-	extras := map[string]any{"attempts": len(history.Responses)}
+	extras := map[string]any{
+		"attempts":    len(history.Responses),
+		"exit_reason": string(history.Reason),
+	}
 	if n := len(history.Responses); n > 0 {
 		last := history.Responses[n-1]
 		extras["tokens_used"] = last.Usage.CompletionTokens
@@ -317,9 +329,13 @@ func runOne[T any](ctx context.Context, b *Backend, spec BenchSpec[T],
 		}
 	} else {
 		r.Error = err.Error()
-		var le *LoopError
-		if errors.As(err, &le) {
-			extras["exit_reason"] = string(le.Reason)
+		switch {
+		case errors.Is(err, ErrJSONParse):
+			extras["validate_code"] = "json_parse"
+		case errors.Is(err, ErrShape):
+			extras["validate_code"] = "shape_mismatch"
+		case errors.Is(err, ErrEnum):
+			extras["validate_code"] = "enum_violation"
 		}
 	}
 	r.Extras = extras

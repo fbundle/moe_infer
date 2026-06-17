@@ -5,44 +5,29 @@ import (
 	"errors"
 	"fmt"
 	"slices"
-	"strings"
-	"sync"
 
 	openai "github.com/sashabaranov/go-openai"
-	"github.com/sashabaranov/go-openai/jsonschema"
 )
 
-// History records every message sent and every response received.
-type History struct {
-	Messages  []openai.ChatCompletionMessage
-	Responses []openai.ChatCompletionResponse
-}
-
 // LoopExitReason — Go has no enums; typed string constants are the idiom.
-// One of these is set in LoopError when ChatCompletionLoop returns without
-// a validated value.
+// Set on History.Reason every time ChatCompletionLoop returns.
 type LoopExitReason string
 
 const (
+	ExitOK              LoopExitReason = "ok"
 	ExitInvalidInput    LoopExitReason = "invalid_input"
 	ExitMaxRetries      LoopExitReason = "max_retries_reached"
 	ExitBudgetExhausted LoopExitReason = "budget_exhausted"
 	ExitCallError       LoopExitReason = "call_error" // completion func returned err/nil
 )
 
-type LoopError struct {
-	Reason  LoopExitReason
-	LastErr error // last validate or completion error, if any
+// History records every message sent, every response received, and how
+// the loop exited. Reason is always set after ChatCompletionLoop returns.
+type History struct {
+	Messages  []openai.ChatCompletionMessage
+	Responses []openai.ChatCompletionResponse
+	Reason    LoopExitReason
 }
-
-func (e *LoopError) Error() string {
-	if e.LastErr != nil {
-		return string(e.Reason) + ": " + e.LastErr.Error()
-	}
-	return string(e.Reason)
-}
-
-func (e *LoopError) Unwrap() error { return e.LastErr }
 
 func budgetMessage(remainingTokens int) openai.ChatCompletionMessage {
 	return openai.ChatCompletionMessage{
@@ -62,15 +47,17 @@ func ChatCompletionLoop[T any](
 	ctx context.Context,
 	initial []openai.ChatCompletionMessage,
 	completion func(ctx context.Context, messages []openai.ChatCompletionMessage, maxCompletionTokens int) (*openai.ChatCompletionResponse, error),
-	validate func(string) (T, error),
+	validate func(string) (T, string, error), // (parsed, hint-for-LLM, err-for-caller)
 	maxRetries int,
 	maxCompletionTokens int,
 ) (o T, h History, err error) {
 	if maxRetries < 0 {
-		return o, h, &LoopError{Reason: ExitInvalidInput, LastErr: errors.New("maxTries must be non-negative")}
+		h.Reason = ExitInvalidInput
+		return o, h, errors.New("maxTries must be non-negative")
 	}
 	if maxCompletionTokens <= 0 {
-		return o, h, &LoopError{Reason: ExitInvalidInput, LastErr: errors.New("maxCompletionTokens must positive")}
+		h.Reason = ExitInvalidInput
+		return o, h, errors.New("maxCompletionTokens must positive")
 	}
 	remainingTokens := maxCompletionTokens
 	reaminingRetries := maxRetries
@@ -78,14 +65,16 @@ func ChatCompletionLoop[T any](
 		Messages:  slices.Clone(initial),
 		Responses: nil,
 	}
-	var lastValidateErr error // surfaced in the LoopError if we run out
+	var lastValidateErr error // surfaced as err when we run out
 
 	for {
 		if remainingTokens == 0 {
-			return o, h, &LoopError{Reason: ExitBudgetExhausted, LastErr: lastValidateErr}
+			h.Reason = ExitBudgetExhausted
+			return o, h, lastValidateErr
 		}
 		if reaminingRetries == 0 {
-			return o, h, &LoopError{Reason: ExitMaxRetries, LastErr: lastValidateErr}
+			h.Reason = ExitMaxRetries
+			return o, h, lastValidateErr
 		}
 		// add budget hint
 		h.Messages = append(h.Messages, budgetMessage(remainingTokens))
@@ -93,7 +82,8 @@ func ChatCompletionLoop[T any](
 		r, err := completion(ctx, h.Messages, remainingTokens)
 		if err != nil || r == nil {
 			// not recoverable
-			return o, h, &LoopError{Reason: ExitCallError, LastErr: err}
+			h.Reason = ExitCallError
+			return o, h, err
 		}
 		// make call success, update history
 		h.Responses = append(h.Responses, *r)
@@ -102,82 +92,16 @@ func ChatCompletionLoop[T any](
 			Content: r.Choices[0].Message.Content,
 		})
 		// validate
-		o, err = validate(r.Choices[0].Message.Content)
+		var hint string
+		o, hint, err = validate(r.Choices[0].Message.Content)
 		if err == nil { // validate success
+			h.Reason = ExitOK
 			return o, h, nil
 		}
-		// retry loop
+		// retry loop — hint is LLM-facing, err is caller-facing
 		lastValidateErr = err
-		h.Messages = append(h.Messages, errorMessage(err.Error()))
+		h.Messages = append(h.Messages, errorMessage(hint))
 		reaminingRetries -= 1
 		remainingTokens -= r.Usage.CompletionTokens
 	}
-}
-
-// ── OpenAI-compatible backend (strict json_schema → json_object fallback) ──
-
-type Backend struct {
-	client   *openai.Client
-	model    string
-	mu       sync.Mutex
-	strictOK *bool // nil = unknown
-}
-
-func NewBackend(baseURL, apiKey, model string) *Backend {
-	cfg := openai.DefaultConfig(apiKey)
-	cfg.BaseURL = baseURL
-	return &Backend{client: openai.NewClientWithConfig(cfg), model: model}
-}
-
-// CallWithSchema makes one chat-completion call enforcing a JSON schema.
-// Tries strict json_schema first; falls back permanently to json_object
-// when the endpoint refuses (e.g. DeepSeek, older mlx servers).
-func (b *Backend) CallWithSchema(
-	ctx context.Context,
-	messages []openai.ChatCompletionMessage,
-	schema *jsonschema.Definition, schemaName string,
-	maxTokens int, temperature, topP float32,
-) (*openai.ChatCompletionResponse, error) {
-	b.mu.Lock()
-	tryStrict := b.strictOK == nil || *b.strictOK
-	b.mu.Unlock()
-
-	req := openai.ChatCompletionRequest{
-		Model: b.model, Messages: messages, MaxTokens: maxTokens,
-		Temperature: temperature, TopP: topP,
-	}
-	if tryStrict {
-		req.ResponseFormat = &openai.ChatCompletionResponseFormat{
-			Type: openai.ChatCompletionResponseFormatTypeJSONSchema,
-			JSONSchema: &openai.ChatCompletionResponseFormatJSONSchema{
-				Name: schemaName, Schema: schema, Strict: true,
-			},
-		}
-		resp, err := b.client.CreateChatCompletion(ctx, req)
-		if err == nil {
-			b.setStrict(true)
-			return &resp, nil
-		}
-		s := strings.ToLower(err.Error())
-		if strings.Contains(s, "response_format") || strings.Contains(s, "json_schema") ||
-			strings.Contains(s, "unavailable") || strings.Contains(s, "not supported") {
-			b.setStrict(false)
-		} else {
-			return nil, err
-		}
-	}
-	req.ResponseFormat = &openai.ChatCompletionResponseFormat{
-		Type: openai.ChatCompletionResponseFormatTypeJSONObject,
-	}
-	resp, err := b.client.CreateChatCompletion(ctx, req)
-	if err != nil {
-		return nil, err
-	}
-	return &resp, nil
-}
-
-func (b *Backend) setStrict(v bool) {
-	b.mu.Lock()
-	b.strictOK = &v
-	b.mu.Unlock()
 }
