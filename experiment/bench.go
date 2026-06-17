@@ -65,6 +65,22 @@ var (
 	ErrEnum      = errors.New("enum_violation")
 )
 
+// qwen3Assistant folds reasoning_content back into the assistant message
+// using <think>...</think> tags, so retries can see prior chain-of-thought.
+// Qwen3-family chat templates parse these tags natively; other model
+// families would need a different toAssistantMessage.
+func qwen3Assistant(r openai.ChatCompletionResponse) openai.ChatCompletionMessage {
+	msg := r.Choices[0].Message
+	content := msg.Content
+	if msg.ReasoningContent != "" {
+		content = "<think>\n" + msg.ReasoningContent + "\n</think>\n" + content
+	}
+	return openai.ChatCompletionMessage{
+		Role:    openai.ChatMessageRoleAssistant,
+		Content: content,
+	}
+}
+
 type ZebraOutput struct {
 	Header []string   `json:"header"`
 	Rows   [][]string `json:"rows"`
@@ -302,7 +318,7 @@ func runOne[T any](ctx context.Context, b *Backend, spec BenchSpec[T],
 			maxTok, opts.Temperature, opts.TopP)
 	}
 	parsed, history, err := ChatCompletionLoop(ctx, initial, completion,
-		spec.Validate, opts.MaxRetries, opts.MaxTokens)
+		qwen3Assistant, spec.Validate, opts.MaxRetries, opts.MaxTokens)
 
 	r := Result[T]{
 		ID: ex.ID, Prompt: ex.Prompt, Gold: ex.Gold, Meta: ex.Meta,

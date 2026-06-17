@@ -47,6 +47,7 @@ func ChatCompletionLoop[T any](
 	ctx context.Context,
 	initial []openai.ChatCompletionMessage,
 	completion func(ctx context.Context, messages []openai.ChatCompletionMessage, maxCompletionTokens int) (*openai.ChatCompletionResponse, error),
+	toAssistantMessage func(openai.ChatCompletionResponse) openai.ChatCompletionMessage, // model-specific (e.g. Qwen3 <think> wrapping)
 	validate func(string) (T, string, error), // (parsed, hint-for-LLM, err-for-caller)
 	maxRetries int,
 	maxCompletionTokens int,
@@ -85,12 +86,12 @@ func ChatCompletionLoop[T any](
 			h.Reason = ExitCallError
 			return o, h, err
 		}
-		// make call success, update history
+		// make call success, update history.
+		// Caller's toAssistantMessage decides how to fold reasoning_content back
+		// into the next turn — Qwen3 uses <think>...</think>, others may
+		// pass it through reasoning_content, others drop it entirely.
 		h.Responses = append(h.Responses, *r)
-		h.Messages = append(h.Messages, openai.ChatCompletionMessage{
-			Role:    openai.ChatMessageRoleAssistant,
-			Content: r.Choices[0].Message.Content,
-		})
+		h.Messages = append(h.Messages, toAssistantMessage(*r))
 		// validate
 		var hint string
 		o, hint, err = validate(r.Choices[0].Message.Content)
