@@ -27,9 +27,8 @@ Harness: `experiment/bench.go` (sashabaranov + verify-loop with reasoning replay
 | **deepseek-v4-flash** | API | 100% (80/80) | **0.176 ±0.020** | 83.3% (165/198) |
 | **claude-opus-4-7** (claude-cli backend, effort=medium) | API | 80% (64/80) | — | 79% (46/58) partial |
 | **VibeThinker-3B** | mixed_4_6 (4.77 bpw) | 66.2% (53/80) | pending | pending |
-| **Qwen3.5-0.8B** | mlx q4 (~4.5 bpw) | pending | pending | pending |
-| **Nemotron-Nano-4B** | mlx q4 (~4.5 bpw) | pending | pending | pending |
-| **LFM2.5-8B-A1B** (~1B active) | mlx q8 (~8.5 bpw) | 30% (3/10) partial | pending | pending |
+| **Gemma-4-E4B-QAT** (4B active / 26B total) | mlx q4 (~4.5 bpw) | pending | pending | pending |
+| **LFM2.5-8B-A1B** (~1B active) | mlx q8 (~8.5 bpw) | 33% (3/9) partial | pending | pending |
 | **Qwen3.5-4B** | mlx q4 (~4.5 bpw) | on hold | on hold | on hold |
 | Claude Opus 4.5 | API | — | — | 87.0% |
 | Qwen3-VL-235B-A22B Thinking | open | 97.3% | — | — |
@@ -39,6 +38,28 @@ Harness: `experiment/bench.go` (sashabaranov + verify-loop with reasoning replay
 | UCB1 | — | — | 0.142 ±0.002 | — |
 | Thompson sampling | — | — | 0.107 ±0.002 | — |
 
+## Throughput
+
+Output tokens only. Claude CLI backend reports only final output (no hidden reasoning tokens), so its tok/q is artificially low.
+
+### ZebraLogic
+
+| Model | Tok/q | tok/s |
+|---|---|---|
+| DeepSeek-v4-flash | 2253 | 105.4 |
+| DeepSeek-v4-pro | 2448 | 71.8 |
+| Claude Opus 4.7 | 723 | 51.6 |
+| VibeThinker-3B | 4812 | 28.5 |
+| LFM2.5-8B-A1B | 6265 | 28.9 |
+
+### GPQA-Diamond
+
+| Model | Tok/q | tok/s |
+|---|---|---|
+| DeepSeek-v4-flash | 4333 | 98.1 |
+| DeepSeek-v4-pro | 6144 | 63.4 |
+| Claude Opus 4.7 | 438 | 29.1 |
+
 ZL public numbers are the paper's *Overall* (all sizes 2×2 → 6×6). Our 80-row subset is **3×3 + 4×4 only**, which sits in the paper's *Small* and *Medium* tiers — easier than "Overall."
 
 `max_tokens=40960`, `max_retries=5`, `response_format=json_schema` strict (oMLX accepts but does not constrain). Decode per model card:
@@ -46,6 +67,7 @@ ZL public numbers are the paper's *Overall* (all sizes 2×2 → 6×6). Our 80-ro
 | Model | temp | top_p | top_k | notes |
 |---|---|---|---|---|
 | VibeThinker-3B | 1.0 | 0.95 | — | |
+| Gemma-4-E4B-QAT | 0.2 | 1.0 | — | |
 | Qwen3.5-4B | 0.6 | 0.95 | 20 | thinking mode |
 | LFM2.5-8B-A1B | 0.2 | 1.0 | — | |
 | deepseek-v4-flash | — | — | — | thinking mode default (silently ignores temp/top_p) |

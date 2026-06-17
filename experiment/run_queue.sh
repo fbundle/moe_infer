@@ -1,5 +1,5 @@
 #!/bin/bash
-# Axis-major queue with per-model sampling/decode params.
+# Model-major queue: for each model, run all axes, then next model.
 # Manages its own oMLX server: kills whatever holds port 9100, spawns
 # a fresh `omlx serve` between every (model, axis), waits for ready,
 # then runs the bench. Pidfiles let kill_queue.sh stop cleanly.
@@ -19,8 +19,7 @@ trap 'rm -f "$QUEUE_PID" "$BENCH_PID"' EXIT
 MODELS=(
   # model_id|temperature|top_p|max_tokens|tolerant_json|concurrency
   "vibethinker-3b-q4|1.0|0.95|40960|false|2"
-  "mlx-community--Qwen3.5-0.8B-MLX-4bit|0.6|0.95|40960|false|4"
-  "mlx-community--NVIDIA-Nemotron-3-Nano-4B-4bit|0.2|1.0|40960|true|2"
+  "mlx-community--gemma-4-e4b-it-qat-4bit|0.2|1.0|40960|true|4"
   "lfm25-8b-a1b-mlx-8bit|0.2|1.0|40960|true|2"
   # Qwen3.5-4B on hold: even at conc=1, thinking mode burns 30k+ tokens per puzzle → ~20 min/ex.
   # "mlx-community--Qwen3.5-4B-4bit|0.6|0.95|40960|false|1"
@@ -43,7 +42,7 @@ restart_omlx() {
   fi
   # Spawn fresh
   echo "[$(date +%s)] starting omlx serve" >> "$LOG"
-  nohup omlx serve >> "$OMLX_LOG" 2>&1 &
+  nohup omlx serve --paged-ssd-cache-dir "$(pwd)/omlx-cache" >> "$OMLX_LOG" 2>&1 &
   echo $! > "$OMLX_PID"
   # Wait for /v1/models
   for _ in $(seq 1 90); do
@@ -57,8 +56,8 @@ restart_omlx() {
   return 1
 }
 
-for AXIS in "${AXES[@]}"; do
-  for ROW in "${MODELS[@]}"; do
+for ROW in "${MODELS[@]}"; do
+  for AXIS in "${AXES[@]}"; do
     IFS='|' read -r M TEMP TOPP MAXTOK TOL CONC <<< "$ROW"
     restart_omlx || continue
     TOL_FLAG=""
