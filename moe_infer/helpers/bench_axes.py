@@ -1,26 +1,11 @@
 """Three-axis reasoning benchmark via an OpenAI-compatible API.
 
-Axes:
-  - logical:        ZebraLogic (grid_mode, default 3×3 + 4×4)
-  - probabilistic:  CLadder (default rungs 2+3 = interventional + counterfactual)
-  - knowledge:      GPQA-Diamond (full 198)
+Axes: ZebraLogic (logical), CLadder (probabilistic), GPQA-Diamond (knowledge).
+Pure-reasoning, no tools. JSON output enforced via response_format strict
+json_schema (fallback: json_object + client-side pydantic validation).
 
-No tools — pure-reasoning prompts. Decision rationale lives in the chat
-transcript; this script is the harness only.
-
-Usage examples
---------------
-  # First end-to-end on DeepSeek (assumes DEEPSEEK_API_TOKEN env var):
-  python -m moe_infer.helpers.bench_axes \\
-      --model deepseek-v4-flash \\
-      --base-url https://api.deepseek.com \\
-      --api-key-env DEEPSEEK_API_TOKEN
-
-  # Quick sanity check (5 examples per benchmark):
-  python -m moe_infer.helpers.bench_axes --n 5
-
-  # One benchmark only:
-  python -m moe_infer.helpers.bench_axes --benches cladder --n 50
+Per-example streaming dump + resume; sequential verifier-loop retry with
+error-feedback turns; optional Pattern D budget hint.
 """
 
 from __future__ import annotations
@@ -40,11 +25,7 @@ from datasets import load_dataset
 from openai import AsyncOpenAI, BadRequestError
 from pydantic import BaseModel, ValidationError
 
-# Per-process cache: does the endpoint support response_format=PydanticModel
-# (i.e. strict json_schema mode)? None = unknown, True/False = decided after
-# the first request's response. Falls back to json_object + client-side
-# validation when False (DeepSeek's current behavior).
-_STRICT_SCHEMA_OK: bool | None = None
+from moe_infer.helpers.verifier import Completion, Message, verify_loop
 
 
 # ── Pydantic output schemas ────────────────────────────────────────────────
@@ -128,6 +109,7 @@ class Result:
     correct: bool
     elapsed: float
     error: str = ""
+    reasoning: str = ""
     extras: dict = field(default_factory=dict)
 
 
@@ -143,6 +125,27 @@ class Bench:
         return parse_json_content(content, self.output_model)
     def score(self, parsed: BaseModel | None, gold: Any) -> tuple[bool, dict]: raise NotImplementedError
     def report_extras(self, results: list[Result]) -> None: ...
+
+    def load_from_jsonl(self, path: str) -> list[Example]:
+        """Load examples from a frozen baseline JSONL (data/bench_subsets/).
+
+        Same shape as a per-axis dump: one JSON record per line with
+        `{id, prompt, gold, meta}`. Bypasses dataset+shuffle code paths so
+        the example set is fully reproducible across runs even if upstream
+        HF dataset rows change.
+        """
+        out: list[Example] = []
+        with open(path) as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                d = json.loads(line)
+                out.append(Example(
+                    bench=self.name, id=d["id"], prompt=d["prompt"],
+                    gold=d.get("gold"), meta=d.get("meta", {}),
+                ))
+        return out
 
 
 # ── ZebraLogic (logical) ──────────────────────────────────────────────────
@@ -361,52 +364,44 @@ class GPQADiamond(Bench):
 
 # ── Async runner ──────────────────────────────────────────────────────────
 
-@dataclass
-class Completion:
-    content: str
-    reasoning_content: str = ""
-    finish_reason: str = "stop"
-    parsed: BaseModel | None = None  # set by strict-mode backend; otherwise None
-    extra_mode_info: dict = field(default_factory=dict)
-
-
 # ── Backend: OpenAI-compatible API ────────────────────────────────────────
 
 class OpenAIBackend:
-    """OpenAI-compatible chat completion backend.
+    """Stateless wrapper over the OpenAI-compatible chat completion API.
 
-    Tries strict json_schema mode (`client.chat.completions.parse`) first;
-    falls back to `json_object` mode + client-side pydantic validation if the
-    endpoint refuses it (DeepSeek, LM Studio's older builds, etc).
+    Given `messages` and a response schema, call the SDK and return a
+    `Completion`. Tries strict json_schema first; falls back permanently to
+    json_object when the endpoint refuses (e.g. DeepSeek).
     """
 
     def __init__(self, client: AsyncOpenAI, model: str):
         self.client = client
         self.model = model
-        # Cache: True = strict ok, False = use json_object, None = unknown.
+        # Cache: True = strict OK, False = use json_object, None = unknown.
         self.strict_ok: bool | None = None
 
-    async def complete(self, bench: Bench, ex: Example,
-                       max_tokens: int, temperature: float) -> Completion:
-        messages = [
-            {"role": "system", "content": bench.system_prompt},
-            {"role": "user", "content": ex.prompt},
-        ]
+    async def complete(
+        self, *, messages: list[Message],
+        response_format: type[BaseModel],
+        client_parse,             # fn(content: str) -> parsed value or raises
+        max_tokens: int, temperature: float, top_p: float = 1.0,
+    ) -> Completion:
         if self.strict_ok is not False:
             try:
                 resp = await self.client.chat.completions.parse(
                     model=self.model, messages=messages,
-                    temperature=temperature, max_tokens=max_tokens,
-                    response_format=bench.output_model,
+                    temperature=temperature, max_tokens=max_tokens, top_p=top_p,
+                    response_format=response_format,
                 )
-                if self.strict_ok is None:
-                    self.strict_ok = True
+                self.strict_ok = True
                 msg = resp.choices[0].message
                 return Completion(
                     content=msg.content or "",
                     reasoning_content=getattr(msg, "reasoning_content", "") or "",
-                    finish_reason=resp.choices[0].finish_reason or "",
+                    finish_reason=resp.choices[0].finish_reason or "stop",
                     parsed=msg.parsed,
+                    tokens_used=(resp.usage.completion_tokens
+                                 if resp.usage else 0),
                     extra_mode_info={"mode": "strict"},
                 )
             except BadRequestError as e:
@@ -414,19 +409,25 @@ class OpenAIBackend:
                     self.strict_ok = False
                 else:
                     raise
-        # json_object fallback (also where we land permanently once strict fails)
+        # json_object fallback
         resp = await self.client.chat.completions.create(
             model=self.model, messages=messages,
-            temperature=temperature, max_tokens=max_tokens,
+            temperature=temperature, max_tokens=max_tokens, top_p=top_p,
             response_format={"type": "json_object"},
         )
         msg = resp.choices[0].message
         content = msg.content or ""
+        try:
+            parsed = client_parse(content)
+        except Exception:
+            parsed = None
         return Completion(
             content=content,
             reasoning_content=getattr(msg, "reasoning_content", "") or "",
-            finish_reason=resp.choices[0].finish_reason or "",
-            parsed=bench.parse(content),
+            finish_reason=resp.choices[0].finish_reason or "stop",
+            parsed=parsed,
+            tokens_used=(resp.usage.completion_tokens
+                         if resp.usage else 0),
             extra_mode_info={"mode": "json_object"},
         )
 
@@ -496,43 +497,154 @@ async def _run_one(
     semaphore: asyncio.Semaphore, max_tokens: int, temperature: float,
     request_timeout: float,
     deadline: float | None,
+    top_p: float = 1.0,
+    max_retries: int = 0,
+    budget_hint: bool = False,
 ) -> Result:
     async with semaphore:
-        # Wall-clock deadline check INSIDE the critical section. This is the
-        # only correct place to enforce a budget — checking from the outer
-        # loop body has a race (asyncio eagerly hands the released semaphore
-        # to the next waiting task before the loop body can flip a flag).
-        # Each task checks for itself the moment it has exclusive access.
-        # Bounded overshoot: exactly the one task already past this check
-        # at deadline time will run; everyone after it skips cheaply.
+        # Deadline check INSIDE critical section — checking from the outer
+        # loop has a race: asyncio releases the semaphore before the flag
+        # can flip. Bounded overshoot: only the task already past this
+        # check at deadline time runs; later tasks skip cheaply.
         if deadline is not None and time.perf_counter() >= deadline:
             return _budget_skipped_result(ex)
         t0 = time.perf_counter()
-        try:
-            comp: Completion = await asyncio.wait_for(
-                backend.complete(bench, ex, max_tokens, temperature),
+
+        # ── Build the conversation in one place ──
+        initial_messages: list[Message] = [
+            Message(role="system", content=bench.system_prompt),
+            Message(role="user", content=ex.prompt),
+        ]
+
+        async def call(messages):
+            return await asyncio.wait_for(
+                backend.complete(
+                    messages=messages,
+                    response_format=bench.output_model,
+                    client_parse=bench.parse,
+                    max_tokens=max_tokens, temperature=temperature, top_p=top_p,
+                ),
                 timeout=request_timeout,
             )
-        except Exception as e:
+
+        outcome = await verify_loop(
+            call=call,
+            validate=lambda content: bench.output_model.model_validate_json(content),
+            initial_messages=initial_messages,
+            max_retries=max_retries,
+            budget_tokens=max_tokens if budget_hint else None,
+        )
+        elapsed = time.perf_counter() - t0
+
+        if outcome.comp is None:
             return Result(
                 example=ex, response="", parsed=None,
-                correct=False, elapsed=time.perf_counter() - t0,
-                error=f"{type(e).__name__}: {e}",
+                correct=False, elapsed=elapsed, error=outcome.final_error,
+                extras={"attempts": len(outcome.history)},
             )
-        elapsed = time.perf_counter() - t0
-        correct, extras = bench.score(comp.parsed, ex.gold)
+
+        # Prefer verify_loop's parsed (last successful validate); else fall
+        # back to the strict-mode SDK's parsed value if it populated one.
+        final_parsed = (outcome.parsed if outcome.parsed is not None
+                        else outcome.comp.parsed)
+        correct, extras = bench.score(final_parsed, ex.gold)
         extras = {
             **extras,
-            "finish": comp.finish_reason,
-            "len_content": len(comp.content),
-            "len_reasoning": len(comp.reasoning_content),
-            "no_answer": comp.parsed is None,
-            **comp.extra_mode_info,
+            "finish": outcome.comp.finish_reason,
+            "len_content": len(outcome.comp.content),
+            "len_reasoning": len(outcome.comp.reasoning_content),
+            "no_answer": final_parsed is None,
+            "attempts": len(outcome.history),
+            "tokens_used": outcome.comp.tokens_used,
+            "truncated": outcome.truncated,
+            # Per-attempt full record so failures can be replayed/inspected.
+            "history": [
+                {
+                    "content": c.content,
+                    "reasoning_content": c.reasoning_content,
+                    "finish_reason": c.finish_reason,
+                    "tokens_used": c.tokens_used,
+                    **c.extra_mode_info,
+                }
+                for c in outcome.history
+            ],
+            # Final conversation that was sent (with budget hints + retry turns).
+            "messages": outcome.messages,
+            **outcome.comp.extra_mode_info,
         }
         return Result(
-            example=ex, response=comp.content, parsed=comp.parsed,
+            example=ex, response=outcome.comp.content,
+            reasoning=outcome.comp.reasoning_content,
+            parsed=final_parsed,
             correct=correct, elapsed=elapsed, extras=extras,
         )
+
+
+def _serialize_result(r: Result) -> dict:
+    parsed_dump = (r.parsed.model_dump()
+                   if isinstance(r.parsed, BaseModel) else r.parsed)
+    return {
+        "id": r.example.id,
+        "prompt": r.example.prompt,  # full prompt — record everything
+        "gold": r.example.gold,
+        "response": r.response,
+        "reasoning": r.reasoning,
+        "parsed": parsed_dump,
+        "correct": r.correct,
+        "elapsed": r.elapsed,
+        "error": r.error,
+        "meta": r.example.meta,
+        "extras": r.extras,
+    }
+
+
+def _result_from_record(d: dict, bench_name: str) -> Result:
+    """Reconstruct a Result from a streaming-dump JSONL record.
+
+    `parsed` round-trips as a dict (or None); that's fine for stats —
+    we already stored `correct`. Score/parse aren't re-run on resume.
+    """
+    ex = Example(
+        bench=bench_name, id=d["id"],
+        prompt=d.get("prompt", ""), gold=d.get("gold"),
+        meta=d.get("meta", {}),
+    )
+    return Result(
+        example=ex,
+        response=d.get("response", ""),
+        reasoning=d.get("reasoning", ""),
+        parsed=d.get("parsed"),
+        correct=bool(d.get("correct", False)),
+        elapsed=float(d.get("elapsed", 0.0)),
+        error=d.get("error", ""),
+        extras=d.get("extras", {}),
+    )
+
+
+def _mark_for(r: Result) -> str:
+    if r.extras.get("budget_skipped"):
+        return "."
+    if r.error:
+        return "E"
+    if r.extras.get("no_answer"):
+        return "?"
+    return "+" if r.correct else "-"
+
+
+def _print_example_line(r: Result, done: int, total: int) -> None:
+    if r.extras.get("budget_skipped"):
+        return
+    mark = _mark_for(r)
+    gold_s = _short_display(r.example.gold)
+    parsed_s = _short_display(r.parsed)
+    finish = (r.extras.get("finish") or "?")[:6]
+    lc = r.extras.get("len_content", 0)
+    lr = r.extras.get("len_reasoning", 0)
+    suffix = (f"  err={r.error[:80]}" if r.error else "")
+    print(f"  {mark} {done:>3}/{total}  id={r.example.id:>12}  "
+          f"{r.elapsed:>5.1f}s  fin={finish:<6} c={lc:<4} r={lr:<5}  "
+          f"gold={gold_s:<22}  parsed={parsed_s:<22}{suffix}",
+          flush=True)
 
 
 async def run_bench(
@@ -540,14 +652,67 @@ async def run_bench(
     concurrency: int, max_tokens: int, temperature: float,
     request_timeout: float, dump_dir: str | None,
     time_budget_sec: float = 0.0,
+    subsets_dir: str | None = None,
+    top_p: float = 1.0,
+    max_retries: int = 0,
+    budget_hint: bool = False,
 ) -> tuple[float, list[Result]]:
-    examples = bench.load(n)
+    # Prefer the frozen baseline subset when present — keeps example IDs
+    # stable across runs (and across upstream HF dataset edits).
+    subset_path = None
+    if subsets_dir:
+        candidate = os.path.join(subsets_dir, f"{bench.name}.jsonl")
+        if os.path.exists(candidate):
+            subset_path = candidate
+    if subset_path:
+        examples = bench.load_from_jsonl(subset_path)
+        msg = (f"[{bench.name}] using frozen subset {subset_path} "
+               f"({len(examples)} examples). --zebra-sizes, --cladder-rungs, "
+               f"--gpqa-seed, --sample-seed are ignored.")
+        if n is not None and n < len(examples):
+            examples = examples[:n]
+            msg += f" Capped to first {n}."
+        print(msg, flush=True)
+    else:
+        examples = bench.load(n)
+
+    # ── Resume: load any prior streaming dump for this (model, bench) ──
+    dump_path: str | None = None
+    completed: dict[str, Result] = {}
+    if dump_dir:
+        os.makedirs(dump_dir, exist_ok=True)
+        dump_path = os.path.join(
+            dump_dir, f"{model_label.replace('/', '_')}__{bench.name}.jsonl",
+        )
+        if os.path.exists(dump_path):
+            with open(dump_path) as f:
+                for line in f:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        rec = json.loads(line)
+                    except json.JSONDecodeError:
+                        continue
+                    completed[rec["id"]] = _result_from_record(rec, bench.name)
+
+    resumed = [completed[ex.id] for ex in examples if ex.id in completed]
+    todo = [ex for ex in examples if ex.id not in completed]
+
     print(f"\n{'='*64}\n[{bench.name}] model={model_label}  n={len(examples)}  "
+          f"resumed={len(resumed)}  todo={len(todo)}  "
           f"concurrency={concurrency}  budget={time_budget_sec:.0f}s\n{'='*64}",
           flush=True)
+    # Replay resumed examples so log + progress watcher see them.
+    for i, r in enumerate(resumed, start=1):
+        _print_example_line(r, i, len(examples))
+
     if not examples:
         print(f"[{bench.name}] no examples loaded", flush=True)
         return 0.0, []
+
+    # ── Open dump in append mode for streaming writes ──
+    dump_f = open(dump_path, "a") if dump_path else None
 
     sem = asyncio.Semaphore(concurrency)
     t_start = time.perf_counter()
@@ -555,57 +720,44 @@ async def run_bench(
     running_tasks = [
         asyncio.create_task(_run_one(backend, ex, bench, sem,
                                      max_tokens, temperature, request_timeout,
-                                     deadline))
-        for ex in examples
+                                     deadline, top_p=top_p,
+                                     max_retries=max_retries,
+                                     budget_hint=budget_hint))
+        for ex in todo
     ]
 
-    results: list[Result] = []
-    done = 0
+    fresh: list[Result] = []
+    done = len(resumed)
     budget_announced = False
-    for fut in asyncio.as_completed(running_tasks):
-        try:
-            r = await fut
-        except asyncio.CancelledError:
-            continue
-        done += 1
-        results.append(r)
-        # Skip the verbose per-example line for budget-skipped entries —
-        # they're not failures, just unattempted.
-        if r.extras.get("budget_skipped"):
-            continue
-        if r.error:
-            mark = "E"
-        elif r.extras.get("no_answer"):
-            mark = "?"
-        elif r.correct:
-            mark = "+"
-        else:
-            mark = "-"
-        gold_s = _short_display(r.example.gold)
-        parsed_s = _short_display(r.parsed)
-        finish = (r.extras.get("finish") or "?")[:6]
-        lc = r.extras.get("len_content", 0)
-        lr = r.extras.get("len_reasoning", 0)
-        suffix = (f"  err={r.error[:80]}" if r.error else "")
-        print(f"  {mark} {done:>3}/{len(examples)}  id={r.example.id:>12}  "
-              f"{r.elapsed:>5.1f}s  fin={finish:<6} c={lc:<4} r={lr:<5}  "
-              f"gold={gold_s:<22}  parsed={parsed_s:<22}{suffix}",
-              flush=True)
-        # Budget enforcement happens inside each task (deadline check after
-        # semaphore acquire). Here we just announce, once, when results
-        # start arriving as budget_skipped.
-        if (not budget_announced and time_budget_sec > 0
-                and r.extras.get("budget_skipped")):
-            budget_announced = True
-            elapsed = time.perf_counter() - t_start
-            n_pending = sum(1 for t in running_tasks if not t.done())
-            print(f"  [{bench.name}] budget {time_budget_sec:.0f}s reached "
-                  f"after {done - 1} completed; {n_pending} pending "
-                  f"will short-circuit (elapsed={elapsed:.0f}s)",
-                  flush=True)
+    try:
+        for fut in asyncio.as_completed(running_tasks):
+            try:
+                r = await fut
+            except asyncio.CancelledError:
+                continue
+            done += 1
+            fresh.append(r)
+            # Stream-dump immediately (before printing or computing stats)
+            if dump_f is not None and not r.extras.get("budget_skipped"):
+                dump_f.write(json.dumps(_serialize_result(r), default=str) + "\n")
+                dump_f.flush()
+            _print_example_line(r, done, len(examples))
+            if (not budget_announced and time_budget_sec > 0
+                    and r.extras.get("budget_skipped")):
+                budget_announced = True
+                elapsed = time.perf_counter() - t_start
+                n_pending = sum(1 for t in running_tasks if not t.done())
+                print(f"  [{bench.name}] budget {time_budget_sec:.0f}s reached "
+                      f"after {done - 1} completed; {n_pending} pending "
+                      f"will short-circuit (elapsed={elapsed:.0f}s)",
+                      flush=True)
+    finally:
+        if dump_f is not None:
+            dump_f.close()
 
     wall = time.perf_counter() - t_start
-    # Separate budget-skipped from genuine attempts in the reporting.
+    results = resumed + fresh
+
     attempted = [r for r in results if not r.extras.get("budget_skipped")]
     n_skipped = len(results) - len(attempted)
     n_correct = sum(1 for r in attempted if r.correct)
@@ -623,29 +775,11 @@ async def run_bench(
         clean_acc = n_correct / answered
         print(f"  clean accuracy (answered only) = {clean_acc:.1%}  "
               f"({n_correct}/{answered})", flush=True)
-    # report_extras gets attempted results only (skipped have no signal).
     bench.report_extras(attempted)
 
-    if dump_dir:
-        os.makedirs(dump_dir, exist_ok=True)
-        path = os.path.join(dump_dir, f"{model_label.replace('/', '_')}__{bench.name}.jsonl")
-        with open(path, "w") as f:
-            for r in results:
-                parsed_dump = (r.parsed.model_dump()
-                               if isinstance(r.parsed, BaseModel) else r.parsed)
-                f.write(json.dumps({
-                    "id": r.example.id,
-                    "prompt": r.example.prompt[:2000],
-                    "gold": r.example.gold,
-                    "response": r.response,
-                    "parsed": parsed_dump,
-                    "correct": r.correct,
-                    "elapsed": r.elapsed,
-                    "error": r.error,
-                    "meta": r.example.meta,
-                    "extras": r.extras,
-                }, default=str) + "\n")
-        print(f"  dumped → {path}")
+    if dump_path:
+        print(f"  dumped → {dump_path}  (streamed; {len(resumed)} resumed + "
+              f"{len(fresh)} fresh)")
 
     return acc, results
 
@@ -736,6 +870,10 @@ async def main_async(args: argparse.Namespace) -> None:
             args.concurrency, args.max_tokens, args.temperature,
             args.request_timeout, args.dump_dir,
             time_budget_sec=args.time_budget_sec,
+            subsets_dir=args.subsets_dir,
+            top_p=args.top_p,
+            max_retries=args.max_retries,
+            budget_hint=args.budget_hint,
         )
         summary[b] = acc
 
@@ -790,6 +928,19 @@ def main() -> None:
     ap.add_argument("--max-tokens", type=int, default=32768,
                     help="reasoning models need a lot of headroom (32k+)")
     ap.add_argument("--temperature", type=float, default=0.0)
+    ap.add_argument("--top-p", type=float, default=1.0,
+                    help="nucleus sampling cutoff. Default 1.0 (no nucleus). "
+                    "VibeThinker-3B card recommends 0.95.")
+    ap.add_argument("--max-retries", type=int, default=5,
+                    help="resample on parse-fail (when finish=stop, NOT length). "
+                    "Default 5 — recovers most stochastic parse-fails at temp>0. "
+                    "Truncated (finish=length) samples are never retried because "
+                    "the same prompt would truncate identically.")
+    ap.add_argument("--budget-hint", action="store_true",
+                    help="Append a token-budget hint to the system prompt "
+                    "(Pattern A): 'you have at most N tokens, emit JSON before "
+                    "you run out.' Helps reasoning models avoid finish=length "
+                    "truncation. Off by default.")
     ap.add_argument("--request-timeout", type=float, default=600.0,
                     help="reasoning + local can be slow; set 600s")
     ap.add_argument("--zebra-sizes", default="3*3,4*4")
@@ -806,8 +957,15 @@ def main() -> None:
                     help="per-benchmark wall-time cap (s). After this, in-flight "
                     "results are kept and pending tasks are cancelled. 0 = no cap.")
     ap.add_argument("--dump-dir", default="data/bench_runs")
+    ap.add_argument("--subsets-dir", default="data/bench_subsets",
+                    help="frozen baseline subset dir. If {axis}.jsonl exists "
+                    "there, it overrides dataset loading; --n, --zebra-sizes, "
+                    "--cladder-rungs, --gpqa-seed, --sample-seed are ignored. "
+                    "Pass empty string to disable.")
 
     args = ap.parse_args()
+    if args.subsets_dir == "":
+        args.subsets_dir = None
     asyncio.run(main_async(args))
 
 
