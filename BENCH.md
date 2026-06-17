@@ -8,7 +8,7 @@ Pure-reasoning prompts on three orthogonal axes:
 
 Frozen subsets at `data/bench_subsets/{zebralogic,cladder,gpqa_diamond}.jsonl`. Per-example JSONL streams to `data/bench_runs/{model}__{bench}.jsonl` and resumes by ID.
 
-Harnesses (same JSONL schema): `moe_infer/helpers/bench_axes.py` (async-openai + pydantic) and `experiment/bench.go` (sashabaranov + verify-loop with reasoning replay).
+Harness: `experiment/bench.go` (sashabaranov + verify-loop with reasoning replay).
 
 ## Method
 
