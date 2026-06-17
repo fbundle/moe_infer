@@ -79,7 +79,20 @@ func zebraBench() BenchSpec[ZebraOutput] {
 		},
 		Validate: func(c string) (ZebraOutput, error) {
 			var z ZebraOutput
-			return z, json.Unmarshal([]byte(c), &z)
+			if err := json.Unmarshal([]byte(c), &z); err != nil {
+				return z, fmt.Errorf("invalid JSON: %v.\n"+
+					`Expected exactly: {"header": ["House","Name","Color",...], "rows": [["1","Alice","red",...], ["2","Bob","blue",...]]}.`+"\n"+
+					"Each row MUST be its own inner [...] array nested inside the outer rows array — do NOT write rows values as siblings of the rows array.", err)
+			}
+			if len(z.Header) == 0 || len(z.Rows) == 0 {
+				return z, fmt.Errorf("header and rows must both be non-empty arrays")
+			}
+			for i, r := range z.Rows {
+				if len(r) != len(z.Header) {
+					return z, fmt.Errorf("row %d has %d cells but header has %d — every row must match the header length", i, len(r), len(z.Header))
+				}
+			}
+			return z, nil
 		},
 		Score: func(p, g ZebraOutput) (bool, map[string]any) {
 			total, correct := 0, 0
@@ -137,10 +150,10 @@ func cladderBench() BenchSpec[CladderOutput] {
 		Validate: func(c string) (CladderOutput, error) {
 			var o CladderOutput
 			if err := json.Unmarshal([]byte(c), &o); err != nil {
-				return o, err
+				return o, fmt.Errorf(`invalid JSON: %v. Expected exactly: {"answer": "yes"} or {"answer": "no"}`, err)
 			}
 			if o.Answer != "yes" && o.Answer != "no" {
-				return o, fmt.Errorf("answer must be yes/no, got %q", o.Answer)
+				return o, fmt.Errorf(`answer must be lowercase "yes" or "no" (got %q). Re-emit: {"answer": "yes"} or {"answer": "no"}`, o.Answer)
 			}
 			return o, nil
 		},
@@ -184,10 +197,10 @@ func gpqaBench() BenchSpec[GpqaOutput] {
 		Validate: func(c string) (GpqaOutput, error) {
 			var o GpqaOutput
 			if err := json.Unmarshal([]byte(c), &o); err != nil {
-				return o, err
+				return o, fmt.Errorf(`invalid JSON: %v. Expected exactly: {"answer": "A"} (or B, C, D)`, err)
 			}
 			if len(o.Answer) != 1 || !strings.ContainsRune("ABCD", rune(o.Answer[0])) {
-				return o, fmt.Errorf("answer must be A/B/C/D, got %q", o.Answer)
+				return o, fmt.Errorf(`answer must be a single letter A, B, C, or D (got %q). Re-emit: {"answer": "A"}`, o.Answer)
 			}
 			return o, nil
 		},
