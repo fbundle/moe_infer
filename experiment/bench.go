@@ -1,8 +1,9 @@
-// Three-axis reasoning bench, Go port of moe_infer/helpers/bench_axes.py.
+// Three-axis reasoning bench. Bench definitions + orchestration only —
+// the chat-completion loop and OpenAI backend live in harness.go.
 //
-//   go run bench.go --model vibethinker-3b-q4 --concurrency 2 --n 10 \
-//                   --budget-hint --max-retries 5 --top-p 0.95 \
-//                   --max-tokens 40960 --dump-dir ../data/bench_runs/test
+//   go run . --model vibethinker-3b-q4 --concurrency 2 --n 10 \
+//            --max-retries 5 --top-p 0.95 --max-tokens 40960 \
+//            --dump-dir ../data/bench_runs/test
 package main
 
 import (
@@ -24,10 +25,6 @@ import (
 
 // ── Types ─────────────────────────────────────────────────────────────────
 
-// Example carries one bench question. Gold has the same parsed type as the
-// model's expected output — see the Unmarshal helpers on Cladder/Gpqa
-// outputs which accept either a bare string (frozen-subset gold format) or
-// a {"answer":...} object (validation format).
 type Example[T any] struct {
 	ID     string         `json:"id"`
 	Prompt string         `json:"prompt"`
@@ -43,28 +40,18 @@ type BenchSpec[T any] struct {
 	Score        func(parsed, gold T) (correct bool, extras map[string]any)
 }
 
-// Outcome of one verify-loop run. Attempts = len(History), last = History[-1].
-type Outcome[T any] struct {
-	Parsed    *T
-	Error     string
-	Truncated bool
-	Messages  []openai.ChatCompletionMessage
-	History   []*openai.ChatCompletionResponse
-}
-
 type Result[T any] struct {
-	ID        string                           `json:"id"`
-	Prompt    string                           `json:"prompt"`
-	Gold      T                                `json:"gold"`
-	Parsed    *T                               `json:"parsed"`
-	Correct   bool                             `json:"correct"`
-	Elapsed   float64                          `json:"elapsed"`
-	Error     string                           `json:"error"`
-	Truncated bool                             `json:"truncated"`
-	Meta      map[string]any                   `json:"meta"`
-	Extras    map[string]any                   `json:"extras"`
-	History   []*openai.ChatCompletionResponse `json:"history"`
-	Messages  []openai.ChatCompletionMessage   `json:"messages"`
+	ID       string                           `json:"id"`
+	Prompt   string                           `json:"prompt"`
+	Gold     T                                `json:"gold"`
+	Parsed   *T                               `json:"parsed"`
+	Correct  bool                             `json:"correct"`
+	Elapsed  float64                          `json:"elapsed"`
+	Error    string                           `json:"error"`
+	Meta     map[string]any                   `json:"meta"`
+	Extras   map[string]any                   `json:"extras"`
+	History  []openai.ChatCompletionResponse  `json:"history"`
+	Messages []openai.ChatCompletionMessage   `json:"messages"`
 }
 
 // ── Bench specs ───────────────────────────────────────────────────────────
@@ -112,9 +99,9 @@ func zebraBench() BenchSpec[ZebraOutput] {
 	}
 }
 
-// CladderOutput accepts either a bare string ("yes") or an object
-// ({"answer": "yes"}), so the same type round-trips between gold-format
-// JSONL and model-output validation.
+// CladderOutput / GpqaOutput accept either a bare string (frozen-subset
+// gold format) or {"answer": ...} (validation format).
+
 type CladderOutput struct {
 	Answer string `json:"answer"`
 }
@@ -209,134 +196,6 @@ func gpqaBench() BenchSpec[GpqaOutput] {
 	}
 }
 
-// ── verify_loop ───────────────────────────────────────────────────────────
-
-func budgetHint(remaining int) openai.ChatCompletionMessage {
-	return openai.ChatCompletionMessage{
-		Role: openai.ChatMessageRoleSystem,
-		Content: fmt.Sprintf("[Budget: %d tokens remaining for this response. "+
-			"Emit valid output before you run out — truncation = failure.]", remaining),
-	}
-}
-
-func feedback(errMsg string) string {
-	return fmt.Sprintf("That response failed validation: %s. "+
-		"Re-emit ONLY the expected output, no commentary, no markdown fences.", errMsg)
-}
-
-func verifyLoop[T any](
-	ctx context.Context,
-	call func([]openai.ChatCompletionMessage) (*openai.ChatCompletionResponse, error),
-	validate func(string) (T, error),
-	initial []openai.ChatCompletionMessage,
-	maxRetries int,
-	budgetTokens int, // 0 = no budget hint
-) *Outcome[T] {
-	msgs := append([]openai.ChatCompletionMessage{}, initial...)
-	remaining := budgetTokens
-	out := &Outcome[T]{}
-
-	for i := 0; i <= maxRetries; i++ {
-		if budgetTokens > 0 {
-			msgs = append(msgs, budgetHint(max(remaining, 0)))
-		}
-		resp, err := call(msgs)
-		var content, finish string
-		if resp != nil && len(resp.Choices) > 0 {
-			content = resp.Choices[0].Message.Content
-			finish = string(resp.Choices[0].FinishReason)
-		}
-		if err != nil {
-			out.Error = err.Error()
-		} else {
-			out.History = append(out.History, resp)
-			if budgetTokens > 0 {
-				remaining -= resp.Usage.CompletionTokens
-			}
-			if parsed, vErr := validate(content); vErr == nil {
-				out.Parsed = &parsed
-				out.Error = ""
-				out.Messages = msgs
-				return out
-			} else {
-				out.Error = vErr.Error()
-			}
-			if finish == "length" {
-				out.Truncated = true
-				out.Messages = msgs
-				return out
-			}
-		}
-		msgs = append(msgs,
-			openai.ChatCompletionMessage{Role: openai.ChatMessageRoleAssistant, Content: content},
-			openai.ChatCompletionMessage{Role: openai.ChatMessageRoleUser, Content: feedback(out.Error)},
-		)
-	}
-	out.Messages = msgs
-	return out
-}
-
-// ── Backend ───────────────────────────────────────────────────────────────
-
-type Backend struct {
-	client   *openai.Client
-	model    string
-	mu       sync.Mutex
-	strictOK *bool // nil = unknown
-}
-
-func newBackend(baseURL, apiKey, model string) *Backend {
-	cfg := openai.DefaultConfig(apiKey)
-	cfg.BaseURL = baseURL
-	return &Backend{client: openai.NewClientWithConfig(cfg), model: model}
-}
-
-func (b *Backend) call(ctx context.Context, msgs []openai.ChatCompletionMessage,
-	schema *jsonschema.Definition, name string,
-	maxTokens int, temperature, topP float32) (*openai.ChatCompletionResponse, error) {
-
-	b.mu.Lock()
-	tryStrict := b.strictOK == nil || *b.strictOK
-	b.mu.Unlock()
-
-	req := openai.ChatCompletionRequest{
-		Model: b.model, Messages: msgs, MaxTokens: maxTokens,
-		Temperature: temperature, TopP: topP,
-	}
-	if tryStrict {
-		req.ResponseFormat = &openai.ChatCompletionResponseFormat{
-			Type: openai.ChatCompletionResponseFormatTypeJSONSchema,
-			JSONSchema: &openai.ChatCompletionResponseFormatJSONSchema{
-				Name: name, Schema: schema, Strict: true,
-			},
-		}
-		resp, err := b.client.CreateChatCompletion(ctx, req)
-		if err == nil {
-			b.setStrict(true)
-			return &resp, nil
-		}
-		s := strings.ToLower(err.Error())
-		if strings.Contains(s, "response_format") || strings.Contains(s, "json_schema") ||
-			strings.Contains(s, "unavailable") || strings.Contains(s, "not supported") {
-			b.setStrict(false)
-		} else {
-			return nil, err
-		}
-	}
-	req.ResponseFormat = &openai.ChatCompletionResponseFormat{Type: openai.ChatCompletionResponseFormatTypeJSONObject}
-	resp, err := b.client.CreateChatCompletion(ctx, req)
-	if err != nil {
-		return nil, err
-	}
-	return &resp, nil
-}
-
-func (b *Backend) setStrict(v bool) {
-	b.mu.Lock()
-	b.strictOK = &v
-	b.mu.Unlock()
-}
-
 // ── runBench + runOne ─────────────────────────────────────────────────────
 
 func runBench[T any](ctx context.Context, b *Backend, spec BenchSpec[T],
@@ -359,11 +218,6 @@ func runBench[T any](ctx context.Context, b *Backend, spec BenchSpec[T],
 	}
 	defer dumpF.Close()
 
-	budget := 0
-	if opts.BudgetHint {
-		budget = opts.MaxTokens
-	}
-
 	results := make(chan Result[T], opts.Concurrency)
 	sem := make(chan struct{}, opts.Concurrency)
 	var wg sync.WaitGroup
@@ -373,7 +227,7 @@ func runBench[T any](ctx context.Context, b *Backend, spec BenchSpec[T],
 			defer wg.Done()
 			sem <- struct{}{}
 			defer func() { <-sem }()
-			results <- runOne(ctx, b, spec, ex, opts, budget)
+			results <- runOne(ctx, b, spec, ex, opts)
 		}(ex)
 	}
 	go func() { wg.Wait(); close(results) }()
@@ -413,44 +267,42 @@ func runBench[T any](ctx context.Context, b *Backend, spec BenchSpec[T],
 }
 
 func runOne[T any](ctx context.Context, b *Backend, spec BenchSpec[T],
-	ex Example[T], opts Opts, budgetTokens int) Result[T] {
+	ex Example[T], opts Opts) Result[T] {
 
 	t0 := time.Now()
 	initial := []openai.ChatCompletionMessage{
 		{Role: openai.ChatMessageRoleSystem, Content: spec.SystemPrompt},
 		{Role: openai.ChatMessageRoleUser, Content: ex.Prompt},
 	}
-	out := verifyLoop(ctx,
-		func(m []openai.ChatCompletionMessage) (*openai.ChatCompletionResponse, error) {
-			return b.call(ctx, m, spec.Schema, spec.Name+"_output",
-				opts.MaxTokens, opts.Temperature, opts.TopP)
-		},
-		spec.Validate, initial, opts.MaxRetries, budgetTokens,
-	)
+	completion := func(c context.Context, m []openai.ChatCompletionMessage, maxTok int) (*openai.ChatCompletionResponse, error) {
+		return b.CallWithSchema(c, m, spec.Schema, spec.Name+"_output",
+			maxTok, opts.Temperature, opts.TopP)
+	}
+	parsed, history, err := ChatCompletionLoop(ctx, initial, completion,
+		spec.Validate, opts.MaxRetries, opts.MaxTokens)
 
 	r := Result[T]{
 		ID: ex.ID, Prompt: ex.Prompt, Gold: ex.Gold, Meta: ex.Meta,
-		Elapsed: time.Since(t0).Seconds(),
-		Parsed:  out.Parsed, Error: out.Error, Truncated: out.Truncated,
-		History: out.History, Messages: out.Messages,
+		Elapsed:  time.Since(t0).Seconds(),
+		History:  history.Responses, Messages: history.Messages,
 	}
-	extras := map[string]any{
-		"attempts":  len(out.History),
-		"truncated": out.Truncated,
-	}
-	if n := len(out.History); n > 0 {
-		last := out.History[n-1]
+	extras := map[string]any{"attempts": len(history.Responses)}
+	if n := len(history.Responses); n > 0 {
+		last := history.Responses[n-1]
 		extras["tokens_used"] = last.Usage.CompletionTokens
 		if len(last.Choices) > 0 {
 			extras["finish"] = string(last.Choices[0].FinishReason)
 		}
 	}
-	if out.Parsed != nil {
-		ok, sx := spec.Score(*out.Parsed, ex.Gold)
+	if err == nil {
+		r.Parsed = &parsed
+		ok, sx := spec.Score(parsed, ex.Gold)
 		r.Correct = ok
 		for k, v := range sx {
 			extras[k] = v
 		}
+	} else {
+		r.Error = err.Error()
 	}
 	r.Extras = extras
 	return r
@@ -512,19 +364,11 @@ func intOr(v any, def int) int {
 	return def
 }
 
-func max(a, b int) int {
-	if a > b {
-		return a
-	}
-	return b
-}
-
 // ── main ──────────────────────────────────────────────────────────────────
 
 type Opts struct {
 	Concurrency, MaxTokens, MaxRetries int
 	Temperature, TopP                  float32
-	BudgetHint                         bool
 }
 
 func runNamed[T any](ctx context.Context, b *Backend, spec BenchSpec[T],
@@ -545,7 +389,6 @@ func main() {
 	temperature := flag.Float64("temperature", 1.0, "sampling temperature")
 	topP := flag.Float64("top-p", 0.95, "nucleus sampling cutoff")
 	maxRetries := flag.Int("max-retries", 5, "verify-loop retries on parse fail")
-	budgetHint := flag.Bool("budget-hint", false, "inject token-budget hint each call")
 	n := flag.Int("n", 0, "cap per axis (0 = all)")
 	benches := flag.String("benches", "zebralogic,cladder,gpqa_diamond", "comma list")
 	subsetsDir := flag.String("subsets-dir", "../data/bench_subsets", "frozen subset dir")
@@ -558,9 +401,8 @@ func main() {
 	opts := Opts{
 		Concurrency: *concurrency, MaxTokens: *maxTokens, MaxRetries: *maxRetries,
 		Temperature: float32(*temperature), TopP: float32(*topP),
-		BudgetHint: *budgetHint,
 	}
-	backend := newBackend(*baseURL, *apiKey, *model)
+	backend := NewBackend(*baseURL, *apiKey, *model)
 	ctx := context.Background()
 
 	dumpFor := func(name string) string {
