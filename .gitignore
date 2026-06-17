@@ -41,3 +41,4 @@ moe_infer_c/bench
 moe_infer_mlx/core.c
 moe_infer_mlx/core_src/shaders.h
 data
+.env
