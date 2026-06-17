@@ -238,6 +238,47 @@ func gpqaBench() BenchSpec[GpqaOutput] {
 	}
 }
 
+// KalshiOutput — single float probability ∈ [0, 1]. Gold uses the same
+// shape: P=1.0 for "yes", P=0.0 for "no" (set during subset freezing).
+
+type KalshiOutput struct {
+	Probability float64 `json:"probability"`
+}
+
+func kalshiBench() BenchSpec[KalshiOutput] {
+	return BenchSpec[KalshiOutput]{
+		Name: "kalshi",
+		SystemPrompt: "You are a calibrated forecaster. Estimate the probability of the " +
+			"event resolving YES using all available reasoning. Respond with a single " +
+			`JSON object: {"probability": <number between 0 and 1 inclusive>}.`,
+		Schema: &jsonschema.Definition{
+			Type:                 jsonschema.Object,
+			Required:             []string{"probability"},
+			AdditionalProperties: false,
+			Properties: map[string]jsonschema.Definition{
+				"probability": {Type: jsonschema.Number},
+			},
+		},
+		Validate: func(c string) (KalshiOutput, string, error) {
+			var o KalshiOutput
+			if e := json.Unmarshal([]byte(c), &o); e != nil {
+				return o, fmt.Sprintf(`invalid JSON: %v. Expected exactly: {"probability": <float in [0,1]>}`, e), ErrJSONParse
+			}
+			if o.Probability < 0.0 || o.Probability > 1.0 {
+				return o, fmt.Sprintf(`probability must be in [0, 1] (got %v). Re-emit: {"probability": 0.7}`, o.Probability), ErrEnum
+			}
+			return o, "", nil
+		},
+		// Score: Brier per row, "correct" = threshold-0.5 prediction matches gold.
+		Score: func(p, g KalshiOutput) (bool, map[string]any) {
+			diff := p.Probability - g.Probability
+			brier := diff * diff
+			thresholdMatch := (p.Probability > 0.5) == (g.Probability > 0.5)
+			return thresholdMatch, map[string]any{"brier": brier, "probability": p.Probability}
+		},
+	}
+}
+
 // ── runBench + runOne ─────────────────────────────────────────────────────
 
 func runBench[T any](ctx context.Context, b *Backend, spec BenchSpec[T],
@@ -444,7 +485,7 @@ func main() {
 	topP := flag.Float64("top-p", 0.95, "nucleus sampling cutoff")
 	maxRetries := flag.Int("max-retries", 5, "verify-loop retries on parse fail")
 	n := flag.Int("n", 0, "cap per axis (0 = all)")
-	benches := flag.String("benches", "zebralogic,cladder,gpqa_diamond", "comma list")
+	benches := flag.String("benches", "zebralogic,kalshi,gpqa_diamond", "comma list")
 	subsetsDir := flag.String("subsets-dir", "../data/bench_subsets", "frozen subset dir")
 	dumpDir := flag.String("dump-dir", "../data/bench_runs/go-bench", "output dir")
 	flag.Parse()
@@ -471,6 +512,8 @@ func main() {
 			runNamed(ctx, backend, zebraBench(), *subsetsDir, dumpFor(name), *n, opts)
 		case "cladder":
 			runNamed(ctx, backend, cladderBench(), *subsetsDir, dumpFor(name), *n, opts)
+		case "kalshi":
+			runNamed(ctx, backend, kalshiBench(), *subsetsDir, dumpFor(name), *n, opts)
 		case "gpqa_diamond":
 			runNamed(ctx, backend, gpqaBench(), *subsetsDir, dumpFor(name), *n, opts)
 		default:

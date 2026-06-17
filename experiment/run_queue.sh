@@ -16,7 +16,7 @@ MODELS=(
   "mlx-community--Qwen3.5-4B-4bit|0.6|0.95|40960"
   "lfm25-8b-a1b-mlx-8bit|0.2|1.0|40960"
 )
-AXES=("zebralogic" "cladder" "gpqa_diamond")
+AXES=("zebralogic" "kalshi" "gpqa_diamond")
 
 for AXIS in "${AXES[@]}"; do
   for ROW in "${MODELS[@]}"; do
