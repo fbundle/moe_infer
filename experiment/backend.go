@@ -26,16 +26,17 @@ type Backend interface {
 // ── OpenAI-compatible backend (strict json_schema → json_object fallback) ──
 
 type OpenAIBackend struct {
-	client   *openai.Client
-	model    string
-	mu       sync.Mutex
-	strictOK *bool // nil = unknown
+	client       *openai.Client
+	model        string
+	tmplKwargs   map[string]any // sent as chat_template_kwargs (e.g. {"enable_thinking": false})
+	mu           sync.Mutex
+	strictOK     *bool // nil = unknown
 }
 
-func NewOpenAIBackend(baseURL, apiKey, model string) *OpenAIBackend {
+func NewOpenAIBackend(baseURL, apiKey, model string, tmplKwargs map[string]any) *OpenAIBackend {
 	cfg := openai.DefaultConfig(apiKey)
 	cfg.BaseURL = baseURL
-	return &OpenAIBackend{client: openai.NewClientWithConfig(cfg), model: model}
+	return &OpenAIBackend{client: openai.NewClientWithConfig(cfg), model: model, tmplKwargs: tmplKwargs}
 }
 
 func (b *OpenAIBackend) CallWithSchema(
@@ -51,6 +52,7 @@ func (b *OpenAIBackend) CallWithSchema(
 	req := openai.ChatCompletionRequest{
 		Model: b.model, Messages: messages, MaxTokens: maxTokens,
 		Temperature: temperature, TopP: topP,
+		ChatTemplateKwargs: b.tmplKwargs,
 	}
 	if tryStrict {
 		req.ResponseFormat = &openai.ChatCompletionResponseFormat{
@@ -123,9 +125,17 @@ type cliEnvelope struct {
 	SessionID        string          `json:"session_id"`
 	TotalCost        float64         `json:"total_cost_usd"`
 	IsError          bool            `json:"is_error"`
+	StopReason       string          `json:"stop_reason"`
 	Usage            struct {
 		OutputTokens int `json:"output_tokens"`
 	} `json:"usage"`
+}
+
+func strOr(s, fallback string) string {
+	if s == "" {
+		return fallback
+	}
+	return s
 }
 
 func (b *ClaudeCLIBackend) CallWithSchema(
@@ -173,24 +183,34 @@ func (b *ClaudeCLIBackend) CallWithSchema(
 	var stdout, stderr bytes.Buffer
 	cmd.Stdout = &stdout
 	cmd.Stderr = &stderr
-	if err := cmd.Run(); err != nil {
+	runErr := cmd.Run()
+
+	// Prefer the structured envelope when present, even on non-zero exit:
+	// `claude -p` returns exit 1 with a populated JSON envelope on policy
+	// refusals (stop_reason="refusal", is_error=true) and on other in-band
+	// errors. The exit code alone hides the real reason.
+	var env cliEnvelope
+	if json.Unmarshal(stdout.Bytes(), &env) == nil {
+		if env.IsError || env.StopReason == "refusal" {
+			return nil, fmt.Errorf("claude -p %s: %s",
+				strOr(env.StopReason, "is_error"), env.Result)
+		}
+		if runErr != nil {
+			return nil, fmt.Errorf("claude -p failed: %v (envelope: %q)",
+				runErr, env.Result)
+		}
+	} else if runErr != nil {
 		errOut := stderr.String()
 		if len(errOut) > 400 {
 			errOut = errOut[:400]
 		}
-		return nil, fmt.Errorf("claude -p failed: %v (stderr: %s)", err, strings.TrimSpace(errOut))
-	}
-
-	var env cliEnvelope
-	if err := json.Unmarshal(stdout.Bytes(), &env); err != nil {
+		return nil, fmt.Errorf("claude -p failed: %v (stderr: %s)", runErr, strings.TrimSpace(errOut))
+	} else {
 		raw := stdout.String()
 		if len(raw) > 400 {
 			raw = raw[:400]
 		}
-		return nil, fmt.Errorf("parse claude envelope: %w (raw: %q)", err, raw)
-	}
-	if env.IsError {
-		return nil, fmt.Errorf("claude -p returned is_error=true: %s", env.Result)
+		return nil, fmt.Errorf("parse claude envelope (raw: %q)", raw)
 	}
 
 	// With --json-schema set, the model's structured answer lands in

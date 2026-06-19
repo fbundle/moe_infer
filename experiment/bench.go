@@ -99,6 +99,30 @@ func qwen3Assistant(r openai.ChatCompletionResponse) openai.ChatCompletionMessag
 	}
 }
 
+// defaultAssistant preserves ReasoningContent as a separate field instead
+// of embedding it into Content. Suitable for models whose tokenizer chat
+// template handles reasoning independently (Gemma, etc.).
+func defaultAssistant(r openai.ChatCompletionResponse) openai.ChatCompletionMessage {
+	msg := r.Choices[0].Message
+	return openai.ChatCompletionMessage{
+		Role:             openai.ChatMessageRoleAssistant,
+		Content:          msg.Content,
+		ReasoningContent: msg.ReasoningContent,
+	}
+}
+
+func assistantFnFor(fmtName string) func(openai.ChatCompletionResponse) openai.ChatCompletionMessage {
+	switch fmtName {
+	case "qwen3":
+		return qwen3Assistant
+	case "gemma4", "default":
+		return defaultAssistant
+	default:
+		log.Fatalf("unknown --assistant-fmt %q (want qwen3 | gemma4 | default)", fmtName)
+		return nil
+	}
+}
+
 // ── ZebraLogic ────────────────────────────────────────────────────────────
 
 type ZebraOutput struct {
@@ -410,16 +434,24 @@ func runOne[T any](ctx context.Context, b Backend, spec BenchSpec[T],
 		inner := step
 		step = func(c string) (T, string, bool) { return inner(extractLastJSON(c)) }
 	}
+	sysPrompt := spec.SystemPrompt
+	if opts.SystemSuffix != "" {
+		sysPrompt = sysPrompt + "\n\n" + opts.SystemSuffix
+	}
 	initial := []openai.ChatCompletionMessage{
-		{Role: openai.ChatMessageRoleSystem, Content: spec.SystemPrompt},
+		{Role: openai.ChatMessageRoleSystem, Content: sysPrompt},
 		{Role: openai.ChatMessageRoleUser, Content: userPrompt},
 	}
 	completion := func(c context.Context, m []openai.ChatCompletionMessage, maxTok int) (*openai.ChatCompletionResponse, error) {
 		return b.CallWithSchema(c, m, spec.Schema, spec.Name+"_output",
 			maxTok, opts.Temperature, opts.TopP)
 	}
+	assistantFn := opts.AssistantFn
+	if assistantFn == nil {
+		assistantFn = qwen3Assistant
+	}
 	parsed, history, err := ChatCompletionLoop(ctx, initial, completion,
-		qwen3Assistant, step, opts.MaxSteps, opts.MaxTokens)
+		assistantFn, step, opts.MaxSteps, opts.MaxTokens)
 
 	r := Result[T]{
 		ID: ex.ID, Prompt: userPrompt, Gold: ex.Gold, Meta: ex.Meta,
@@ -432,8 +464,12 @@ func runOne[T any](ctx context.Context, b Backend, spec BenchSpec[T],
 		"mode":        b.Mode(),
 	}
 	if n := len(history.Responses); n > 0 {
+		total := 0
+		for _, h := range history.Responses {
+			total += h.Usage.CompletionTokens
+		}
+		extras["tokens_used"] = total
 		last := history.Responses[n-1]
-		extras["tokens_used"] = last.Usage.CompletionTokens
 		if len(last.Choices) > 0 {
 			extras["finish"] = string(last.Choices[0].FinishReason)
 		}
@@ -515,6 +551,8 @@ type Opts struct {
 	Concurrency, MaxTokens, MaxSteps int
 	Temperature, TopP                float32
 	TolerantJSON                     bool
+	SystemSuffix                     string
+	AssistantFn                      func(openai.ChatCompletionResponse) openai.ChatCompletionMessage
 }
 
 func runNamed[T any](ctx context.Context, b Backend, spec BenchSpec[T],
@@ -542,6 +580,10 @@ func main() {
 	dumpDir := flag.String("dump-dir", "../data/bench_runs/go-bench", "output dir")
 	backendKind := flag.String("backend", "openai", "openai | claude-cli")
 	cliEffort := flag.String("cli-effort", "medium", "claude -p --effort (low|medium|high|xhigh|max)")
+	assistantFmt := flag.String("assistant-fmt", "qwen3", "response → assistant message conversion: qwen3 (wrap reasoning in <think>) | gemma4 | default (pass ReasoningContent through)")
+	sysSuffix := flag.String("system-suffix", "", "appended to each bench's SystemPrompt (use for non-Qwen3 family thinking-off conventions; use --thinking-off instead for Qwen3 family)")
+	thinkingOff := flag.Bool("thinking-off", false, "send chat_template_kwargs={\"enable_thinking\": false} (Qwen3 family — works at the chat template, not as a prompt suffix)")
+	dumpTag := flag.String("dump-tag", "", "appended to model id in the JSONL filename (use to keep configs of the same model in separate files, e.g. '-think' vs '-nothink')")
 	flag.Parse()
 
 	if err := os.MkdirAll(*dumpDir, 0o755); err != nil {
@@ -550,20 +592,25 @@ func main() {
 	opts := Opts{
 		Concurrency: *concurrency, MaxTokens: *maxTokens, MaxSteps: *maxSteps,
 		Temperature: float32(*temperature), TopP: float32(*topP),
-		TolerantJSON: *tolerantJSON,
+		TolerantJSON: *tolerantJSON, AssistantFn: assistantFnFor(*assistantFmt),
+		SystemSuffix: *sysSuffix,
+	}
+	var tmplKwargs map[string]any
+	if *thinkingOff {
+		tmplKwargs = map[string]any{"enable_thinking": false}
 	}
 	var backend Backend
 	switch *backendKind {
 	case "claude-cli":
 		backend = NewClaudeCLIBackend(*model, *cliEffort)
 	default:
-		backend = NewOpenAIBackend(*baseURL, *apiKey, *model)
+		backend = NewOpenAIBackend(*baseURL, *apiKey, *model, tmplKwargs)
 	}
 	ctx := context.Background()
 
 	dumpFor := func(name string) string {
-		return filepath.Join(*dumpDir, fmt.Sprintf("%s__%s.jsonl",
-			strings.ReplaceAll(*model, "/", "_"), name))
+		return filepath.Join(*dumpDir, fmt.Sprintf("%s%s__%s.jsonl",
+			strings.ReplaceAll(*model, "/", "_"), *dumpTag, name))
 	}
 
 	for _, name := range strings.Split(*benches, ",") {
